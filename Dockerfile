@@ -5,7 +5,8 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY media-server ./media-server
+RUN mkdir -p /app/data && chown -R node:node /app
+COPY --chown=node:node media-server ./media-server
 
 ENV MEDIA_API_HOST=0.0.0.0 \
     MEDIA_API_PORT=8788 \
@@ -15,5 +16,6 @@ ENV MEDIA_API_HOST=0.0.0.0 \
 EXPOSE 8788
 VOLUME ["/app/data"]
 
+USER node
 CMD ["node", "media-server/server.mjs"]
 

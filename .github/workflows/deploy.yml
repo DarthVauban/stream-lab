@@ -9,7 +9,32 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Build web application
+        run: npm run build
+
   build:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -50,8 +75,6 @@ jobs:
           context: .
           file: Dockerfile.web
           push: true
-          build-args: |
-            NEXT_PUBLIC_MEDIA_API_URL=${{ secrets.NEXT_PUBLIC_MEDIA_API_URL }}
           tags: |
             ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}-web:latest
             ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}-web:sha-${{ github.sha }}
@@ -69,15 +92,28 @@ jobs:
         env:
           GHCR_ACTOR: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
-          envs: GHCR_ACTOR,GHCR_TOKEN
+          envs: GHCR_ACTOR,GHCR_TOKEN,GITHUB_SHA
           script: |
+            set -eu
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
             cd stream-lab
-            git pull
+            git pull --ff-only
+            previous_tag=latest
+            if [ -f .deploy-tag ]; then previous_tag=$(cat .deploy-tag); fi
+            new_tag="sha-$GITHUB_SHA"
+            export IMAGE_TAG="$new_tag"
             docker compose pull media-server web
-            docker compose up -d
+            if ! docker compose up -d --wait --wait-timeout 120; then
+              echo "Deployment failed, rolling back to $previous_tag"
+              export IMAGE_TAG="$previous_tag"
+              docker compose pull media-server web
+              docker compose up -d --wait --wait-timeout 120
+              exit 1
+            fi
+            printf '%s\n' "$new_tag" > .deploy-tag
             docker image prune -f

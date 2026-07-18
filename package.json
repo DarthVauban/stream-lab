@@ -9,6 +9,7 @@
     "dev": "node --env-file-if-exists=.env scripts/dev-all.mjs",
     "dev:web": "next dev --hostname 127.0.0.1 --port 5173",
     "dev:media": "node --env-file-if-exists=.env media-server/server.mjs",
+    "auth:setup": "node scripts/generate-auth.mjs",
     "build": "next build",
     "start": "next start --hostname 0.0.0.0 --port 3000",
     "test": "node --test tests/*.test.mjs",
@@ -28,6 +29,9 @@
     "eslint-config-next": "16.2.6",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3"
+  },
+  "overrides": {
+    "postcss": "8.5.14"
   },
   "type": "module"
 }

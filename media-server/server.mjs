@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ApiError } from "./api-error.mjs";
+import { createOwnerAuth } from "./auth.mjs";
 import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
 
@@ -63,7 +64,8 @@ function setCommonHeaders(request, response, allowedOrigins) {
     response.setHeader("Vary", "Origin");
   }
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
-  response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  response.setHeader("Access-Control-Allow-Headers", "Content-Type,X-CSRF-Token");
+  response.setHeader("Access-Control-Allow-Credentials", "true");
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("X-Frame-Options", "DENY");
@@ -77,6 +79,7 @@ export async function createMvpServer({
     .filter(Boolean),
   store,
   controller,
+  auth,
 } = {}) {
   const videoStore = store ?? new VideoStore({ rootDir: dataDir });
   const streamController =
@@ -87,6 +90,7 @@ export async function createMvpServer({
       audioBitrate: process.env.MVP_AUDIO_BITRATE || "128k",
     });
   const corsOrigins = allowedOrigins.length ? allowedOrigins : DEFAULT_ALLOWED_ORIGINS;
+  const ownerAuth = auth ?? createOwnerAuth();
   await videoStore.init();
 
   const server = createServer(async (request, response) => {
@@ -107,6 +111,40 @@ export async function createMvpServer({
         });
         return;
       }
+
+      if (request.method === "GET" && url.pathname === "/api/auth/session") {
+        const session = ownerAuth.authenticate(request);
+        json(response, 200, session ? { authenticated: true, ...session } : { authenticated: false });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/auth/login") {
+        const body = await readJson(request, 8 * 1024);
+        const session = ownerAuth.login(
+          request.socket.remoteAddress || "unknown",
+          body.username,
+          body.password,
+        );
+        response.setHeader("Set-Cookie", session.setCookie);
+        json(response, 200, {
+          authenticated: true,
+          owner: session.owner,
+          csrfToken: session.csrfToken,
+          expiresAt: session.expiresAt,
+        });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+        ownerAuth.assertAuthenticated(request, { requireCsrf: true });
+        response.setHeader("Set-Cookie", ownerAuth.clearCookie);
+        json(response, 200, { authenticated: false });
+        return;
+      }
+
+      ownerAuth.assertAuthenticated(request, {
+        requireCsrf: !["GET", "HEAD"].includes(request.method || "GET"),
+      });
 
       if (request.method === "GET" && url.pathname === "/api/videos") {
         json(response, 200, { videos: videoStore.listVideos() });
@@ -164,6 +202,9 @@ export async function createMvpServer({
       const code = error instanceof ApiError ? error.code : "INTERNAL_ERROR";
       const message =
         error instanceof ApiError ? error.message : "Внутрішня помилка медіасервера.";
+      if (error instanceof ApiError && error.retryAfter) {
+        response.setHeader("Retry-After", String(error.retryAfter));
+      }
       if (!(error instanceof ApiError)) console.error(error);
       json(response, status, { error: { code, message } });
     }
@@ -205,4 +246,3 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
-

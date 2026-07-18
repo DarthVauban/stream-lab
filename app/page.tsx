@@ -2,7 +2,6 @@
 
 import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const API_URL = process.env.NEXT_PUBLIC_MEDIA_API_URL || "http://127.0.0.1:8788";
 const CHUNK_SIZE = 8 * 1024 * 1024;
 
 type Video = {
@@ -31,13 +30,33 @@ type Health = {
   ffmpeg: { available: boolean; version: string | null; message: string | null };
 };
 
-class ApiRequestError extends Error {}
+type AuthSession =
+  | { authenticated: false }
+  | { authenticated: true; owner: string; csrfToken: string; expiresAt: string };
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, init);
+class ApiRequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+async function api<T>(path: string, init: RequestInit = {}, csrfToken = ""): Promise<T> {
+  const headers = new Headers(init.headers);
+  if (csrfToken && !["GET", "HEAD"].includes(init.method || "GET")) {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
+  const response = await fetch(path, {
+    ...init,
+    headers,
+    credentials: "same-origin",
+    cache: "no-store",
+  });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new ApiRequestError(body?.error?.message || "Сервер не зміг виконати запит.");
+    throw new ApiRequestError(
+      body?.error?.message || "Сервер не зміг виконати запит.",
+      response.status,
+    );
   }
   return body as T;
 }
@@ -81,6 +100,13 @@ const emptyStream: StreamStatus = {
 };
 
 export default function Home() {
+  const [authState, setAuthState] = useState<"loading" | "anonymous" | "authenticated">("loading");
+  const [owner, setOwner] = useState("");
+  const [csrfToken, setCsrfToken] = useState("");
+  const [loginUsername, setLoginUsername] = useState("owner");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginError, setLoginError] = useState("");
   const [health, setHealth] = useState<Health | null>(null);
   const [videos, setVideos] = useState<Video[]>([]);
   const [stream, setStream] = useState<StreamStatus>(emptyStream);
@@ -109,12 +135,39 @@ export default function Home() {
         if (current && videosResult.videos.some((video) => video.id === current)) return current;
         return videosResult.videos[0]?.id || "";
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 401) {
+        setAuthState("anonymous");
+        setOwner("");
+        setCsrfToken("");
+      }
       setHealth(null);
     }
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    void api<AuthSession>("/api/auth/session")
+      .then((session) => {
+        if (cancelled) return;
+        if (session.authenticated) {
+          setOwner(session.owner);
+          setCsrfToken(session.csrfToken);
+          setAuthState("authenticated");
+        } else {
+          setAuthState("anonymous");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setAuthState("anonymous");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (authState !== "authenticated") return;
     const initialRefresh = window.setTimeout(refresh, 0);
     const poll = window.setInterval(refresh, 2000);
     const clock = window.setInterval(() => setNow(Date.now()), 1000);
@@ -123,7 +176,7 @@ export default function Home() {
       window.clearInterval(poll);
       window.clearInterval(clock);
     };
-  }, [refresh]);
+  }, [authState, refresh]);
 
   const active = stream.status === "LIVE" || stream.status === "STARTING";
   const selectedVideo = useMemo(
@@ -133,6 +186,41 @@ export default function Home() {
   const readyToStart = Boolean(
     selectedVideoId && streamUrl.trim() && streamKey.trim() && health?.ffmpeg.available,
   );
+
+  async function login(event: FormEvent) {
+    event.preventDefault();
+    if (loginBusy) return;
+    setLoginBusy(true);
+    setLoginError("");
+    try {
+      const session = await api<AuthSession>("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: loginUsername, password: loginPassword }),
+      });
+      if (!session.authenticated) throw new Error("Не вдалося створити сесію.");
+      setOwner(session.owner);
+      setCsrfToken(session.csrfToken);
+      setLoginPassword("");
+      setAuthState("authenticated");
+    } catch (error) {
+      setLoginError(error instanceof Error ? error.message : "Не вдалося увійти.");
+    } finally {
+      setLoginBusy(false);
+    }
+  }
+
+  async function logout() {
+    try {
+      await api("/api/auth/logout", { method: "POST" }, csrfToken);
+    } finally {
+      setAuthState("anonymous");
+      setOwner("");
+      setCsrfToken("");
+      setVideos([]);
+      setStream(emptyStream);
+    }
+  }
 
   function handleFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0] ?? null;
@@ -155,7 +243,7 @@ export default function Home() {
           size: selectedFile.size,
           mimeType: selectedFile.type,
         }),
-      });
+      }, csrfToken);
 
       let offset = created.upload.uploadedBytes;
       while (offset < selectedFile.size) {
@@ -163,6 +251,7 @@ export default function Home() {
         const result = await api<{ upload: Video }>(
           `/api/uploads/${created.upload.id}/chunks?offset=${offset}`,
           { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: chunk },
+          csrfToken,
         );
         offset = result.upload.uploadedBytes;
         setUploadProgress(Math.round((offset / selectedFile.size) * 100));
@@ -171,6 +260,7 @@ export default function Home() {
       const completed = await api<{ video: Video }>(
         `/api/uploads/${created.upload.id}/complete`,
         { method: "POST" },
+        csrfToken,
       );
       setSelectedVideoId(completed.video.id);
       setSelectedFile(null);
@@ -198,7 +288,7 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ videoId: selectedVideoId, streamUrl, streamKey }),
-      });
+      }, csrfToken);
       setStream(result.stream);
       setStreamKey("");
       setNotice({ type: "success", text: "FFmpeg запущено. Очікуємо сигнал від YouTube." });
@@ -220,7 +310,7 @@ export default function Home() {
     try {
       const result = await api<{ stream: StreamStatus }>("/api/stream/stop", {
         method: "POST",
-      });
+      }, csrfToken);
       setStream(result.stream);
       setNotice({ type: "success", text: "Трансляцію зупинено." });
     } catch (error) {
@@ -234,6 +324,62 @@ export default function Home() {
     }
   }
 
+  if (authState === "loading") {
+    return (
+      <main className="login-shell" aria-busy="true">
+        <div className="login-card login-card--loading">
+          <div className="brand" aria-label="StreamLab">
+            <span className="brand-mark" aria-hidden="true"><span /></span>
+            <span>StreamLab</span>
+          </div>
+          <p>Перевіряємо доступ…</p>
+        </div>
+      </main>
+    );
+  }
+
+  if (authState === "anonymous") {
+    return (
+      <main className="login-shell">
+        <section className="login-card" aria-labelledby="login-title">
+          <div className="brand" aria-label="StreamLab">
+            <span className="brand-mark" aria-hidden="true"><span /></span>
+            <span>StreamLab</span>
+            <span className="mvp-tag">OWNER</span>
+          </div>
+          <p className="eyebrow">YouTube 24/7 Stream Manager</p>
+          <h1 id="login-title">Вхід до панелі</h1>
+          <p className="login-copy">Керування відео та трансляцією доступне лише власнику.</p>
+          <form onSubmit={login}>
+            <label className="field">
+              <span>Логін</span>
+              <input
+                value={loginUsername}
+                onChange={(event) => setLoginUsername(event.target.value)}
+                autoComplete="username"
+                required
+              />
+            </label>
+            <label className="field">
+              <span>Пароль</span>
+              <input
+                type="password"
+                value={loginPassword}
+                onChange={(event) => setLoginPassword(event.target.value)}
+                autoComplete="current-password"
+                required
+              />
+            </label>
+            {loginError && <p className="login-error" role="alert">{loginError}</p>}
+            <button className="button button--primary button--full" type="submit" disabled={loginBusy}>
+              {loginBusy ? "Входимо…" : "Увійти"}
+            </button>
+          </form>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -242,9 +388,13 @@ export default function Home() {
           <span>StreamLab</span>
           <span className="mvp-tag">MVP</span>
         </div>
-        <div className={`live-indicator live-indicator--${stream.status.toLowerCase()}`}>
-          <span className="status-dot" aria-hidden="true" />
-          {statusLabel(stream.status)}
+        <div className="topbar-actions">
+          <div className={`live-indicator live-indicator--${stream.status.toLowerCase()}`}>
+            <span className="status-dot" aria-hidden="true" />
+            {statusLabel(stream.status)}
+          </div>
+          <span className="owner-name">{owner}</span>
+          <button className="logout-button" type="button" onClick={logout}>Вийти</button>
         </div>
       </header>
 
@@ -274,7 +424,7 @@ export default function Home() {
           <span aria-hidden="true">!</span>
           <div>
             <strong>Медіасервер недоступний</strong>
-            <p>Запустіть локальний медіасервер на порту 8788 і оновіть сторінку.</p>
+            <p>Перевірте стан контейнера медіасервера й оновіть сторінку.</p>
           </div>
         </div>
       )}
@@ -461,7 +611,7 @@ export default function Home() {
       </div>
 
       <footer>
-        <span>Локальний MVP · без авторизації та автоматичного відновлення</span>
+        <span>OWNER-захист активний · автоматичне відновлення буде на наступному етапі</span>
         <span className={health?.ffmpeg.available ? "footer-ok" : "footer-muted"}>
           FFmpeg {health?.ffmpeg.available ? "готовий" : "не підключений"}
         </span>
