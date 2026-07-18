@@ -21,7 +21,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Set image name
+      - name: Set image base name
         id: image
         run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
@@ -32,14 +32,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push media-server
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest
-            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}-media:latest
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}-media:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push web
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          push: true
+          build-args: |
+            NEXT_PUBLIC_MEDIA_API_URL=${{ secrets.NEXT_PUBLIC_MEDIA_API_URL }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}-web:latest
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}-web:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -63,6 +78,6 @@ jobs:
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
             cd stream-lab
             git pull
-            docker compose pull media-server
+            docker compose pull media-server web
             docker compose up -d
             docker image prune -f

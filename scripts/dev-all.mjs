@@ -3,11 +3,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const vinextCli = path.join(root, "node_modules", "vinext", "dist", "cli.js");
+const nextCli = path.join(root, "node_modules", "next", "dist", "bin", "next");
 const mediaServer = path.join(root, "media-server", "server.mjs");
 
 const children = [
-  spawn(process.execPath, [vinextCli, "dev", "--hostname", "127.0.0.1", "--port", "5173"], {
+  spawn(process.execPath, [nextCli, "dev", "--hostname", "127.0.0.1", "--port", "5173"], {
     cwd: root,
     stdio: "inherit",
   }),

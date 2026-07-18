@@ -17,7 +17,8 @@
 
 ## Найпростіший запуск через Docker
 
-Docker-контейнер потрібен лише для медіасервера та вже містить FFmpeg.
+Локально досить підняти лише медіасервер (містить FFmpeg), а вебінтерфейс запустити
+окремо в dev-режимі:
 
 ```powershell
 docker compose up --build media-server
@@ -31,6 +32,25 @@ npm run dev:web
 ```
 
 Відкрийте `http://127.0.0.1:5173`.
+
+### Продакшн (обидва сервіси в Docker)
+
+`compose.yaml` містить також сервіс `web` (Next.js, standalone-збірка з `Dockerfile.web`).
+Для нього `NEXT_PUBLIC_MEDIA_API_URL` вшивається під час *збірки* образу, тож перед
+`docker compose up -d --build` пропишіть у `.env` реальну публічну адресу сервера:
+
+```
+NEXT_PUBLIC_MEDIA_API_URL=http://<SERVER_IP>:8788
+MEDIA_ALLOWED_ORIGINS=http://<SERVER_IP>:3000
+```
+
+Якщо образ `web` збирається в CI (`.github/workflows/deploy.yml`), те саме значення
+треба задати як GitHub Actions secret `NEXT_PUBLIC_MEDIA_API_URL` — інакше в
+задеплоєному образі залишиться дефолтний `http://127.0.0.1:8788`.
+
+```powershell
+docker compose up -d --build
+```
 
 ## Запуск із локальним FFmpeg
 
