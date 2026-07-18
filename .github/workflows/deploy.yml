@@ -63,6 +63,6 @@ jobs:
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
             cd stream-lab
             git pull
-            docker compose pull web
+            docker compose pull media-server
             docker compose up -d
             docker image prune -f

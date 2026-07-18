@@ -1,8 +1,9 @@
 services:
   media-server:
+    image: ghcr.io/darthvauban/stream-lab:latest
     build:
       context: .
-      dockerfile: Dockerfile.media
+      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
       - "127.0.0.1:8788:8788"
