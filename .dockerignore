@@ -1,0 +1,10 @@
+node_modules
+.git
+.next
+.vinext
+dist
+data
+work
+outputs
+*.log
+
