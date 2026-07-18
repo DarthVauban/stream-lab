@@ -16,12 +16,17 @@ type Video = {
 };
 
 type StreamStatus = {
-  status: "STOPPED" | "STARTING" | "LIVE" | "STOPPING" | "ERROR";
+  status: "STOPPED" | "STARTING" | "LIVE" | "RECONNECTING" | "STOPPING" | "ERROR";
   videoId: string | null;
   videoName: string | null;
   startedAt: string | null;
   stoppedAt: string | null;
   lastError: string | null;
+  lastFailure: string | null;
+  reconnectAttempt: number;
+  nextRetryAt: string | null;
+  autoResumeEnabled: boolean;
+  restoredAfterRestart: boolean;
   logs: string[];
 };
 
@@ -79,11 +84,18 @@ function formatDuration(startedAt: string | null, currentTime: number) {
   return [hours, minutes, rest].map((value) => String(value).padStart(2, "0")).join(":");
 }
 
+function formatRetry(nextRetryAt: string | null, currentTime: number) {
+  if (!nextRetryAt || !currentTime) return "очікуємо";
+  const seconds = Math.max(0, Math.ceil((new Date(nextRetryAt).getTime() - currentTime) / 1000));
+  return seconds > 0 ? `через ${seconds} с` : "зараз";
+}
+
 function statusLabel(status: StreamStatus["status"]) {
   return {
     STOPPED: "Зупинено",
     STARTING: "Запуск",
     LIVE: "В ефірі",
+    RECONNECTING: "Відновлення",
     STOPPING: "Зупинка",
     ERROR: "Помилка",
   }[status];
@@ -96,6 +108,11 @@ const emptyStream: StreamStatus = {
   startedAt: null,
   stoppedAt: null,
   lastError: null,
+  lastFailure: null,
+  reconnectAttempt: 0,
+  nextRetryAt: null,
+  autoResumeEnabled: false,
+  restoredAfterRestart: false,
   logs: [],
 };
 
@@ -178,7 +195,7 @@ export default function Home() {
     };
   }, [authState, refresh]);
 
-  const active = stream.status === "LIVE" || stream.status === "STARTING";
+  const active = ["LIVE", "STARTING", "RECONNECTING", "STOPPING"].includes(stream.status);
   const selectedVideo = useMemo(
     () => videos.find((video) => video.id === selectedVideoId) ?? null,
     [selectedVideoId, videos],
@@ -598,7 +615,19 @@ export default function Home() {
               <span>Зараз транслюється</span>
               <strong>{stream.videoName || selectedVideo?.name || "Відео ще не вибрано"}</strong>
             </div>
+            {stream.status === "RECONNECTING" && (
+              <div className="reconnect-info" role="status">
+                <span>Спроба {stream.reconnectAttempt}</span>
+                <strong>Наступний запуск {formatRetry(stream.nextRetryAt, now)}</strong>
+              </div>
+            )}
+            {stream.restoredAfterRestart && stream.autoResumeEnabled && (
+              <p className="auto-resume-note">Автовідновлення після перезапуску сервісу активне.</p>
+            )}
             {stream.lastError && <p className="stream-error">{stream.lastError}</p>}
+            {!stream.lastError && stream.lastFailure && (
+              <p className="stream-history">Останнє відновлення: {stream.lastFailure}</p>
+            )}
           </div>
 
           {stream.logs.length > 0 && (
@@ -611,7 +640,9 @@ export default function Home() {
       </div>
 
       <footer>
-        <span>OWNER-захист активний · автоматичне відновлення буде на наступному етапі</span>
+        <span>
+          OWNER-захист активний · {stream.autoResumeEnabled ? "автовідновлення увімкнене" : "стрім зупинений вручну"}
+        </span>
         <span className={health?.ffmpeg.available ? "footer-ok" : "footer-muted"}>
           FFmpeg {health?.ffmpeg.available ? "готовий" : "не підключений"}
         </span>

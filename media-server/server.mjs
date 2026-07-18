@@ -5,6 +5,7 @@ import { ApiError } from "./api-error.mjs";
 import { createOwnerAuth } from "./auth.mjs";
 import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
+import { EncryptedStreamStateStore } from "./stream-state-store.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, "..");
@@ -80,18 +81,32 @@ export async function createMvpServer({
   store,
   controller,
   auth,
+  stateStore,
 } = {}) {
   const videoStore = store ?? new VideoStore({ rootDir: dataDir });
+  const encryptedStateStore =
+    stateStore ??
+    (controller
+      ? null
+      : new EncryptedStreamStateStore({
+          rootDir: dataDir,
+          secret: process.env.STREAM_CONFIG_SECRET,
+        }));
   const streamController =
     controller ??
     new StreamController({
       ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
       videoBitrate: process.env.MVP_VIDEO_BITRATE || "10M",
       audioBitrate: process.env.MVP_AUDIO_BITRATE || "128k",
+      stateStore: encryptedStateStore,
     });
   const corsOrigins = allowedOrigins.length ? allowedOrigins : DEFAULT_ALLOWED_ORIGINS;
   const ownerAuth = auth ?? createOwnerAuth();
   await videoStore.init();
+  await encryptedStateStore?.init();
+  await streamController.init?.({
+    resolveVideo: (videoId) => videoStore.getReadyVideo(videoId),
+  });
 
   const server = createServer(async (request, response) => {
     setCommonHeaders(request, response, corsOrigins);
@@ -224,7 +239,8 @@ export async function createMvpServer({
       });
     },
     async close() {
-      await streamController.stop();
+      if (streamController.shutdown) await streamController.shutdown();
+      else await streamController.stop();
       await new Promise((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
       );

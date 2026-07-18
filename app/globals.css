@@ -167,6 +167,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 
 .stream-card { margin-top: 18px; padding: 17px; border: 1px solid var(--border); border-radius: 15px; background: rgba(0,0,0,.14); }
 .stream-card--live, .stream-card--starting { border-color: rgba(121,242,164,.23); background: linear-gradient(140deg, rgba(121,242,164,.055), rgba(0,0,0,.14)); }
+.stream-card--reconnecting { border-color: rgba(244,201,93,.28); background: linear-gradient(140deg, rgba(244,201,93,.065), rgba(0,0,0,.14)); }
 .stream-card--error { border-color: rgba(255,93,99,.24); }
 .stream-card-top { display: flex; align-items: center; justify-content: space-between; padding-bottom: 14px; border-bottom: 1px solid rgba(255,255,255,.07); }
 .stream-card-top > div { display: flex; align-items: center; gap: 9px; }
@@ -174,12 +175,17 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .stream-card-top > span { color: var(--muted); font: 600 12px ui-monospace, monospace; }
 .stream-pulse { width: 8px; height: 8px; border-radius: 50%; background: #59616c; }
 .stream-card--live .stream-pulse, .stream-card--starting .stream-pulse { background: var(--green); box-shadow: 0 0 0 5px rgba(121,242,164,.08); }
+.stream-card--reconnecting .stream-pulse { background: var(--yellow); box-shadow: 0 0 0 5px rgba(244,201,93,.08); }
 .stream-card--error .stream-pulse { background: var(--red); }
 .now-playing { margin-top: 14px; }
 .now-playing span, .now-playing strong { display: block; }
 .now-playing span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
 .now-playing strong { margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .stream-error { margin: 12px 0 0; color: var(--red); font-size: 11px; }
+.reconnect-info { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 13px; padding: 10px 12px; border-radius: 10px; background: rgba(244,201,93,.07); color: var(--yellow); font-size: 11px; }
+.reconnect-info strong { font-size: 11px; }
+.auto-resume-note, .stream-history { margin: 11px 0 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.auto-resume-note { color: var(--green); }
 .log-details { margin-top: 12px; padding: 0 3px; }
 .log-details summary { color: var(--muted); cursor: pointer; font-size: 11px; }
 .log-details pre { max-height: 170px; overflow: auto; margin: 10px 0 0; padding: 12px; border-radius: 10px; background: #080a0d; color: #9da8b5; font: 10px/1.5 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }

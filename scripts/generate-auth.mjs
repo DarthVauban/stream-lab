@@ -10,3 +10,4 @@ if (!password) {
 
 console.log(`OWNER_PASSWORD_HASH='${hashPassword(password)}'`);
 console.log(`SESSION_SECRET='${randomBytes(32).toString("base64url")}'`);
+console.log(`STREAM_CONFIG_SECRET='${randomBytes(32).toString("base64url")}'`);
