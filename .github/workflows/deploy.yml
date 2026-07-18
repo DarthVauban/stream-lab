@@ -61,7 +61,7 @@ jobs:
           envs: GHCR_ACTOR,GHCR_TOKEN
           script: |
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
-            cd clan-portal
+            cd stream-lab
             git pull
             docker compose pull web
             docker compose up -d
