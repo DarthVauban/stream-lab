@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8788:8788"
+      - "8788:8788"
     environment:
       MEDIA_API_HOST: 0.0.0.0
       MEDIA_API_PORT: 8788
