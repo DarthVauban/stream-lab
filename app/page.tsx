@@ -107,7 +107,7 @@ type AuthSession =
   | { authenticated: false }
   | { authenticated: true; owner: string; csrfToken: string; expiresAt: string };
 
-type WorkspaceTab = "library" | "queue" | "stream" | "monitoring" | "youtube";
+type WorkspaceTab = "library" | "queue" | "stream" | "monitoring" | "youtube" | "profile";
 type MonitoringRange = 1 | 24 | 168;
 type MonitoringHealthState = "STABLE" | "BUFFERING_RISK" | "CRITICAL" | "OFFLINE";
 
@@ -226,6 +226,17 @@ type YouTubeStatus = {
   };
   lastUpdatedAt: string | null;
   lastError: string | null;
+};
+
+type TelegramStatus = {
+  connected: boolean;
+  connectedAt: string | null;
+  tokenMasked: string | null;
+  bot: {
+    id: number;
+    username: string | null;
+    displayName: string | null;
+  } | null;
 };
 
 class ApiRequestError extends Error {
@@ -435,7 +446,12 @@ export default function Home() {
   const [youtubeAction, setYoutubeAction] = useState("");
   const [monitoring, setMonitoring] = useState<MonitoringStatus | null>(null);
   const [monitoringRange, setMonitoringRange] = useState<MonitoringRange>(24);
+  const [telegram, setTelegram] = useState<TelegramStatus | null>(null);
+  const [telegramToken, setTelegramToken] = useState("");
+  const [telegramTokenVisible, setTelegramTokenVisible] = useState(false);
+  const [telegramAction, setTelegramAction] = useState("");
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [failedChannelAvatarUrl, setFailedChannelAvatarUrl] = useState("");
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [now, setNow] = useState(0);
@@ -501,6 +517,13 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const restorePreference = window.setTimeout(() => {
+      setSidebarCollapsed(window.localStorage.getItem("streamlab:sidebar-collapsed") === "true");
+    }, 0);
+    return () => window.clearTimeout(restorePreference);
+  }, []);
+
+  useEffect(() => {
     if (authState !== "authenticated") return;
     const initialRefresh = window.setTimeout(refresh, 0);
     const poll = window.setInterval(refresh, 2000);
@@ -541,7 +564,7 @@ export default function Home() {
     const result = new URLSearchParams(window.location.search).get("youtube");
     if (!result) return;
     const notification = window.setTimeout(() => {
-      setActiveTab("youtube");
+      setActiveTab("profile");
       setNotice(
         result === "connected"
           ? { type: "success", text: "YouTube-канал підключено." }
@@ -558,13 +581,15 @@ export default function Home() {
     void Promise.all([
       api<{ settings: StreamSettings }>("/api/settings/stream"),
       api<{ presets: StreamPresetSummary[] }>("/api/stream-presets"),
+      api<{ telegram: TelegramStatus }>("/api/telegram/status"),
     ])
-      .then(([{ settings }, { presets }]) => {
+      .then(([{ settings }, { presets }, { telegram }]) => {
         if (cancelled) return;
         setStreamSettings(settings);
         setBitrateDraft(settings.videoBitrateKbps);
         setFallbackVideoDraft(settings.fallbackVideoId ?? "");
         setStreamPresets(presets);
+        setTelegram(telegram);
       })
       .catch((error) => {
         if (!cancelled) {
@@ -607,6 +632,26 @@ export default function Home() {
     monitoring?.current.targetBitrateKbps ?? 0,
     ...(monitoring?.history.map((item) => item.bitrateKbps ?? 0) ?? []),
   );
+  const pageMeta = {
+    library: { eyebrow: "Медіатека", title: "Бібліотека відео", description: "Завантаження, підготовка та керування файлами." },
+    queue: { eyebrow: "Плейлист", title: "Черга трансляції", description: "Порядок безперервного відтворення в ефірі." },
+    stream: { eyebrow: "Трансляція", title: "Керування ефіром", description: "Профіль сигналу, RTMPS-підключення та запуск." },
+    monitoring: { eyebrow: "Діагностика", title: "Моніторинг ефіру", description: "Якість сигналу, продуктивність і журнал подій." },
+    youtube: { eyebrow: "Аналітика", title: "YouTube", description: "Активна трансляція, показники каналу та сигнал ingest." },
+    profile: { eyebrow: "Обліковий запис", title: "Профіль та інтеграції", description: "Доступ власника, YouTube і Telegram-бот." },
+  }[activeTab];
+  const navigationItems: Array<{
+    id: Exclude<WorkspaceTab, "profile">;
+    icon: string;
+    label: string;
+    description: string;
+  }> = [
+    { id: "library", icon: "▦", label: "Бібліотека", description: "Відеофайли" },
+    { id: "queue", icon: "≡", label: "Черга", description: "Порядок ефіру" },
+    { id: "stream", icon: "▶", label: "Ефір", description: "Запуск і керування" },
+    { id: "monitoring", icon: "⌁", label: "Моніторинг", description: "Якість сигналу" },
+    { id: "youtube", icon: "YT", label: "YouTube", description: "Канал і аналітика" },
+  ];
 
   async function login(event: FormEvent) {
     event.preventDefault();
@@ -653,6 +698,10 @@ export default function Home() {
       setYoutubeAction("");
       setMonitoring(null);
       setMonitoringRange(24);
+      setTelegram(null);
+      setTelegramToken("");
+      setTelegramTokenVisible(false);
+      setTelegramAction("");
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
     }
@@ -1213,6 +1262,65 @@ export default function Home() {
     }
   }
 
+  async function connectTelegram() {
+    if (telegramAction || !telegramToken.trim()) return;
+    setTelegramAction("connect");
+    setNotice(null);
+    try {
+      const result = await api<{ telegram: TelegramStatus }>(
+        "/api/telegram/connect",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: telegramToken.trim() }),
+        },
+        csrfToken,
+      );
+      setTelegram(result.telegram);
+      setTelegramToken("");
+      setTelegramTokenVisible(false);
+      setNotice({ type: "success", text: "Telegram-бот підключено й перевірено." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося підключити Telegram-бота.",
+      });
+    } finally {
+      setTelegramAction("");
+    }
+  }
+
+  async function disconnectTelegram() {
+    if (telegramAction || !window.confirm("Відключити Telegram-бота від StreamLab?")) return;
+    setTelegramAction("disconnect");
+    setNotice(null);
+    try {
+      const result = await api<{ telegram: TelegramStatus }>(
+        "/api/telegram/disconnect",
+        { method: "DELETE" },
+        csrfToken,
+      );
+      setTelegram(result.telegram);
+      setTelegramToken("");
+      setNotice({ type: "success", text: "Telegram-бот відключено." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося відключити Telegram-бота.",
+      });
+    } finally {
+      setTelegramAction("");
+    }
+  }
+
+  function toggleSidebar() {
+    setSidebarCollapsed((collapsed) => {
+      const next = !collapsed;
+      window.localStorage.setItem("streamlab:sidebar-collapsed", String(next));
+      return next;
+    });
+  }
+
   async function refreshYouTube() {
     if (youtubeAction) return;
     setYoutubeAction("refresh");
@@ -1353,43 +1461,80 @@ export default function Home() {
   }
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div className="brand" aria-label="StreamLab">
-          <span className="brand-mark" aria-hidden="true"><span /></span>
-          <span>StreamLab</span>
-          <span className="mvp-tag">MVP</span>
-        </div>
-        <div className="topbar-actions">
-          <div className={`live-indicator live-indicator--${stream.status.toLowerCase()}`}>
-            <span className="status-dot" aria-hidden="true" />
-            {statusLabel(stream.status)}
+    <div className={`dashboard-shell ${sidebarCollapsed ? "dashboard-shell--collapsed" : ""}`}>
+      <aside className="app-sidebar" aria-label="Основна навігація">
+        <div className="sidebar-header">
+          <div className="sidebar-brand" aria-label="StreamLab">
+            <span className="brand-mark" aria-hidden="true"><span /></span>
+            <span className="sidebar-brand-copy"><strong>StreamLab</strong><small>24/7 Manager</small></span>
           </div>
-          <span className="owner-name">{owner}</span>
-          <button className="logout-button" type="button" onClick={logout}>Вийти</button>
+          <button
+            className="sidebar-toggle"
+            type="button"
+            onClick={toggleSidebar}
+            aria-label={sidebarCollapsed ? "Розгорнути сайдбар" : "Згорнути сайдбар"}
+            title={sidebarCollapsed ? "Розгорнути сайдбар" : "Згорнути сайдбар"}
+          >
+            {sidebarCollapsed ? "›" : "‹"}
+          </button>
         </div>
-      </header>
 
-      <section className="hero">
-        <div>
-          <p className="eyebrow">YouTube 24/7 Stream Manager</p>
-          <h1>Одне відео. Один ефір. Без зайвого.</h1>
-          <p className="hero-copy">
-            Завантажте відео, дочекайтеся автоматичної підготовки, додайте дані
-            трансляції YouTube і запустіть циклічний стрім через FFmpeg.
-          </p>
+        <nav className="sidebar-nav">
+          {navigationItems.map((item) => (
+            <button
+              className={activeTab === item.id ? "sidebar-nav-item sidebar-nav-item--active" : "sidebar-nav-item"}
+              key={item.id}
+              type="button"
+              onClick={() => setActiveTab(item.id)}
+              aria-current={activeTab === item.id ? "page" : undefined}
+              aria-label={item.label}
+              title={sidebarCollapsed ? item.label : undefined}
+            >
+              <span className="sidebar-nav-icon" aria-hidden="true">{item.icon}</span>
+              <span className="sidebar-nav-copy"><strong>{item.label}</strong><small>{item.description}</small></span>
+              {item.id === "library" && <span className="sidebar-nav-value">{videos.length}</span>}
+              {item.id === "queue" && <span className="sidebar-nav-value">{queue.items.length}</span>}
+              {item.id === "stream" && <span className={`sidebar-state-dot sidebar-state-dot--${stream.status.toLowerCase()}`} aria-hidden="true" />}
+              {item.id === "monitoring" && <span className={`sidebar-state-dot sidebar-state-dot--${(monitoring?.status || "OFFLINE").toLowerCase()}`} aria-hidden="true" />}
+              {item.id === "youtube" && <span className={`sidebar-state-dot ${youtube?.connected ? "sidebar-state-dot--live" : ""}`} aria-hidden="true" />}
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-footer">
+          <button
+            className={activeTab === "profile" ? "sidebar-profile sidebar-profile--active" : "sidebar-profile"}
+            type="button"
+            onClick={() => setActiveTab("profile")}
+            aria-current={activeTab === "profile" ? "page" : undefined}
+            aria-label="Профіль"
+            title={sidebarCollapsed ? "Профіль" : undefined}
+          >
+            <span className="sidebar-profile-avatar" aria-hidden="true">{owner.slice(0, 1).toUpperCase()}</span>
+            <span className="sidebar-nav-copy"><strong>{owner}</strong><small>Профіль та інтеграції</small></span>
+            <span className="sidebar-profile-arrow" aria-hidden="true">›</span>
+          </button>
         </div>
-        <div className="hero-stats" aria-label="Поточний стан">
-          <div>
-            <span>Відео</span>
-            <strong>{videos.length}</strong>
+      </aside>
+
+      <main className="app-main">
+        <header className="page-header">
+          <div className="page-heading">
+            <p className="eyebrow">{pageMeta.eyebrow}</p>
+            <h1>{pageMeta.title}</h1>
+            <p>{pageMeta.description}</p>
           </div>
-          <div>
-            <span>Uptime</span>
-            <strong>{formatDuration(stream.startedAt, now)}</strong>
+          <div className="page-status">
+            <div className={`live-indicator live-indicator--${stream.status.toLowerCase()}`}>
+              <span className="status-dot" aria-hidden="true" />
+              {statusLabel(stream.status)}
+            </div>
+            <div className="page-stat"><span>Відео</span><strong>{videos.length}</strong></div>
+            <div className="page-stat"><span>Uptime</span><strong>{formatDuration(stream.startedAt, now)}</strong></div>
           </div>
-        </div>
-      </section>
+        </header>
+
+        <div className="app-content">
 
       {!health && (
         <div className="system-banner system-banner--error" role="alert">
@@ -1418,79 +1563,12 @@ export default function Home() {
         </div>
       )}
 
-      <nav className="workspace-tabs" role="tablist" aria-label="Розділи StreamLab">
-        <button
-          className={activeTab === "library" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
-          type="button"
-          role="tab"
-          aria-selected={activeTab === "library"}
-          aria-controls="workspace-library"
-          onClick={() => setActiveTab("library")}
-        >
-          <span className="workspace-tab-number">01</span>
-          <span className="workspace-tab-copy"><strong>Бібліотека</strong><small>Файли та завантаження</small></span>
-          <span className="workspace-tab-value">{videos.length}</span>
-        </button>
-        <button
-          className={activeTab === "queue" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
-          type="button"
-          role="tab"
-          aria-selected={activeTab === "queue"}
-          aria-controls="workspace-queue"
-          onClick={() => setActiveTab("queue")}
-        >
-          <span className="workspace-tab-number">02</span>
-          <span className="workspace-tab-copy"><strong>Черга</strong><small>Порядок відтворення</small></span>
-          <span className="workspace-tab-value">{queue.items.length}</span>
-        </button>
-        <button
-          className={activeTab === "stream" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
-          type="button"
-          role="tab"
-          aria-selected={activeTab === "stream"}
-          aria-controls="workspace-stream"
-          onClick={() => setActiveTab("stream")}
-        >
-          <span className="workspace-tab-number">03</span>
-          <span className="workspace-tab-copy"><strong>Ефір</strong><small>Запуск і керування</small></span>
-          <span className={`workspace-tab-state workspace-tab-state--${stream.status.toLowerCase()}`}>
-            {statusLabel(stream.status)}
-          </span>
-        </button>
-        <button
-          className={activeTab === "monitoring" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
-          type="button"
-          role="tab"
-          aria-selected={activeTab === "monitoring"}
-          aria-controls="workspace-monitoring"
-          onClick={() => setActiveTab("monitoring")}
-        >
-          <span className="workspace-tab-number">04</span>
-          <span className="workspace-tab-copy"><strong>Моніторинг</strong><small>Якість і події</small></span>
-          <span className={`monitoring-tab-status monitoring-tab-status--${(monitoring?.status || "OFFLINE").toLowerCase()}`}>
-            {monitoringStatusLabel(monitoring?.status)}
-          </span>
-        </button>
-        <button
-          className={activeTab === "youtube" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
-          type="button"
-          role="tab"
-          aria-selected={activeTab === "youtube"}
-          aria-controls="workspace-youtube"
-          onClick={() => setActiveTab("youtube")}
-        >
-          <span className="workspace-tab-number">05</span>
-          <span className="workspace-tab-copy"><strong>YouTube</strong><small>Канал і аналітика</small></span>
-          <span className={`workspace-tab-dot ${youtube?.connected ? "workspace-tab-dot--active" : ""}`} aria-label={youtube?.connected ? "Канал підключено" : "Канал не підключено"} />
-        </button>
-      </nav>
-
       <div className="workspace-grid workspace-grid--tabs">
         {activeTab === "library" && (
-        <section id="workspace-library" className="panel upload-panel" role="tabpanel" aria-labelledby="upload-title">
+        <section id="workspace-library" className="panel upload-panel" aria-labelledby="upload-title">
           <div className="panel-heading">
             <div>
-              <span className="step-number">01</span>
+              <span className="section-icon" aria-hidden="true">▦</span>
               <h2 id="upload-title">Відеофайл</h2>
             </div>
             <span className="panel-kicker">до 50 ГБ</span>
@@ -1637,10 +1715,10 @@ export default function Home() {
         )}
 
         {activeTab === "stream" && (
-        <section id="workspace-stream" className="panel stream-panel" role="tabpanel" aria-labelledby="stream-title">
+        <section id="workspace-stream" className="panel stream-panel" aria-labelledby="stream-title">
           <div className="panel-heading">
             <div>
-              <span className="step-number">03</span>
+              <span className="section-icon" aria-hidden="true">▶</span>
               <h2 id="stream-title">Запуск ефіру</h2>
             </div>
             <span className="panel-kicker">RTMPS</span>
@@ -1876,10 +1954,10 @@ export default function Home() {
         )}
 
         {activeTab === "monitoring" && (
-        <section id="workspace-monitoring" className="panel monitoring-panel" role="tabpanel" aria-labelledby="monitoring-title">
+        <section id="workspace-monitoring" className="panel monitoring-panel" aria-labelledby="monitoring-title">
           <div className="panel-heading monitoring-heading">
             <div>
-              <span className="step-number">04</span>
+              <span className="section-icon" aria-hidden="true">⌁</span>
               <h2 id="monitoring-title">Моніторинг ефіру</h2>
             </div>
             <div className="monitoring-range" aria-label="Період графіків">
@@ -2028,10 +2106,10 @@ export default function Home() {
         )}
 
         {activeTab === "youtube" && (
-        <section id="workspace-youtube" className="panel youtube-panel" role="tabpanel" aria-labelledby="youtube-title">
+        <section id="workspace-youtube" className="panel youtube-panel" aria-labelledby="youtube-title">
           <div className="panel-heading">
             <div>
-              <span className="step-number">05</span>
+              <span className="section-icon section-icon--text" aria-hidden="true">YT</span>
               <h2 id="youtube-title">YouTube</h2>
             </div>
             <span className={`youtube-connection ${youtube?.connected ? "youtube-connection--active" : ""}`}>
@@ -2049,17 +2127,16 @@ export default function Home() {
               <div>
                 <span className="youtube-logo" aria-hidden="true">▶</span>
                 <div>
-                  <strong>Підключіть канал через Google</strong>
-                  <p>StreamLab отримає лише доступ для читання даних каналу, ефірів і їхніх показників.</p>
+                  <strong>YouTube-канал ще не підключено</strong>
+                  <p>Керування інтеграціями тепер знаходиться на екрані профілю.</p>
                 </div>
               </div>
               <button
                 className="button button--primary"
                 type="button"
-                onClick={connectYouTube}
-                disabled={Boolean(youtubeAction)}
+                onClick={() => setActiveTab("profile")}
               >
-                {youtubeAction === "connect" ? "Переходимо…" : "Підключити YouTube"}
+                Перейти до профілю
               </button>
             </div>
           ) : (
@@ -2091,14 +2168,6 @@ export default function Home() {
                 <div className="youtube-toolbar-actions">
                   <button type="button" onClick={refreshYouTube} disabled={Boolean(youtubeAction)}>
                     {youtubeAction === "refresh" ? "Оновлюємо…" : "Оновити"}
-                  </button>
-                  <button
-                    className="youtube-disconnect"
-                    type="button"
-                    onClick={disconnectYouTube}
-                    disabled={Boolean(youtubeAction)}
-                  >
-                    Відключити
                   </button>
                 </div>
               </div>
@@ -2205,11 +2274,146 @@ export default function Home() {
         </section>
         )}
 
-        {activeTab === "queue" && (
-        <section id="workspace-queue" className="panel queue-panel" role="tabpanel" aria-labelledby="queue-title">
+        {activeTab === "profile" && (
+        <section id="workspace-profile" className="panel profile-panel" aria-labelledby="profile-title">
           <div className="panel-heading">
             <div>
-              <span className="step-number">02</span>
+              <span className="section-icon" aria-hidden="true">{owner.slice(0, 1).toUpperCase()}</span>
+              <h2 id="profile-title">Профіль власника</h2>
+            </div>
+            <span className="panel-kicker">OWNER</span>
+          </div>
+
+          <div className="profile-grid">
+            <article className="profile-card profile-account-card">
+              <div className="profile-card-heading">
+                <div><span>Обліковий запис</span><strong>Доступ до StreamLab</strong></div>
+                <span className="integration-status integration-status--active">активний</span>
+              </div>
+              <div className="profile-owner">
+                <span className="profile-owner-avatar" aria-hidden="true">{owner.slice(0, 1).toUpperCase()}</span>
+                <div><strong>{owner}</strong><span>Власник робочого простору</span></div>
+              </div>
+              <p>Поточна сесія захищена HttpOnly cookie та автоматично завершується через 12 годин.</p>
+              <button className="button button--danger profile-logout" type="button" onClick={logout}>Вийти з профілю</button>
+            </article>
+
+            <article className="profile-card profile-integration-card">
+              <div className="profile-card-heading">
+                <div><span>Інтеграція</span><strong>YouTube</strong></div>
+                <span className={`integration-status ${youtube?.connected ? "integration-status--active" : ""}`}>
+                  {youtube?.connected ? "підключено" : "не підключено"}
+                </span>
+              </div>
+              {youtube?.connected ? (
+                <div className="integration-connected">
+                  <span className="youtube-avatar profile-youtube-avatar" aria-hidden="true">
+                    {(youtube.channel?.title || "Y").slice(0, 1).toUpperCase()}
+                    {youtube.channel?.thumbnailUrl && failedChannelAvatarUrl !== youtube.channel.thumbnailUrl && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={youtube.channel.thumbnailUrl}
+                        alt=""
+                        referrerPolicy="no-referrer"
+                        onError={() => setFailedChannelAvatarUrl(youtube.channel?.thumbnailUrl || "")}
+                      />
+                    )}
+                  </span>
+                  <div>
+                    <strong>{youtube.channel?.title || "YouTube-канал"}</strong>
+                    <span>Аналітика й дані трансляцій доступні</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="integration-empty">
+                  <span className="youtube-logo" aria-hidden="true">▶</span>
+                  <div>
+                    <strong>Підключіть канал через Google</strong>
+                    <p>StreamLab запитує лише доступ для читання каналу, ефірів і показників.</p>
+                  </div>
+                </div>
+              )}
+              {!youtube?.configured && (
+                <p className="integration-warning">Спочатку додайте GOOGLE_OAUTH змінні на сервері.</p>
+              )}
+              <div className="profile-card-actions">
+                {youtube?.connected ? (
+                  <>
+                    <button className="button button--quiet" type="button" onClick={() => setActiveTab("youtube")}>Відкрити YouTube</button>
+                    <button className="button button--danger" type="button" onClick={disconnectYouTube} disabled={Boolean(youtubeAction)}>
+                      {youtubeAction === "disconnect" ? "Відключаємо…" : "Відключити"}
+                    </button>
+                  </>
+                ) : (
+                  <button className="button button--primary button--full" type="button" onClick={connectYouTube} disabled={!youtube?.configured || Boolean(youtubeAction)}>
+                    {youtubeAction === "connect" ? "Переходимо до Google…" : "Підключити YouTube"}
+                  </button>
+                )}
+              </div>
+            </article>
+
+            <article className="profile-card profile-integration-card profile-telegram-card">
+              <div className="profile-card-heading">
+                <div><span>Інтеграція</span><strong>Telegram Bot</strong></div>
+                <span className={`integration-status ${telegram?.connected ? "integration-status--active" : ""}`}>
+                  {telegram?.connected ? "підключено" : "не підключено"}
+                </span>
+              </div>
+              {telegram?.connected && (
+                <div className="integration-connected telegram-connected">
+                  <span className="telegram-bot-avatar" aria-hidden="true">TG</span>
+                  <div>
+                    <strong>{telegram.bot?.displayName || telegram.bot?.username || "Telegram-бот"}</strong>
+                    <span>{telegram.bot?.username ? `@${telegram.bot.username}` : `Bot ID ${telegram.bot?.id}`} · {telegram.tokenMasked}</span>
+                  </div>
+                </div>
+              )}
+              <form
+                className="telegram-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void connectTelegram();
+                }}
+              >
+                <label className="field">
+                  <span>{telegram?.connected ? "Новий bot token" : "Bot token від @BotFather"}</span>
+                  <div className="secret-input">
+                    <input
+                      type={telegramTokenVisible ? "text" : "password"}
+                      value={telegramToken}
+                      onChange={(event) => setTelegramToken(event.target.value)}
+                      placeholder={telegram?.connected ? "Вставте токен, щоб замінити поточний" : "123456789:AA…"}
+                      autoComplete="off"
+                      spellCheck={false}
+                      disabled={Boolean(telegramAction)}
+                    />
+                    <button type="button" onClick={() => setTelegramTokenVisible((visible) => !visible)} disabled={!telegramToken}>
+                      {telegramTokenVisible ? "Сховати" : "Показати"}
+                    </button>
+                  </div>
+                  <small>Перед збереженням StreamLab перевірить токен через Telegram API. Повне значення більше не показується.</small>
+                </label>
+                <div className="profile-card-actions">
+                  <button className="button button--primary" type="submit" disabled={!telegramToken.trim() || Boolean(telegramAction)}>
+                    {telegramAction === "connect" ? "Перевіряємо…" : telegram?.connected ? "Замінити токен" : "Підключити бота"}
+                  </button>
+                  {telegram?.connected && (
+                    <button className="button button--danger" type="button" onClick={disconnectTelegram} disabled={Boolean(telegramAction)}>
+                      {telegramAction === "disconnect" ? "Відключаємо…" : "Відключити"}
+                    </button>
+                  )}
+                </div>
+              </form>
+            </article>
+          </div>
+        </section>
+        )}
+
+        {activeTab === "queue" && (
+        <section id="workspace-queue" className="panel queue-panel" aria-labelledby="queue-title">
+          <div className="panel-heading">
+            <div>
+              <span className="section-icon" aria-hidden="true">≡</span>
               <h2 id="queue-title">Черга трансляції</h2>
             </div>
             <span className="panel-kicker">{queue.items.length} · LOOP</span>
@@ -2324,6 +2528,8 @@ export default function Home() {
           FFmpeg {health?.ffmpeg.available ? "готовий" : "не підключений"}
         </span>
       </footer>
-    </main>
+        </div>
+      </main>
+    </div>
   );
 }

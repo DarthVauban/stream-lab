@@ -12,6 +12,8 @@ import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
 import { EncryptedStreamPresetStore } from "./stream-preset-store.mjs";
 import { EncryptedStreamStateStore } from "./stream-state-store.mjs";
+import { TelegramService } from "./telegram-service.mjs";
+import { EncryptedTelegramStore } from "./telegram-store.mjs";
 import { YouTubeService } from "./youtube-service.mjs";
 import { EncryptedYouTubeStore, YouTubeStatsStore } from "./youtube-store.mjs";
 
@@ -116,6 +118,7 @@ export async function createMvpServer({
   presets,
   youtube,
   monitoring,
+  telegram,
 } = {}) {
   const videoStore = store ?? new VideoStore({ rootDir: dataDir });
   const liveQueue = queue ?? new QueueStore({ rootDir: dataDir });
@@ -174,6 +177,11 @@ export async function createMvpServer({
           }
         : {},
     );
+  const telegramIntegration =
+    telegram ??
+    new TelegramService({
+      store: new EncryptedTelegramStore({ rootDir: dataDir }),
+    });
   await encryptedStateStore?.init();
   await streamController.init?.({
     resolveVideo: (videoId) => videoStore.getReadyVideo(videoId),
@@ -192,6 +200,7 @@ export async function createMvpServer({
   await mediaProcessor.init?.();
   await youtubeIntegration.init?.();
   youtubeIntegration.start?.();
+  await telegramIntegration.init?.();
   const monitoringService =
     monitoring ??
     new MonitoringService({
@@ -346,6 +355,24 @@ export async function createMvpServer({
         json(response, 200, {
           monitoring: monitoringService.snapshot({ hours: url.searchParams.get("hours") }),
         });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/telegram/status") {
+        json(response, 200, { telegram: telegramIntegration.snapshot() });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/telegram/connect") {
+        const body = await readJson(request, 8 * 1024);
+        const snapshot = await telegramIntegration.connect(body.token);
+        json(response, 200, { telegram: snapshot });
+        return;
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/api/telegram/disconnect") {
+        const snapshot = await telegramIntegration.disconnect();
+        json(response, 200, { telegram: snapshot });
         return;
       }
 
@@ -654,6 +681,7 @@ export async function createMvpServer({
     presets: streamPresetStore,
     youtube: youtubeIntegration,
     monitoring: monitoringService,
+    telegram: telegramIntegration,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);

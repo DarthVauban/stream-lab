@@ -8,6 +8,8 @@ import { MediaProcessor } from "../media-server/media-processor.mjs";
 import { createMvpServer, normalizeServerError } from "../media-server/server.mjs";
 import { VideoStore } from "../media-server/store.mjs";
 import { EncryptedStreamPresetStore } from "../media-server/stream-preset-store.mjs";
+import { TelegramService } from "../media-server/telegram-service.mjs";
+import { EncryptedTelegramStore } from "../media-server/telegram-store.mjs";
 import {
   buildPlayoutFfmpegArgs,
   buildUplinkFfmpegArgs,
@@ -105,6 +107,24 @@ function testPresetStore(dataDir) {
   });
 }
 
+function testTelegram(dataDir) {
+  return new TelegramService({
+    store: new EncryptedTelegramStore({
+      rootDir: dataDir,
+      secret: "streamlab-test-telegram-secret-32-characters",
+    }),
+    fetchImpl: async () => ({
+      ok: true,
+      async json() {
+        return {
+          ok: true,
+          result: { id: 123456, is_bot: true, username: "streamlab_test_bot", first_name: "StreamLab" },
+        };
+      },
+    }),
+  });
+}
+
 async function login(baseUrl) {
   const response = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
@@ -157,6 +177,7 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
     controller,
     auth: testAuth(),
     presets: testPresetStore(dataDir),
+    telegram: testTelegram(dataDir),
   });
   const address = await app.listen(0, "127.0.0.1");
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -170,6 +191,26 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(unauthorized.status, 401);
 
   const session = await login(baseUrl);
+  const telegramToken = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd";
+  const telegramResponse = await fetch(`${baseUrl}/api/telegram/connect`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: session.cookie,
+      "X-CSRF-Token": session.csrfToken,
+    },
+    body: JSON.stringify({ token: telegramToken }),
+  });
+  assert.equal(telegramResponse.status, 200);
+  const telegram = (await telegramResponse.json()).telegram;
+  assert.equal(telegram.connected, true);
+  assert.equal(telegram.bot.username, "streamlab_test_bot");
+  assert.equal(telegram.token, undefined);
+  assert.match(telegram.tokenMasked, /abcd$/);
+  assert.doesNotMatch(
+    await readFile(path.join(dataDir, "telegram-bot.enc.json"), "utf8"),
+    new RegExp(telegramToken),
+  );
   const createPresetResponse = await fetch(`${baseUrl}/api/stream-presets`, {
     method: "POST",
     headers: {
@@ -398,6 +439,7 @@ test("rejects state-changing requests without a CSRF token", async (t) => {
     controller: new FakeController(),
     auth: testAuth(),
     presets: testPresetStore(dataDir),
+    telegram: testTelegram(dataDir),
   });
   const address = await app.listen(0, "127.0.0.1");
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -493,6 +535,7 @@ test("protects YouTube controls while allowing the state-validated OAuth callbac
     auth: testAuth(),
     presets: testPresetStore(dataDir),
     youtube,
+    telegram: testTelegram(dataDir),
   });
   const address = await app.listen(0, "127.0.0.1");
   const baseUrl = `http://127.0.0.1:${address.port}`;
