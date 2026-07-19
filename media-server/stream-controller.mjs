@@ -1,23 +1,40 @@
 import { spawn, spawnSync } from "node:child_process";
-import { rename, rm, writeFile } from "node:fs/promises";
 import { ApiError } from "./api-error.mjs";
 
-export function buildFfmpegArgs({
-  inputPath,
-  playlistPath,
+const ACTIVE_STATUSES = new Set(["STARTING", "LIVE", "DEGRADED", "RECONNECTING", "STOPPING"]);
+const MIN_VIDEO_BITRATE_KBPS = 3_000;
+const MAX_VIDEO_BITRATE_KBPS = 12_000;
+
+export function normalizeVideoBitrateKbps(value, fallback = 8_000) {
+  const bitrate = Number(value);
+  if (!Number.isInteger(bitrate)) return fallback;
+  if (bitrate < MIN_VIDEO_BITRATE_KBPS || bitrate > MAX_VIDEO_BITRATE_KBPS) {
+    throw new ApiError(
+      400,
+      "INVALID_VIDEO_BITRATE",
+      "Відеобітрейт має бути від 3000 до 12000 Кбіт/с.",
+    );
+  }
+  return bitrate;
+}
+
+export function buildUplinkFfmpegArgs({
+  inputUrl,
   target,
-  videoBitrate = "10M",
-  audioBitrate = "128k",
+  videoBitrateKbps = 8_000,
+  audioBitrate = "192k",
 }) {
-  const inputArgs = playlistPath
-    ? ["-stream_loop", "-1", "-f", "concat", "-safe", "0", "-i", playlistPath]
-    : ["-stream_loop", "-1", "-i", inputPath];
+  const bitrate = normalizeVideoBitrateKbps(videoBitrateKbps);
   return [
     "-hide_banner",
     "-loglevel",
     "info",
-    "-re",
-    ...inputArgs,
+    "-fflags",
+    "+genpts+discardcorrupt",
+    "-thread_queue_size",
+    "2048",
+    "-i",
+    inputUrl,
     "-vf",
     "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
     "-r",
@@ -29,13 +46,13 @@ export function buildFfmpegArgs({
     "-tune",
     "zerolatency",
     "-b:v",
-    videoBitrate,
+    `${bitrate}k`,
     "-minrate",
-    videoBitrate,
+    `${bitrate}k`,
     "-maxrate",
-    videoBitrate,
+    `${bitrate}k`,
     "-bufsize",
-    "20M",
+    `${bitrate * 2}k`,
     "-g",
     "60",
     "-keyint_min",
@@ -47,7 +64,7 @@ export function buildFfmpegArgs({
     "-b:a",
     audioBitrate,
     "-ar",
-    "44100",
+    "48000",
     "-ac",
     "2",
     "-af",
@@ -58,19 +75,44 @@ export function buildFfmpegArgs({
   ];
 }
 
-function escapeConcatPath(filePath) {
-  return filePath.replace(/'/g, "'\\''");
+export function buildPlayoutFfmpegArgs({ inputPath, outputUrl, timestampOffsetSeconds = 0 }) {
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "info",
+    "-re",
+    "-i",
+    inputPath,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0",
+    "-c",
+    "copy",
+    "-output_ts_offset",
+    Math.max(0, timestampOffsetSeconds).toFixed(3),
+    "-mpegts_flags",
+    "+resend_headers",
+    "-muxdelay",
+    "0",
+    "-muxpreload",
+    "0",
+    "-flush_packets",
+    "1",
+    "-f",
+    "mpegts",
+    outputUrl,
+  ];
 }
 
-export function buildConcatPlaylist(videos) {
-  if (!Array.isArray(videos) || videos.length === 0) {
-    throw new ApiError(409, "QUEUE_EMPTY", "Додайте хоча б одне готове відео до черги.");
-  }
-  return [
-    "ffconcat version 1.0",
-    ...videos.map((video) => `file '${escapeConcatPath(video.filePath)}'`),
-    "",
-  ].join("\n");
+// Backwards-compatible export for integrations that still import the old helper.
+export function buildFfmpegArgs(options) {
+  return buildUplinkFfmpegArgs({
+    inputUrl: options.inputUrl ?? options.playlistPath ?? options.inputPath,
+    target: options.target,
+    videoBitrateKbps: options.videoBitrateKbps ?? Number.parseInt(options.videoBitrate, 10) * 1_000,
+    audioBitrate: options.audioBitrate,
+  });
 }
 
 function redact(text, secrets) {
@@ -80,16 +122,22 @@ function redact(text, secrets) {
   );
 }
 
+function durationMs(item) {
+  const seconds = Number(item?.media?.durationSeconds);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1_000) : 0;
+}
+
 export class StreamController {
   constructor({
     ffmpegPath = "ffmpeg",
-    videoBitrate = "10M",
-    audioBitrate = "128k",
-    playlistPath = null,
+    videoBitrateKbps = 8_000,
+    audioBitrate = "192k",
+    udpHost = "127.0.0.1",
+    udpPort = Number(process.env.PLAYOUT_UDP_PORT || 23_000),
     spawnImpl = spawn,
     spawnSyncImpl = spawnSync,
     stateStore = null,
-    reconnectBaseMs = Number(process.env.STREAM_RECONNECT_BASE_MS || 2000),
+    reconnectBaseMs = Number(process.env.STREAM_RECONNECT_BASE_MS || 2_000),
     reconnectMaxMs = Number(process.env.STREAM_RECONNECT_MAX_MS || 300_000),
     stableRunMs = Number(process.env.STREAM_STABLE_RUN_MS || 60_000),
     setTimeoutImpl = setTimeout,
@@ -97,9 +145,10 @@ export class StreamController {
     now = () => Date.now(),
   } = {}) {
     this.ffmpegPath = ffmpegPath;
-    this.videoBitrate = videoBitrate;
+    this.defaultVideoBitrateKbps = normalizeVideoBitrateKbps(videoBitrateKbps);
     this.audioBitrate = audioBitrate;
-    this.playlistPath = playlistPath;
+    this.udpInputUrl = `udp://${udpHost}:${udpPort}?fifo_size=262144&overrun_nonfatal=1&buffer_size=1048576`;
+    this.udpOutputUrl = `udp://${udpHost}:${udpPort}?pkt_size=1316&buffer_size=1048576`;
     this.spawnImpl = spawnImpl;
     this.spawnSyncImpl = spawnSyncImpl;
     this.stateStore = stateStore;
@@ -109,22 +158,31 @@ export class StreamController {
     this.setTimeoutImpl = setTimeoutImpl;
     this.clearTimeoutImpl = clearTimeoutImpl;
     this.now = now;
-    this.child = null;
-    this.runId = 0;
+    this.uplinkChild = null;
+    this.playoutChild = null;
+    this.uplinkRunId = 0;
+    this.playoutRunId = 0;
     this.desired = null;
+    this.currentItem = null;
+    this.currentStartedAtMs = null;
+    this.playoutClockSeconds = 0;
+    this.skipRequested = false;
+    this.skipCompletion = null;
+    this.getQueue = () => [];
+    this.getFallback = () => null;
     this.resolveVideo = null;
     this.reconnectTimer = null;
+    this.playoutRetryTimer = null;
     this.failureStreak = 0;
-    this.currentAttemptStartedAt = null;
+    this.uplinkAttemptStartedAt = null;
     this.shuttingDown = false;
     this.secrets = [];
     this.logs = [];
+    this.history = [];
     this.ffmpegHealth = null;
     this.ffmpegHealthCheckedAt = 0;
     this.state = {
       status: "STOPPED",
-      videoId: null,
-      videoName: null,
       startedAt: null,
       stoppedAt: null,
       lastError: null,
@@ -136,8 +194,10 @@ export class StreamController {
     };
   }
 
-  async init({ resolveVideo }) {
-    this.resolveVideo = resolveVideo;
+  async init({ resolveVideo, getQueue, getFallback } = {}) {
+    this.resolveVideo = resolveVideo ?? this.resolveVideo;
+    this.getQueue = getQueue ?? this.getQueue;
+    this.getFallback = getFallback ?? this.getFallback;
     if (!this.stateStore) return this.snapshot();
 
     let persisted;
@@ -152,19 +212,32 @@ export class StreamController {
     if (!persisted) return this.snapshot();
 
     try {
-      const videoIds = persisted.videoIds ?? [persisted.videoId];
-      const videos = videoIds.map((videoId, index) => ({
-        ...resolveVideo(videoId),
-        queueItemId: persisted.queueItemIds?.[index] ?? null,
-      }));
-      const video = videos[0];
-      await this.preparePlaylist(videos);
-      this.desired = { ...persisted, video, videos };
+      const queue = this.safeQueue();
+      const persistedQueueItemId = persisted.queueItemIds?.[0] ?? null;
+      let current = persistedQueueItemId
+        ? queue.find((item) => item.queueItemId === persistedQueueItemId) ?? null
+        : null;
+      const fallback = this.fallbackItem();
+      if (!current && fallback?.id === persisted.videoId) current = fallback;
+      if (!current) current = queue.find((item) => item.id === persisted.videoId) ?? null;
+      if (!current && this.resolveVideo) {
+        current = { ...this.resolveVideo(persisted.videoId), queueItemId: persistedQueueItemId };
+      }
+      if (!current) throw new Error("Збережене відео не знайдено.");
+
+      this.currentItem = current;
+      this.desired = {
+        target: persisted.target,
+        streamKey: persisted.streamKey,
+        startedAt: persisted.startedAt,
+        videoBitrateKbps: normalizeVideoBitrateKbps(
+          persisted.videoBitrateKbps,
+          this.defaultVideoBitrateKbps,
+        ),
+      };
       this.secrets = [persisted.target, persisted.streamKey];
       this.state = {
         status: "RECONNECTING",
-        videoId: video.id,
-        videoName: video.name,
         startedAt: persisted.startedAt,
         stoppedAt: null,
         lastError: "Відновлюємо трансляцію після перезапуску сервісу.",
@@ -174,16 +247,15 @@ export class StreamController {
         autoResumeEnabled: true,
         restoredAfterRestart: true,
       };
-      await this.launch({ initial: false });
+      await this.launchUplink({ initial: false });
+      await this.launchPlayout(current, { initial: false });
     } catch (error) {
-      if (this.desired) {
-        this.scheduleReconnect(error instanceof Error ? error.message : "Не вдалося відновити FFmpeg.");
-      } else {
-        this.state.status = "ERROR";
-        this.state.lastError = "Збережене відео для автоматичного відновлення не знайдено.";
-        this.state.lastFailure = this.state.lastError;
-        await this.stateStore.clear().catch(() => {});
-      }
+      this.desired = null;
+      this.currentItem = null;
+      this.state.status = "ERROR";
+      this.state.lastError = error instanceof Error ? error.message : "Не вдалося відновити ефір.";
+      this.state.lastFailure = this.state.lastError;
+      await this.stateStore.clear().catch(() => {});
     }
     return this.snapshot();
   }
@@ -194,7 +266,7 @@ export class StreamController {
     }
     const result = this.spawnSyncImpl(this.ffmpegPath, ["-version"], {
       encoding: "utf8",
-      timeout: 5000,
+      timeout: 5_000,
       windowsHide: true,
     });
     if (result.error) {
@@ -208,105 +280,117 @@ export class StreamController {
     return this.ffmpegHealth;
   }
 
+  safeQueue() {
+    const queue = this.getQueue?.();
+    return Array.isArray(queue) ? queue.filter((item) => item?.id && item?.filePath) : [];
+  }
+
+  fallbackItem() {
+    try {
+      const fallback = this.getFallback?.();
+      return fallback?.id && fallback?.filePath
+        ? { ...fallback, queueItemId: fallback.queueItemId ?? `fallback:${fallback.id}`, isFallback: true }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  nextItem({ after = this.currentItem, failed = false } = {}) {
+    const queue = this.safeQueue();
+    if (queue.length === 0) return this.fallbackItem();
+    if (failed) {
+      const fallback = this.fallbackItem();
+      if (fallback && fallback.id !== after?.id) return fallback;
+    }
+    if (!after || after.isFallback) return queue[0];
+    const currentIndex = queue.findIndex((item) => item.queueItemId === after.queueItemId);
+    if (currentIndex === -1) return queue[0];
+    if (queue.length === 1) {
+      return queue[0];
+    }
+    return queue[(currentIndex + 1) % queue.length];
+  }
+
   snapshot() {
-    const currentVideo = this.currentPlaylistVideo();
+    const currentDurationMs = durationMs(this.currentItem);
+    const positionMs = this.currentStartedAtMs === null
+      ? 0
+      : Math.max(0, Math.min(currentDurationMs || Number.MAX_SAFE_INTEGER, this.now() - this.currentStartedAtMs));
+    const next = this.nextItem();
+    const queue = this.safeQueue();
     return {
       ...this.state,
-      videoId: currentVideo?.id ?? this.state.videoId,
-      videoName: currentVideo?.name ?? this.state.videoName,
-      queueItemId: currentVideo?.queueItemId ?? null,
-      playlistLength: this.desired?.videos?.length ?? 0,
-      pid: this.child?.pid ?? null,
+      videoId: this.currentItem?.id ?? null,
+      videoName: this.currentItem?.name ?? null,
+      queueItemId: this.currentItem?.queueItemId ?? null,
+      playlistLength: queue.length,
+      positionMs,
+      durationMs: currentDurationMs,
+      remainingMs: currentDurationMs ? Math.max(0, currentDurationMs - positionMs) : null,
+      nextQueueItemId: next?.queueItemId ?? null,
+      nextVideoName: next?.name ?? null,
+      isFallback: Boolean(this.currentItem?.isFallback),
+      videoBitrateKbps: this.desired?.videoBitrateKbps ?? this.defaultVideoBitrateKbps,
+      pid: this.uplinkChild?.pid ?? null,
+      uplinkPid: this.uplinkChild?.pid ?? null,
+      playoutPid: this.playoutChild?.pid ?? null,
+      history: this.history.map((item) => ({ ...item })),
       logs: [...this.logs],
     };
   }
 
-  currentPlaylistVideo() {
-    const videos = this.desired?.videos;
-    if (!videos?.length) return null;
-    if (!this.currentAttemptStartedAt) return videos[0];
-    const durations = videos.map((video) => Number(video.media?.durationSeconds));
-    if (durations.some((duration) => !Number.isFinite(duration) || duration <= 0)) return videos[0];
-    const cycleDuration = durations.reduce((sum, duration) => sum + duration, 0);
-    let offset = Math.max(0, (this.now() - this.currentAttemptStartedAt) / 1000) % cycleDuration;
-    for (let index = 0; index < videos.length; index += 1) {
-      if (offset < durations[index]) return videos[index];
-      offset -= durations[index];
-    }
-    return videos[0];
+  isActive() {
+    return ACTIVE_STATUSES.has(this.state.status);
   }
 
   usesVideo(videoId) {
-    return Boolean(this.desired?.videos?.some((video) => video.id === videoId));
+    return this.currentItem?.id === videoId;
   }
 
-  async preparePlaylist(videos) {
-    if (!this.playlistPath) {
-      if (videos.length === 1) return null;
-      throw new Error("Не налаштовано файл плейлиста FFmpeg.");
-    }
-    const tempPath = `${this.playlistPath}.tmp`;
-    await writeFile(tempPath, buildConcatPlaylist(videos), "utf8");
-    await rename(tempPath, this.playlistPath);
-    return this.playlistPath;
+  isCurrentQueueItem(itemId) {
+    return this.currentItem?.queueItemId === itemId;
   }
 
-  async cleanupPlaylist() {
-    if (!this.playlistPath) return;
-    await rm(`${this.playlistPath}.tmp`, { force: true }).catch(() => {});
-    await rm(this.playlistPath, { force: true }).catch(() => {});
+  async persistCurrent() {
+    if (!this.desired || !this.currentItem) return;
+    await this.stateStore?.saveActive({
+      videoId: this.currentItem.id,
+      videoIds: [this.currentItem.id],
+      ...(this.currentItem.queueItemId ? { queueItemIds: [this.currentItem.queueItemId] } : {}),
+      target: this.desired.target,
+      streamKey: this.desired.streamKey,
+      startedAt: this.desired.startedAt,
+      videoBitrateKbps: this.desired.videoBitrateKbps,
+    });
   }
 
-  async start({ video, videos, target, streamKey }) {
-    if (this.child || this.desired || this.reconnectTimer) {
+  async start({ target, streamKey, videoBitrateKbps = this.defaultVideoBitrateKbps }) {
+    if (this.uplinkChild || this.playoutChild || this.desired || this.reconnectTimer) {
       throw new ApiError(409, "STREAM_ALREADY_RUNNING", "Трансляція вже запущена.");
     }
-
     const ffmpeg = this.checkFfmpeg(true);
-    if (!ffmpeg.available) {
-      throw new ApiError(503, "FFMPEG_UNAVAILABLE", ffmpeg.message);
-    }
+    if (!ffmpeg.available) throw new ApiError(503, "FFMPEG_UNAVAILABLE", ffmpeg.message);
 
-    const playlist = videos ?? (video ? [video] : []);
-    buildConcatPlaylist(playlist);
-    const firstVideo = playlist[0];
+    const first = this.safeQueue()[0] ?? this.fallbackItem();
+    if (!first) {
+      throw new ApiError(409, "QUEUE_EMPTY", "Додайте відео до черги або налаштуйте резервне відео.");
+    }
     const startedAt = new Date(this.now()).toISOString();
-    const desired = {
-      video: firstVideo,
-      videos: playlist,
-      videoId: firstVideo.id,
+    this.currentItem = first;
+    this.desired = {
       target,
       streamKey,
       startedAt,
+      videoBitrateKbps: normalizeVideoBitrateKbps(videoBitrateKbps, this.defaultVideoBitrateKbps),
     };
-    try {
-      await this.preparePlaylist(playlist);
-      const queueItemIds = playlist.map((item) => item.queueItemId).filter(Boolean);
-      await this.stateStore?.saveActive({
-        videoId: firstVideo.id,
-        videoIds: playlist.map((item) => item.id),
-        ...(queueItemIds.length === playlist.length ? { queueItemIds } : {}),
-        target,
-        streamKey,
-        startedAt,
-      });
-    } catch {
-      await this.cleanupPlaylist();
-      throw new ApiError(
-        500,
-        "STREAM_STATE_PERSIST_FAILED",
-        "Не вдалося підготувати плейлист або безпечно зберегти конфігурацію ефіру.",
-      );
-    }
-
-    this.desired = desired;
     this.failureStreak = 0;
+    this.playoutClockSeconds = 0;
     this.secrets = [target, streamKey];
     this.logs = [];
+    this.history = [];
     this.state = {
       status: "STARTING",
-      videoId: firstVideo.id,
-      videoName: firstVideo.name,
       startedAt,
       stoppedAt: null,
       lastError: null,
@@ -318,24 +402,38 @@ export class StreamController {
     };
 
     try {
-      await this.launch({ initial: true });
+      await this.persistCurrent();
+      await this.launchUplink({ initial: true });
+      await this.launchPlayout(first, { initial: true });
     } catch (error) {
       this.desired = null;
+      this.currentItem = null;
       this.secrets = [];
       await this.stateStore?.clear().catch(() => {});
-      await this.cleanupPlaylist();
+      await this.stopChild(this.playoutChild);
+      await this.stopChild(this.uplinkChild);
       this.state.status = "ERROR";
       this.state.autoResumeEnabled = false;
-      this.state.lastError = "Не вдалося запустити FFmpeg.";
+      this.state.lastError = "Не вдалося запустити Playout Engine або RTMPS uplink.";
       this.state.lastFailure = this.state.lastError;
-      throw new ApiError(503, "FFMPEG_START_FAILED", this.state.lastError, { cause: error });
+      throw new ApiError(503, "STREAM_START_FAILED", this.state.lastError, { cause: error });
     }
-
     return this.snapshot();
   }
 
-  async launch({ initial }) {
-    if (!this.desired || this.shuttingDown) return this.snapshot();
+  pushLogs(chunk, role) {
+    const lines = redact(String(chunk), this.secrets)
+      .split(/[\r\n]+/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => `[${role}] ${line}`);
+    this.logs.push(...lines);
+    this.logs = this.logs.slice(-40);
+    return lines;
+  }
+
+  async launchUplink({ initial }) {
+    if (!this.desired || this.shuttingDown || this.uplinkChild) return this.snapshot();
     const ffmpeg = this.checkFfmpeg(true);
     if (!ffmpeg.available) {
       if (initial) throw new Error(ffmpeg.message);
@@ -343,17 +441,14 @@ export class StreamController {
       return this.snapshot();
     }
 
-    this.runId += 1;
-    const currentRunId = this.runId;
-    const { video, target } = this.desired;
+    this.uplinkRunId += 1;
+    const runId = this.uplinkRunId;
     this.state.status = initial ? "STARTING" : "RECONNECTING";
     this.state.nextRetryAt = null;
-
-    const args = buildFfmpegArgs({
-      inputPath: video.filePath,
-      playlistPath: this.playlistPath,
-      target,
-      videoBitrate: this.videoBitrate,
+    const args = buildUplinkFfmpegArgs({
+      inputUrl: this.udpInputUrl,
+      target: this.desired.target,
+      videoBitrateKbps: this.desired.videoBitrateKbps,
       audioBitrate: this.audioBitrate,
     });
     let child;
@@ -364,48 +459,37 @@ export class StreamController {
       });
     } catch (error) {
       if (initial) throw error;
-      this.scheduleReconnect("Не вдалося запустити процес FFmpeg.");
+      this.scheduleReconnect("Не вдалося запустити RTMPS uplink.");
       return this.snapshot();
     }
-    this.child = child;
-    this.currentAttemptStartedAt = this.now();
+    this.uplinkChild = child;
+    this.uplinkAttemptStartedAt = this.now();
     let spawned = false;
     let terminalHandled = false;
 
     child.stderr?.on("data", (chunk) => {
-      if (currentRunId !== this.runId) return;
-      const lines = redact(String(chunk), this.secrets)
-        .split(/[\r\n]+/)
-        .map((line) => line.trim())
-        .filter(Boolean);
+      if (runId !== this.uplinkRunId) return;
+      const lines = this.pushLogs(chunk, "uplink");
       if (lines.some((line) => line.includes("frame="))) {
         this.state.status = "LIVE";
         this.state.lastError = null;
         this.state.nextRetryAt = null;
       }
-      this.logs.push(...lines);
-      this.logs = this.logs.slice(-24);
     });
 
     const handleTerminal = (reason) => {
-      if (terminalHandled || currentRunId !== this.runId) return;
+      if (terminalHandled || runId !== this.uplinkRunId) return;
       terminalHandled = true;
-      const ranFor = this.currentAttemptStartedAt === null ? 0 : this.now() - this.currentAttemptStartedAt;
-      this.child = null;
-      this.currentAttemptStartedAt = null;
-      if (!this.desired || this.shuttingDown || this.state.status === "STOPPING") {
-        this.state.status = "STOPPED";
-        this.state.stoppedAt = new Date(this.now()).toISOString();
-        this.state.lastError = null;
-        this.state.nextRetryAt = null;
-        return;
-      }
+      const ranFor = this.uplinkAttemptStartedAt === null ? 0 : this.now() - this.uplinkAttemptStartedAt;
+      this.uplinkChild = null;
+      this.uplinkAttemptStartedAt = null;
+      if (!this.desired || this.shuttingDown || this.state.status === "STOPPING") return;
       if (ranFor >= this.stableRunMs) this.failureStreak = 0;
       this.scheduleReconnect(reason);
     };
 
     child.once("exit", (code, signal) => {
-      handleTerminal(`FFmpeg завершився (code=${code ?? "null"}, signal=${signal ?? "null"}).`);
+      handleTerminal(`RTMPS uplink завершився (code=${code ?? "null"}, signal=${signal ?? "null"}).`);
     });
 
     return await new Promise((resolve, reject) => {
@@ -416,15 +500,130 @@ export class StreamController {
       child.once("error", (error) => {
         if (!spawned && initial) {
           terminalHandled = true;
-          this.child = null;
-          this.currentAttemptStartedAt = null;
+          this.uplinkChild = null;
+          this.uplinkAttemptStartedAt = null;
           reject(error);
           return;
         }
-        handleTerminal("Процес FFmpeg завершився через системну помилку.");
+        handleTerminal("RTMPS uplink завершився через системну помилку.");
         if (!spawned) resolve(this.snapshot());
       });
     });
+  }
+
+  async launchPlayout(item, { initial = false } = {}) {
+    if (!this.desired || this.shuttingDown || !item) return this.snapshot();
+    this.playoutRunId += 1;
+    const runId = this.playoutRunId;
+    this.currentItem = item;
+    this.currentStartedAtMs = this.now();
+    this.skipRequested = false;
+    const args = buildPlayoutFfmpegArgs({
+      inputPath: item.filePath,
+      outputUrl: this.udpOutputUrl,
+      timestampOffsetSeconds: this.playoutClockSeconds,
+    });
+    let child;
+    try {
+      child = this.spawnImpl(this.ffmpegPath, args, {
+        windowsHide: true,
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+    } catch (error) {
+      if (initial) throw error;
+      await this.advancePlayout("FAILED", String(error?.message || error));
+      return this.snapshot();
+    }
+    this.playoutChild = child;
+    let spawned = false;
+    let terminalHandled = false;
+
+    child.stderr?.on("data", (chunk) => {
+      if (runId === this.playoutRunId) this.pushLogs(chunk, "playout");
+    });
+
+    const handleTerminal = (code, signal, reason) => {
+      if (terminalHandled || runId !== this.playoutRunId) return;
+      terminalHandled = true;
+      this.playoutChild = null;
+      if (!this.desired || this.shuttingDown || this.state.status === "STOPPING") {
+        this.skipCompletion?.();
+        this.skipCompletion = null;
+        return;
+      }
+      const outcome = this.skipRequested ? "SKIPPED" : code === 0 ? "COMPLETED" : "FAILED";
+      void this.advancePlayout(outcome, reason ?? `Playout завершився (code=${code}, signal=${signal}).`)
+        .finally(() => {
+          this.skipCompletion?.();
+          this.skipCompletion = null;
+        });
+    };
+
+    child.once("exit", (code, signal) => handleTerminal(code, signal));
+
+    return await new Promise((resolve, reject) => {
+      child.once("spawn", () => {
+        spawned = true;
+        resolve(this.snapshot());
+      });
+      child.once("error", (error) => {
+        if (!spawned && initial) {
+          terminalHandled = true;
+          this.playoutChild = null;
+          reject(error);
+          return;
+        }
+        handleTerminal(null, null, "Playout Engine завершився через системну помилку.");
+        if (!spawned) resolve(this.snapshot());
+      });
+    });
+  }
+
+  async advancePlayout(outcome, reason) {
+    if (!this.desired || !this.currentItem) return;
+    const endedAtMs = this.now();
+    const elapsedMs = Math.max(0, endedAtMs - (this.currentStartedAtMs ?? endedAtMs));
+    const itemDurationMs = durationMs(this.currentItem);
+    const playedMs = outcome === "COMPLETED" && itemDurationMs ? itemDurationMs : elapsedMs;
+    this.playoutClockSeconds += Math.max(playedMs / 1_000, 1 / 30);
+    this.history.push({
+      queueItemId: this.currentItem.queueItemId ?? null,
+      videoId: this.currentItem.id,
+      videoName: this.currentItem.name,
+      status: outcome,
+      startedAt: new Date(this.currentStartedAtMs ?? endedAtMs).toISOString(),
+      endedAt: new Date(endedAtMs).toISOString(),
+    });
+    this.history = this.history.slice(-20);
+    const next = this.nextItem({ failed: outcome === "FAILED" });
+    this.currentStartedAtMs = null;
+
+    if (!next) {
+      this.state.status = "DEGRADED";
+      this.state.lastError = "Черга порожня, а резервне відео не налаштоване.";
+      this.state.lastFailure = reason;
+      return;
+    }
+
+    if (outcome === "FAILED") {
+      this.state.status = "DEGRADED";
+      this.state.lastError = reason;
+      this.state.lastFailure = reason;
+    }
+    this.currentItem = next;
+    try {
+      await this.persistCurrent();
+      await this.launchPlayout(next);
+    } catch (error) {
+      this.state.status = "DEGRADED";
+      this.state.lastError = error instanceof Error ? error.message : "Не вдалося відкрити наступне відео.";
+      this.state.lastFailure = this.state.lastError;
+      this.playoutRetryTimer = this.setTimeoutImpl(() => {
+        this.playoutRetryTimer = null;
+        void this.launchPlayout(this.nextItem({ failed: true }) ?? this.currentItem);
+      }, 2_000);
+      this.playoutRetryTimer?.unref?.();
+    }
   }
 
   scheduleReconnect(reason) {
@@ -433,25 +632,41 @@ export class StreamController {
     this.failureStreak += 1;
     const exponent = Math.min(this.failureStreak - 1, 16);
     const delay = Math.min(this.reconnectMaxMs, this.reconnectBaseMs * 2 ** exponent);
-    const nextRetryAt = new Date(this.now() + delay).toISOString();
     this.state.status = "RECONNECTING";
     this.state.lastError = reason;
     this.state.lastFailure = reason;
     this.state.reconnectAttempt = this.failureStreak;
-    this.state.nextRetryAt = nextRetryAt;
+    this.state.nextRetryAt = new Date(this.now() + delay).toISOString();
     this.state.autoResumeEnabled = true;
-
     this.reconnectTimer = this.setTimeoutImpl(() => {
       this.reconnectTimer = null;
-      void this.launch({ initial: false }).catch((error) => {
-        this.scheduleReconnect(error instanceof Error ? error.message : "Не вдалося перезапустити FFmpeg.");
+      void this.launchUplink({ initial: false }).catch((error) => {
+        this.scheduleReconnect(error instanceof Error ? error.message : "Не вдалося відновити uplink.");
       });
     }, delay);
     this.reconnectTimer?.unref?.();
   }
 
+  async skip() {
+    if (!this.desired || !this.playoutChild) {
+      throw new ApiError(409, "PLAYOUT_NOT_ACTIVE", "Немає активного відео для пропуску.");
+    }
+    if (this.skipRequested) return this.snapshot();
+    this.skipRequested = true;
+    const completion = new Promise((resolve) => {
+      this.skipCompletion = resolve;
+    });
+    this.playoutChild.kill("SIGTERM");
+    await Promise.race([
+      completion,
+      new Promise((resolve) => this.setTimeoutImpl(resolve, 5_000)),
+    ]);
+    return this.snapshot();
+  }
+
   waitForExit(child, timeoutMs) {
     return new Promise((resolve) => {
+      if (!child) return resolve(true);
       let settled = false;
       const finish = (exited) => {
         if (settled) return;
@@ -467,6 +682,24 @@ export class StreamController {
     });
   }
 
+  async stopChild(child) {
+    if (!child) return;
+    const exited = this.waitForExit(child, 5_000);
+    child.kill("SIGTERM");
+    if (!(await exited)) {
+      const killed = this.waitForExit(child, 2_000);
+      child.kill("SIGKILL");
+      await killed;
+    }
+  }
+
+  clearTimers() {
+    if (this.reconnectTimer) this.clearTimeoutImpl(this.reconnectTimer);
+    if (this.playoutRetryTimer) this.clearTimeoutImpl(this.playoutRetryTimer);
+    this.reconnectTimer = null;
+    this.playoutRetryTimer = null;
+  }
+
   async stop() {
     try {
       await this.stateStore?.clear();
@@ -477,54 +710,38 @@ export class StreamController {
         "Не вдалося вимкнути автоматичне відновлення. Спробуйте ще раз.",
       );
     }
-
+    this.state.status = "STOPPING";
     this.desired = null;
     this.secrets = [];
     this.failureStreak = 0;
-    if (this.reconnectTimer) {
-      this.clearTimeoutImpl(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    this.state.autoResumeEnabled = false;
-    this.state.reconnectAttempt = 0;
-    this.state.nextRetryAt = null;
-    const child = this.child;
-    if (!child) {
-      this.state.status = "STOPPED";
-      this.state.stoppedAt = new Date(this.now()).toISOString();
-      this.state.lastError = null;
-      await this.cleanupPlaylist();
-      return this.snapshot();
-    }
-
-    this.state.status = "STOPPING";
-    const exited = this.waitForExit(child, 8000);
-    child.kill("SIGTERM");
-    if (!(await exited) && this.child === child) {
-      const killed = this.waitForExit(child, 2000);
-      child.kill("SIGKILL");
-      await killed;
-    }
-    await this.cleanupPlaylist();
+    this.clearTimers();
+    await this.stopChild(this.playoutChild);
+    await this.stopChild(this.uplinkChild);
+    this.playoutChild = null;
+    this.uplinkChild = null;
+    this.currentItem = null;
+    this.currentStartedAtMs = null;
+    this.state = {
+      ...this.state,
+      status: "STOPPED",
+      stoppedAt: new Date(this.now()).toISOString(),
+      lastError: null,
+      reconnectAttempt: 0,
+      nextRetryAt: null,
+      autoResumeEnabled: false,
+      restoredAfterRestart: false,
+    };
     return this.snapshot();
   }
 
   async shutdown() {
     this.shuttingDown = true;
-    if (this.reconnectTimer) {
-      this.clearTimeoutImpl(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    const child = this.child;
-    if (!child) return this.snapshot();
+    this.clearTimers();
     this.state.status = "STOPPING";
-    const exited = this.waitForExit(child, 8000);
-    child.kill("SIGTERM");
-    if (!(await exited) && this.child === child) {
-      const killed = this.waitForExit(child, 2000);
-      child.kill("SIGKILL");
-      await killed;
-    }
+    await this.stopChild(this.playoutChild);
+    await this.stopChild(this.uplinkChild);
+    this.playoutChild = null;
+    this.uplinkChild = null;
     return this.snapshot();
   }
 }

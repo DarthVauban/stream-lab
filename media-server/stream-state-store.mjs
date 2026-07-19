@@ -56,6 +56,16 @@ function validateState(value) {
       throw new Error("Елементи черги не відповідають збереженому плейлисту.");
     }
   }
+  if (value.videoBitrateKbps !== undefined) {
+    if (
+      !Number.isInteger(value.videoBitrateKbps) ||
+      value.videoBitrateKbps < 3_000 ||
+      value.videoBitrateKbps > 12_000
+    ) {
+      throw new Error("Некоректний відеобітрейт у стані трансляції.");
+    }
+    validated.videoBitrateKbps = value.videoBitrateKbps;
+  }
   return validated;
 }
 

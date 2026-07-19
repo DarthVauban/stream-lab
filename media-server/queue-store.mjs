@@ -125,15 +125,19 @@ export class QueueStore {
     });
   }
 
-  moveNext(itemId) {
+  moveNext(itemId, afterItemId = null) {
     return this.mutate(() => {
       const index = this.items.findIndex((item) => item.id === itemId);
       if (index === -1) {
         throw new ApiError(404, "QUEUE_ITEM_NOT_FOUND", "Елемент черги не знайдено.");
       }
       const [item] = this.items.splice(index, 1);
-      this.items.unshift(item);
-      return { ...item, position: 0 };
+      const afterIndex = afterItemId
+        ? this.items.findIndex((candidate) => candidate.id === afterItemId)
+        : -1;
+      const position = afterIndex >= 0 ? afterIndex + 1 : 0;
+      this.items.splice(position, 0, item);
+      return { ...item, position };
     });
   }
 

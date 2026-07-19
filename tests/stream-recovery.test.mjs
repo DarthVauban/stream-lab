@@ -10,9 +10,11 @@ import { StreamController } from "../media-server/stream-controller.mjs";
 import { EncryptedStreamStateStore } from "../media-server/stream-state-store.mjs";
 
 class FakeChild extends EventEmitter {
-  constructor(pid) {
+  constructor(pid, role, args) {
     super();
     this.pid = pid;
+    this.role = role;
+    this.args = args;
     this.stderr = new PassThrough();
   }
 
@@ -22,10 +24,14 @@ class FakeChild extends EventEmitter {
   }
 }
 
-function controllerHarness({ persisted = null, playlistPath = null, now } = {}) {
+function controllerHarness({ persisted = null, now } = {}) {
   const children = [];
+  const uplinks = [];
+  const playouts = [];
   const persistedWrites = [];
   let clears = 0;
+  let queue = [];
+  let fallback = null;
   const stateStore = {
     async load() {
       return persisted;
@@ -38,9 +44,11 @@ function controllerHarness({ persisted = null, playlistPath = null, now } = {}) 
     },
   };
   const controller = new StreamController({
-    spawnImpl() {
-      const child = new FakeChild(1000 + children.length);
+    spawnImpl(_command, args) {
+      const role = args.includes("flv") ? "uplink" : "playout";
+      const child = new FakeChild(1000 + children.length, role, args);
       children.push(child);
+      (role === "uplink" ? uplinks : playouts).push(child);
       queueMicrotask(() => child.emit("spawn"));
       return child;
     },
@@ -48,24 +56,47 @@ function controllerHarness({ persisted = null, playlistPath = null, now } = {}) 
       return { status: 0, stdout: "ffmpeg test" };
     },
     stateStore,
-    playlistPath,
     ...(now ? { now } : {}),
     reconnectBaseMs: 5,
     reconnectMaxMs: 10,
     stableRunMs: 50,
   });
+  const init = () => controller.init({
+    resolveVideo: (videoId) => queue.find((item) => item.id === videoId),
+    getQueue: () => queue,
+    getFallback: () => fallback,
+  });
   return {
     controller,
     children,
+    uplinks,
+    playouts,
     persistedWrites,
     clearCount: () => clears,
+    setQueue(value) {
+      queue = value;
+    },
+    setFallback(value) {
+      fallback = value;
+    },
+    init,
   };
 }
 
-const video = {
+const firstVideo = {
   id: "video-1",
   name: "demo.mp4",
   filePath: "C:/media/demo.mp4",
+  queueItemId: "queue-1",
+  media: { durationSeconds: 10 },
+};
+
+const secondVideo = {
+  id: "video-2",
+  name: "next.mp4",
+  filePath: "C:/media/next.mp4",
+  queueItemId: "queue-2",
+  media: { durationSeconds: 20 },
 };
 
 test("encrypts persisted stream configuration and removes it on clear", async (t) => {
@@ -76,9 +107,12 @@ test("encrypts persisted stream configuration and removes it on clear", async (t
   });
   const state = {
     videoId: "video-1",
+    videoIds: ["video-1"],
+    queueItemIds: ["queue-1"],
     target: "rtmps://example.test/live/super-secret-key",
     streamKey: "super-secret-key",
     startedAt: "2026-07-19T00:00:00.000Z",
+    videoBitrateKbps: 7_500,
   };
 
   t.after(() => rm(rootDir, { recursive: true, force: true }));
@@ -95,93 +129,154 @@ test("encrypts persisted stream configuration and removes it on clear", async (t
   assert.equal(await store.load(), null);
 });
 
-test("reconnects FFmpeg after a crash and manual stop cancels recovery", async () => {
-  const harness = controllerHarness();
-  const target = "rtmps://example.test/live/super-secret-key";
-  await harness.controller.start({ video, target, streamKey: "super-secret-key" });
-  assert.equal(harness.persistedWrites.length, 1);
-  assert.equal(harness.controller.snapshot().autoResumeEnabled, true);
+test("keeps one uplink while the live queue advances and changes", async (t) => {
+  let currentTime = 1_000;
+  const harness = controllerHarness({ now: () => currentTime });
+  harness.setQueue([firstVideo, secondVideo]);
+  await harness.init();
+  t.after(() => harness.controller.stop());
 
-  harness.children[0].stderr.write(`frame=1 ${target}\n`);
+  const target = "rtmps://example.test/live/super-secret-key";
+  await harness.controller.start({
+    target,
+    streamKey: "super-secret-key",
+    videoBitrateKbps: 7_500,
+  });
+  assert.equal(harness.uplinks.length, 1);
+  assert.equal(harness.playouts.length, 1);
+  assert.equal(harness.playouts[0].args[harness.playouts[0].args.indexOf("-i") + 1], firstVideo.filePath);
+  assert.ok(harness.uplinks[0].args.includes("7500k"));
+  assert.equal(harness.persistedWrites[0].videoId, firstVideo.id);
+
+  harness.uplinks[0].stderr.write(`frame=1 ${target}\n`);
   await delay(0);
   assert.equal(harness.controller.snapshot().status, "LIVE");
   assert.doesNotMatch(JSON.stringify(harness.controller.snapshot()), /super-secret-key/);
 
-  harness.children[0].emit("exit", 1, null);
-  assert.equal(harness.controller.snapshot().status, "RECONNECTING");
-  assert.equal(harness.controller.snapshot().reconnectAttempt, 1);
-
-  await delay(15);
-  assert.equal(harness.children.length, 2);
-  harness.children[1].stderr.write("frame=2\n");
+  const thirdVideo = {
+    id: "video-3",
+    name: "inserted.mp4",
+    filePath: "C:/media/inserted.mp4",
+    queueItemId: "queue-3",
+    media: { durationSeconds: 15 },
+  };
+  harness.setQueue([firstVideo, thirdVideo, secondVideo]);
+  currentTime += 10_000;
+  harness.playouts[0].emit("exit", 0, null);
   await delay(0);
-  assert.equal(harness.controller.snapshot().status, "LIVE");
+  await delay(0);
 
-  await harness.controller.stop();
-  assert.equal(harness.clearCount(), 1);
-  assert.equal(harness.controller.snapshot().status, "STOPPED");
-  assert.equal(harness.controller.snapshot().autoResumeEnabled, false);
-  await delay(20);
-  assert.equal(harness.children.length, 2);
+  assert.equal(harness.uplinks.length, 1);
+  assert.equal(harness.playouts.length, 2);
+  assert.equal(harness.controller.snapshot().videoId, thirdVideo.id);
+  assert.equal(harness.controller.snapshot().queueItemId, thirdVideo.queueItemId);
+  assert.equal(harness.playouts[1].args[harness.playouts[1].args.indexOf("-i") + 1], thirdVideo.filePath);
+  assert.equal(harness.playouts[1].args[harness.playouts[1].args.indexOf("-output_ts_offset") + 1], "10.000");
 });
 
-test("plays every queued video in order and reports the current queue item", async (t) => {
-  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-playlist-test-"));
-  const playlistPath = path.join(rootDir, "stream-playlist.ffconcat");
-  let currentTime = 1_000;
-  const harness = controllerHarness({ playlistPath, now: () => currentTime });
-  const first = {
-    ...video,
-    queueItemId: "queue-1",
-    media: { durationSeconds: 10 },
-  };
-  const second = {
-    id: "video-2",
-    name: "next.mp4",
-    filePath: "C:/media/next.mp4",
-    queueItemId: "queue-2",
-    media: { durationSeconds: 20 },
-  };
-  t.after(async () => {
-    await harness.controller.stop();
-    await rm(rootDir, { recursive: true, force: true });
-  });
-
+test("skips the current video without restarting the uplink", async (t) => {
+  const harness = controllerHarness();
+  harness.setQueue([firstVideo, secondVideo]);
+  await harness.init();
+  t.after(() => harness.controller.stop());
   await harness.controller.start({
-    videos: [first, second],
-    target: "rtmps://example.test/live/playlist-key",
-    streamKey: "playlist-key",
+    target: "rtmps://example.test/live/skip-key",
+    streamKey: "skip-key",
   });
-  const playlist = await readFile(playlistPath, "utf8");
-  assert.match(playlist, /demo\.mp4[\s\S]+next\.mp4/);
-  assert.equal(harness.persistedWrites[0].videoIds.length, 2);
-  assert.deepEqual(harness.persistedWrites[0].queueItemIds, ["queue-1", "queue-2"]);
-  assert.equal(harness.controller.snapshot().queueItemId, "queue-1");
 
-  currentTime += 11_000;
-  assert.equal(harness.controller.snapshot().videoId, "video-2");
-  assert.equal(harness.controller.snapshot().queueItemId, "queue-2");
-
-  currentTime += 20_000;
-  assert.equal(harness.controller.snapshot().videoId, "video-1");
-  assert.equal(harness.controller.snapshot().queueItemId, "queue-1");
+  await harness.controller.skip();
+  await delay(0);
+  assert.equal(harness.uplinks.length, 1);
+  assert.equal(harness.playouts.length, 2);
+  assert.equal(harness.controller.snapshot().videoId, secondVideo.id);
+  assert.equal(harness.controller.snapshot().history.at(-1).status, "SKIPPED");
 });
 
-test("restores the desired stream after service restart without clearing encrypted state", async () => {
+test("reconnects only the uplink after a network failure", async (t) => {
+  const harness = controllerHarness();
+  harness.setQueue([firstVideo]);
+  await harness.init();
+  t.after(() => harness.controller.stop());
+  await harness.controller.start({
+    target: "rtmps://example.test/live/reconnect-key",
+    streamKey: "reconnect-key",
+  });
+  const originalPlayout = harness.playouts[0];
+
+  harness.uplinks[0].emit("exit", 1, null);
+  assert.equal(harness.controller.snapshot().status, "RECONNECTING");
+  await delay(15);
+  assert.equal(harness.uplinks.length, 2);
+  assert.equal(harness.playouts.length, 1);
+  assert.equal(harness.playouts[0], originalPlayout);
+});
+
+test("uses and loops the fallback when the regular queue is empty", async (t) => {
+  const harness = controllerHarness();
+  harness.setFallback({ ...firstVideo, queueItemId: undefined, isFallback: true });
+  await harness.init();
+  t.after(() => harness.controller.stop());
+  await harness.controller.start({
+    target: "rtmps://example.test/live/fallback-key",
+    streamKey: "fallback-key",
+  });
+  assert.equal(harness.controller.snapshot().isFallback, true);
+
+  harness.playouts[0].emit("exit", 0, null);
+  await delay(0);
+  await delay(0);
+  assert.equal(harness.playouts.length, 2);
+  assert.equal(harness.controller.snapshot().videoId, firstVideo.id);
+  assert.equal(harness.controller.snapshot().isFallback, true);
+});
+
+test("switches to fallback after a playout failure", async (t) => {
+  const harness = controllerHarness();
+  const fallback = {
+    id: "video-fallback",
+    name: "fallback.mp4",
+    filePath: "C:/media/fallback.mp4",
+    media: { durationSeconds: 30 },
+    isFallback: true,
+  };
+  harness.setQueue([firstVideo, secondVideo]);
+  harness.setFallback(fallback);
+  await harness.init();
+  t.after(() => harness.controller.stop());
+  await harness.controller.start({
+    target: "rtmps://example.test/live/fallback-error-key",
+    streamKey: "fallback-error-key",
+  });
+
+  harness.playouts[0].emit("exit", 1, null);
+  await delay(0);
+  await delay(0);
+  assert.equal(harness.controller.snapshot().videoId, fallback.id);
+  assert.equal(harness.controller.snapshot().isFallback, true);
+  assert.equal(harness.controller.snapshot().status, "DEGRADED");
+});
+
+test("restores both the uplink and current playout after service restart", async () => {
   const persisted = {
-    videoId: video.id,
+    videoId: firstVideo.id,
+    videoIds: [firstVideo.id],
+    queueItemIds: [firstVideo.queueItemId],
     target: "rtmps://example.test/live/persisted-key",
     streamKey: "persisted-key",
     startedAt: "2026-07-19T00:00:00.000Z",
+    videoBitrateKbps: 6_500,
   };
   const harness = controllerHarness({ persisted });
+  harness.setQueue([firstVideo, secondVideo]);
 
-  await harness.controller.init({ resolveVideo: () => video });
+  await harness.init();
   const restored = harness.controller.snapshot();
   assert.equal(restored.status, "RECONNECTING");
   assert.equal(restored.restoredAfterRestart, true);
   assert.equal(restored.autoResumeEnabled, true);
-  assert.equal(harness.children.length, 1);
+  assert.equal(restored.videoBitrateKbps, 6_500);
+  assert.equal(harness.uplinks.length, 1);
+  assert.equal(harness.playouts.length, 1);
 
   await harness.controller.shutdown();
   assert.equal(harness.clearCount(), 0);

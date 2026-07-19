@@ -39,11 +39,18 @@ type Video = {
 };
 
 type StreamStatus = {
-  status: "STOPPED" | "STARTING" | "LIVE" | "RECONNECTING" | "STOPPING" | "ERROR";
+  status: "STOPPED" | "STARTING" | "LIVE" | "DEGRADED" | "RECONNECTING" | "STOPPING" | "ERROR";
   videoId: string | null;
   videoName: string | null;
   queueItemId: string | null;
   playlistLength: number;
+  positionMs: number;
+  durationMs: number;
+  remainingMs: number | null;
+  nextQueueItemId: string | null;
+  nextVideoName: string | null;
+  isFallback: boolean;
+  videoBitrateKbps: number;
   startedAt: string | null;
   stoppedAt: string | null;
   lastError: string | null;
@@ -53,6 +60,12 @@ type StreamStatus = {
   autoResumeEnabled: boolean;
   restoredAfterRestart: boolean;
   logs: string[];
+};
+
+type StreamSettings = {
+  videoBitrateKbps: number;
+  fallbackVideoId: string | null;
+  updatedAt: string | null;
 };
 
 type Health = {
@@ -132,11 +145,22 @@ function formatRetry(nextRetryAt: string | null, currentTime: number) {
   return seconds > 0 ? `через ${seconds} с` : "зараз";
 }
 
+function formatMediaTime(milliseconds: number | null) {
+  if (milliseconds === null || !Number.isFinite(milliseconds)) return "—";
+  const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  const parts = hours > 0 ? [hours, minutes, rest] : [minutes, rest];
+  return parts.map((value) => String(value).padStart(2, "0")).join(":");
+}
+
 function statusLabel(status: StreamStatus["status"]) {
   return {
     STOPPED: "Зупинено",
     STARTING: "Запуск",
     LIVE: "В ефірі",
+    DEGRADED: "Сигнал нестабільний",
     RECONNECTING: "Відновлення",
     STOPPING: "Зупинка",
     ERROR: "Помилка",
@@ -167,6 +191,13 @@ const emptyStream: StreamStatus = {
   videoName: null,
   queueItemId: null,
   playlistLength: 0,
+  positionMs: 0,
+  durationMs: 0,
+  remainingMs: null,
+  nextQueueItemId: null,
+  nextVideoName: null,
+  isFallback: false,
+  videoBitrateKbps: 8000,
   startedAt: null,
   stoppedAt: null,
   lastError: null,
@@ -197,6 +228,10 @@ export default function Home() {
   const [videos, setVideos] = useState<Video[]>([]);
   const [stream, setStream] = useState<StreamStatus>(emptyStream);
   const [queue, setQueue] = useState<QueueState>(emptyQueue);
+  const [streamSettings, setStreamSettings] = useState<StreamSettings | null>(null);
+  const [bitrateDraft, setBitrateDraft] = useState(8000);
+  const [fallbackVideoDraft, setFallbackVideoDraft] = useState("");
+  const [settingsAction, setSettingsAction] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
@@ -269,7 +304,44 @@ export default function Home() {
     };
   }, [authState, refresh]);
 
-  const active = ["LIVE", "STARTING", "RECONNECTING", "STOPPING"].includes(stream.status);
+  useEffect(() => {
+    if (authState !== "authenticated") return;
+    const events = new EventSource("/api/stream/events");
+    events.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data) as { stream?: StreamStatus };
+        if (payload.stream) setStream(payload.stream);
+      } catch {
+        // The regular status poll remains available if a malformed event is received.
+      }
+    };
+    return () => events.close();
+  }, [authState]);
+
+  useEffect(() => {
+    if (authState !== "authenticated") return;
+    let cancelled = false;
+    void api<{ settings: StreamSettings }>("/api/settings/stream")
+      .then(({ settings }) => {
+        if (cancelled) return;
+        setStreamSettings(settings);
+        setBitrateDraft(settings.videoBitrateKbps);
+        setFallbackVideoDraft(settings.fallbackVideoId ?? "");
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setNotice({
+            type: "error",
+            text: error instanceof Error ? error.message : "Не вдалося завантажити налаштування ефіру.",
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authState]);
+
+  const active = ["LIVE", "STARTING", "DEGRADED", "RECONNECTING", "STOPPING"].includes(stream.status);
   const currentQueueIndex = stream.queueItemId
     ? queue.items.findIndex((item) => item.id === stream.queueItemId)
     : stream.videoId
@@ -279,8 +351,17 @@ export default function Home() {
     ? queue.items[currentQueueIndex >= 0 ? (currentQueueIndex + 1) % queue.items.length : 0]
     : null;
   const readyToStart = Boolean(
-    queue.items.length > 0 && streamUrl.trim() && streamKey.trim() && health?.ffmpeg.available,
+    (queue.items.length > 0 || Boolean(fallbackVideoDraft)) &&
+    streamUrl.trim() &&
+    streamKey.trim() &&
+    health?.ffmpeg.available &&
+    Number.isInteger(bitrateDraft) &&
+    bitrateDraft >= 3000 &&
+    bitrateDraft <= 12000,
   );
+  const playbackProgress = stream.durationMs > 0
+    ? Math.min(100, Math.max(0, (stream.positionMs / stream.durationMs) * 100))
+    : 0;
 
   async function login(event: FormEvent) {
     event.preventDefault();
@@ -315,6 +396,9 @@ export default function Home() {
       setVideos([]);
       setStream(emptyStream);
       setQueue(emptyQueue);
+      setStreamSettings(null);
+      setBitrateDraft(8000);
+      setFallbackVideoDraft("");
     }
   }
 
@@ -467,6 +551,10 @@ export default function Home() {
       }, csrfToken);
       setVideos((current) => current.filter((item) => item.id !== video.id));
       setQueue(result.queue);
+      if (fallbackVideoDraft === video.id) {
+        setFallbackVideoDraft("");
+        setStreamSettings((current) => current ? { ...current, fallbackVideoId: null } : current);
+      }
       setNotice({ type: "success", text: "Відео повністю видалено із сервера." });
     } catch (error) {
       setNotice({
@@ -529,7 +617,10 @@ export default function Home() {
         method: "POST",
       }, csrfToken);
       setQueue(result.queue);
-      setNotice({ type: "success", text: "Відео переміщено на початок черги." });
+      setNotice({
+        type: "success",
+        text: active ? "Відео буде наступним в ефірі." : "Відео переміщено на початок черги.",
+      });
     } catch (error) {
       setNotice({
         type: "error",
@@ -586,7 +677,7 @@ export default function Home() {
   function handleQueueDragOver(event: ReactDragEvent<HTMLDivElement>, targetItemId: string) {
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
-    if (!draggedQueueItemId || draggedQueueItemId === targetItemId || queueAction || active) {
+    if (!draggedQueueItemId || draggedQueueItemId === targetItemId || queueAction) {
       setQueueDropTarget(null);
       return;
     }
@@ -602,7 +693,7 @@ export default function Home() {
   function handleQueueDrop(event: ReactDragEvent<HTMLDivElement>, targetItemId: string) {
     event.preventDefault();
     const sourceItemId = draggedQueueItemId || event.dataTransfer.getData("text/plain");
-    if (!sourceItemId || sourceItemId === targetItemId || queueAction || active) {
+    if (!sourceItemId || sourceItemId === targetItemId || queueAction) {
       setQueueDropTarget(null);
       return;
     }
@@ -620,12 +711,50 @@ export default function Home() {
     void saveQueueOrder(items);
   }
 
+  async function saveStreamSettings(showNotice = true) {
+    if (settingsAction || active) return null;
+    setSettingsAction(true);
+    if (showNotice) setNotice(null);
+    try {
+      const result = await api<{ settings: StreamSettings }>("/api/settings/stream", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          videoBitrateKbps: bitrateDraft,
+          fallbackVideoId: fallbackVideoDraft || null,
+        }),
+      }, csrfToken);
+      setStreamSettings(result.settings);
+      setBitrateDraft(result.settings.videoBitrateKbps);
+      setFallbackVideoDraft(result.settings.fallbackVideoId ?? "");
+      if (showNotice) {
+        setNotice({ type: "success", text: "Профіль ефіру збережено для наступного запуску." });
+      }
+      return result.settings;
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося зберегти профіль ефіру.",
+      });
+      return null;
+    } finally {
+      setSettingsAction(false);
+    }
+  }
+
   async function startStream(event: FormEvent) {
     event.preventDefault();
     if (!readyToStart || streamAction) return;
     setStreamAction(true);
     setNotice(null);
     try {
+      if (
+        streamSettings?.videoBitrateKbps !== bitrateDraft ||
+        (streamSettings?.fallbackVideoId ?? "") !== fallbackVideoDraft
+      ) {
+        const saved = await saveStreamSettings(false);
+        if (!saved) return;
+      }
       const result = await api<{ stream: StreamStatus }>("/api/stream/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -659,6 +788,27 @@ export default function Home() {
       setNotice({
         type: "error",
         text: error instanceof Error ? error.message : "Не вдалося зупинити трансляцію.",
+      });
+    } finally {
+      setStreamAction(false);
+      await refresh();
+    }
+  }
+
+  async function skipStreamVideo() {
+    if (streamAction) return;
+    setStreamAction(true);
+    setNotice(null);
+    try {
+      const result = await api<{ stream: StreamStatus }>("/api/stream/skip", {
+        method: "POST",
+      }, csrfToken);
+      setStream(result.stream);
+      setNotice({ type: "success", text: "Переходимо до наступного відео без зупинки ефіру." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося пропустити відео.",
       });
     } finally {
       setStreamAction(false);
@@ -883,7 +1033,7 @@ export default function Home() {
                             className="video-add-queue"
                             type="button"
                             onClick={() => addVideoToQueue(video.id)}
-                            disabled={active || Boolean(queueAction) || Boolean(deletingVideoId)}
+                            disabled={Boolean(queueAction) || Boolean(deletingVideoId)}
                           >
                             {queueAction === `add:${video.id}` ? "Додаємо…" : "+ До черги"}
                           </button>
@@ -896,7 +1046,11 @@ export default function Home() {
                           className="video-delete"
                           type="button"
                           onClick={() => deleteVideo(video)}
-                          disabled={active || processing || Boolean(deletingVideoId)}
+                          disabled={
+                            processing ||
+                            Boolean(deletingVideoId) ||
+                            (active && stream.videoId === video.id)
+                          }
                         >
                           {deletingVideoId === video.id ? "Видаляємо…" : "Видалити"}
                         </button>
@@ -967,13 +1121,69 @@ export default function Home() {
               <small>Ключ передається лише під час запуску й не повертається в інтерфейс.</small>
             </label>
 
+            <label className="field">
+              <span>Резервне відео</span>
+              <select
+                value={fallbackVideoDraft}
+                onChange={(event) => setFallbackVideoDraft(event.target.value)}
+                disabled={active || settingsAction}
+              >
+                <option value="">Не вибрано</option>
+                {videos.filter((video) => video.status === "READY").map((video) => (
+                  <option key={video.id} value={video.id}>{video.name}</option>
+                ))}
+              </select>
+              <small>Вмикається, якщо черга порожня або поточний файл не відтворюється.</small>
+            </label>
+
+            <div className="bitrate-control">
+              <label className="field" htmlFor="video-bitrate">
+                <span>Відеобітрейт</span>
+                <div className="bitrate-input">
+                  <input
+                    id="video-bitrate"
+                    type="number"
+                    min={3000}
+                    max={12000}
+                    step={500}
+                    value={bitrateDraft}
+                    onChange={(event) => setBitrateDraft(Number(event.target.value))}
+                    disabled={active || settingsAction}
+                  />
+                  <span>Кбіт/с</span>
+                </div>
+                <small>Діапазон 3000–12000. Зміна застосовується при наступному запуску.</small>
+              </label>
+              <button
+                className="button button--quiet bitrate-save"
+                type="button"
+                onClick={() => void saveStreamSettings()}
+                disabled={
+                  active ||
+                  settingsAction ||
+                  !Number.isInteger(bitrateDraft) ||
+                  bitrateDraft < 3000 ||
+                  bitrateDraft > 12000 ||
+                  (
+                    streamSettings?.videoBitrateKbps === bitrateDraft &&
+                    (streamSettings?.fallbackVideoId ?? "") === fallbackVideoDraft
+                  )
+                }
+              >
+                {settingsAction ? "Зберігаємо…" : "Зберегти профіль"}
+              </button>
+            </div>
+
             <div className="output-card">
               <span className="output-label">Вихідний профіль</span>
               <div className="output-grid">
                 <div><span>Роздільність</span><strong>1080p</strong></div>
                 <div><span>Частота</span><strong>30 FPS</strong></div>
                 <div><span>Відео</span><strong>H.264</strong></div>
-                <div><span>Бітрейт</span><strong>10 Мбіт/с</strong></div>
+                <div>
+                  <span>Бітрейт</span>
+                  <strong>{((active ? stream.videoBitrateKbps : bitrateDraft) / 1000).toFixed(1)} Мбіт/с</strong>
+                </div>
               </div>
             </div>
 
@@ -983,10 +1193,16 @@ export default function Home() {
                 {streamAction ? "Запускаємо…" : "Запустити трансляцію"}
               </button>
             ) : (
-              <button className="button button--danger button--full" type="button" onClick={stopStream} disabled={streamAction}>
-                <span className="button-stop" aria-hidden="true" />
-                {streamAction ? "Зупиняємо…" : "Зупинити трансляцію"}
-              </button>
+              <div className="stream-controls">
+                <button className="button button--quiet" type="button" onClick={skipStreamVideo} disabled={streamAction || stream.status === "STOPPING"}>
+                  <span className="button-skip" aria-hidden="true">⏭</span>
+                  Пропустити відео
+                </button>
+                <button className="button button--danger" type="button" onClick={stopStream} disabled={streamAction}>
+                  <span className="button-stop" aria-hidden="true" />
+                  {streamAction ? "Виконуємо…" : "Зупинити трансляцію"}
+                </button>
+              </div>
             )}
           </form>
 
@@ -1002,6 +1218,20 @@ export default function Home() {
               <span>Зараз транслюється</span>
               <strong>{stream.videoName || queue.items[0]?.video?.name || "Черга ще порожня"}</strong>
             </div>
+            {active && stream.durationMs > 0 && (
+              <div className="playback-progress">
+                <div className="playback-progress-track" aria-hidden="true">
+                  <span style={{ width: `${playbackProgress}%` }} />
+                </div>
+                <div>
+                  <span>{formatMediaTime(stream.positionMs)}</span>
+                  <span>{formatMediaTime(stream.durationMs)}</span>
+                </div>
+              </div>
+            )}
+            {active && stream.nextVideoName && (
+              <p className="stream-next">Далі: <strong>{stream.nextVideoName}</strong></p>
+            )}
             {stream.status === "RECONNECTING" && (
               <div className="reconnect-info" role="status">
                 <span>Спроба {stream.reconnectAttempt}</span>
@@ -1041,7 +1271,7 @@ export default function Home() {
             </div>
             <div>
               <span>Наступне</span>
-              <strong>{nextQueueItem?.video?.name || "Черга порожня"}</strong>
+              <strong>{stream.nextVideoName || nextQueueItem?.video?.name || "Черга порожня"}</strong>
             </div>
             <div>
               <span>Режим</span>
@@ -1055,11 +1285,15 @@ export default function Home() {
             </div>
           ) : (
             <div className="queue-list">
-              {queue.items.map((item, index) => (
+              {queue.items.map((item, index) => {
+                const isCurrent = active && (stream.queueItemId
+                  ? stream.queueItemId === item.id
+                  : stream.videoId === item.videoId);
+                return (
                 <div
-                  className={`queue-row ${active ? "queue-row--locked" : ""} ${draggedQueueItemId === item.id ? "queue-row--dragging" : ""} ${(stream.queueItemId ? stream.queueItemId === item.id : stream.videoId === item.videoId) ? "queue-row--current" : ""} ${queueDropTarget?.itemId === item.id ? `queue-row--drop-${queueDropTarget.edge}` : ""}`}
+                  className={`queue-row ${isCurrent ? "queue-row--locked queue-row--current" : ""} ${draggedQueueItemId === item.id ? "queue-row--dragging" : ""} ${queueDropTarget?.itemId === item.id ? `queue-row--drop-${queueDropTarget.edge}` : ""}`}
                   key={item.id}
-                  draggable={!queueAction && !active}
+                  draggable={!queueAction && !isCurrent}
                   onDragStart={(event) => handleQueueDragStart(event, item.id)}
                   onDragOver={(event) => handleQueueDragOver(event, item.id)}
                   onDrop={(event) => handleQueueDrop(event, item.id)}
@@ -1075,7 +1309,7 @@ export default function Home() {
                     <strong>{item.video?.name || "Відео недоступне"}</strong>
                     <span>
                       {item.video ? videoMeta(item.video) : "Файл видалено з бібліотеки"}
-                      {(stream.queueItemId ? stream.queueItemId === item.id : stream.videoId === item.videoId) ? " · зараз в ефірі" : ""}
+                      {isCurrent ? " · зараз в ефірі" : ""}
                     </span>
                   </span>
                   <div className="queue-actions">
@@ -1084,7 +1318,7 @@ export default function Home() {
                       title="Перемістити вище"
                       aria-label={`Перемістити ${item.video?.name || "відео"} вище`}
                       onClick={() => moveQueueItem(item.id, -1)}
-                      disabled={active || index === 0 || Boolean(queueAction)}
+                      disabled={isCurrent || index === 0 || Boolean(queueAction)}
                     >
                       ↑
                     </button>
@@ -1093,7 +1327,7 @@ export default function Home() {
                       title="Перемістити нижче"
                       aria-label={`Перемістити ${item.video?.name || "відео"} нижче`}
                       onClick={() => moveQueueItem(item.id, 1)}
-                      disabled={active || index === queue.items.length - 1 || Boolean(queueAction)}
+                      disabled={isCurrent || index === queue.items.length - 1 || Boolean(queueAction)}
                     >
                       ↓
                     </button>
@@ -1101,7 +1335,7 @@ export default function Home() {
                       className="queue-next"
                       type="button"
                       onClick={() => playQueueItemNext(item.id)}
-                      disabled={active || index === 0 || Boolean(queueAction)}
+                      disabled={isCurrent || stream.nextQueueItemId === item.id || (!active && index === 0) || Boolean(queueAction)}
                     >
                       {queueAction === `next:${item.id}` ? "Зберігаємо…" : "Наступним"}
                     </button>
@@ -1111,19 +1345,20 @@ export default function Home() {
                       title="Прибрати з черги"
                       aria-label={`Прибрати ${item.video?.name || "відео"} з черги`}
                       onClick={() => removeQueueItem(item.id)}
-                      disabled={active || Boolean(queueAction)}
+                      disabled={isCurrent || Boolean(queueAction)}
                     >
                       ×
                     </button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
 
           <p className="queue-note">
             {active
-              ? "Черга зараз відтворюється циклічно. Зупиніть ефір, щоб змінити її порядок або склад."
+              ? "Майбутню чергу можна змінювати прямо під час ефіру. Поточне відео захищене; для переходу скористайтеся кнопкою «Пропустити відео»."
               : "Перетягніть відео у потрібне місце. Після останнього елемента черга автоматично почнеться з першого."}
           </p>
         </section>

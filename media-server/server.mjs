@@ -5,6 +5,7 @@ import { ApiError } from "./api-error.mjs";
 import { createOwnerAuth } from "./auth.mjs";
 import { MediaProcessor } from "./media-processor.mjs";
 import { QueueStore } from "./queue-store.mjs";
+import { SettingsStore } from "./settings-store.mjs";
 import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
 import { EncryptedStreamStateStore } from "./stream-state-store.mjs";
@@ -66,7 +67,7 @@ function setCommonHeaders(request, response, allowedOrigins) {
     response.setHeader("Access-Control-Allow-Origin", origin);
     response.setHeader("Vary", "Origin");
   }
-  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type,X-CSRF-Token");
   response.setHeader("Access-Control-Allow-Credentials", "true");
   response.setHeader("Cache-Control", "no-store");
@@ -101,9 +102,14 @@ export async function createMvpServer({
   stateStore,
   processor,
   queue,
+  settings,
 } = {}) {
   const videoStore = store ?? new VideoStore({ rootDir: dataDir });
   const liveQueue = queue ?? new QueueStore({ rootDir: dataDir });
+  const settingsStore = settings ?? new SettingsStore({ rootDir: dataDir });
+  await videoStore.init();
+  await liveQueue.init();
+  await settingsStore.init();
   const encryptedStateStore =
     stateStore ??
     (controller
@@ -116,9 +122,8 @@ export async function createMvpServer({
     controller ??
     new StreamController({
       ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
-      videoBitrate: process.env.MVP_VIDEO_BITRATE || "10M",
-      audioBitrate: process.env.MVP_AUDIO_BITRATE || "128k",
-      playlistPath: path.join(dataDir, "stream-playlist.ffconcat"),
+      videoBitrateKbps: settingsStore.snapshot().videoBitrateKbps,
+      audioBitrate: process.env.MVP_AUDIO_BITRATE || "192k",
       stateStore: encryptedStateStore,
     });
   const mediaProcessor =
@@ -128,17 +133,26 @@ export async function createMvpServer({
       ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
       ffprobePath: process.env.FFPROBE_PATH || "ffprobe",
       videoBitrate: process.env.MEDIA_TRANSCODE_VIDEO_BITRATE || "8M",
-      audioBitrate: process.env.MVP_AUDIO_BITRATE || "128k",
+      audioBitrate: process.env.MVP_AUDIO_BITRATE || "192k",
       preset: process.env.MEDIA_TRANSCODE_PRESET || "veryfast",
       keepOriginalUploads: process.env.MEDIA_KEEP_ORIGINAL_UPLOADS === "true",
     });
   const corsOrigins = allowedOrigins.length ? allowedOrigins : DEFAULT_ALLOWED_ORIGINS;
   const ownerAuth = auth ?? createOwnerAuth();
-  await videoStore.init();
-  await liveQueue.init();
   await encryptedStateStore?.init();
   await streamController.init?.({
     resolveVideo: (videoId) => videoStore.getReadyVideo(videoId),
+    getQueue: () =>
+      liveQueue.snapshot().items.map((item) => ({
+        ...videoStore.getReadyVideo(item.videoId),
+        queueItemId: item.id,
+      })),
+    getFallback: () => {
+      const fallbackVideoId = settingsStore.snapshot().fallbackVideoId;
+      return fallbackVideoId
+        ? { ...videoStore.getReadyVideo(fallbackVideoId), isFallback: true }
+        : null;
+    },
   });
   await mediaProcessor.init?.();
 
@@ -155,18 +169,13 @@ export async function createMvpServer({
 
   let streamStartInProgress = false;
   const deletingVideoIds = new Set();
-  const streamIsActive = () => streamStartInProgress || ["LIVE", "STARTING", "RECONNECTING", "STOPPING"]
-    .includes(streamController.snapshot().status);
-
-  const assertQueueEditable = () => {
-    if (streamIsActive()) {
-      throw new ApiError(
-        409,
-        "QUEUE_LOCKED",
-        "Зупиніть трансляцію, щоб змінити чергу.",
-      );
-    }
-  };
+  const streamEventClients = new Set();
+  const streamIsActive = () =>
+    streamStartInProgress ||
+    streamController.isActive?.() ||
+    ["LIVE", "STARTING", "DEGRADED", "RECONNECTING", "STOPPING"].includes(
+      streamController.snapshot().status,
+    );
 
   const server = createServer(async (request, response) => {
     setCommonHeaders(request, response, corsOrigins);
@@ -223,8 +232,52 @@ export async function createMvpServer({
         requireCsrf: !["GET", "HEAD"].includes(request.method || "GET"),
       });
 
+      if (request.method === "GET" && url.pathname === "/api/stream/events") {
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          Connection: "keep-alive",
+          "Cache-Control": "no-cache, no-transform",
+          "X-Accel-Buffering": "no",
+        });
+        response.write("retry: 3000\n\n");
+        const sendSnapshot = () => {
+          response.write(`data: ${JSON.stringify({ stream: streamController.snapshot() })}\n\n`);
+        };
+        sendSnapshot();
+        const interval = setInterval(sendSnapshot, 1_000);
+        interval.unref?.();
+        streamEventClients.add(response);
+        request.once("close", () => {
+          clearInterval(interval);
+          streamEventClients.delete(response);
+        });
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/api/videos") {
         json(response, 200, { videos: videoStore.listVideos() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/settings/stream") {
+        json(response, 200, { settings: settingsStore.snapshot() });
+        return;
+      }
+
+      if (request.method === "PATCH" && url.pathname === "/api/settings/stream") {
+        if (streamIsActive()) {
+          throw new ApiError(
+            409,
+            "STREAM_SETTINGS_LOCKED",
+            "Змініть профіль ефіру після зупинки трансляції.",
+          );
+        }
+        const body = await readJson(request);
+        if (body.fallbackVideoId !== undefined && body.fallbackVideoId !== null) {
+          videoStore.getReadyVideo(body.fallbackVideoId);
+        }
+        const updatedSettings = await settingsStore.updateStream(body);
+        json(response, 200, { settings: updatedSettings });
         return;
       }
 
@@ -257,6 +310,9 @@ export async function createMvpServer({
             );
           }
           await liveQueue.removeVideo(videoId);
+          if (settingsStore.snapshot().fallbackVideoId === videoId) {
+            await settingsStore.updateStream({ fallbackVideoId: null });
+          }
           const deletedVideo = await videoStore.deleteVideo(videoId);
           json(response, 200, { video: deletedVideo, queue: queueSnapshot() });
         } finally {
@@ -271,7 +327,6 @@ export async function createMvpServer({
       }
 
       if (request.method === "POST" && url.pathname === "/api/queue/items") {
-        assertQueueEditable();
         const body = await readJson(request);
         if (deletingVideoIds.has(body.videoId)) {
           throw new ApiError(409, "VIDEO_DELETE_IN_PROGRESS", "Відео вже видаляється.");
@@ -283,7 +338,6 @@ export async function createMvpServer({
       }
 
       if (request.method === "POST" && url.pathname === "/api/queue/reorder") {
-        assertQueueEditable();
         const body = await readJson(request);
         await liveQueue.reorder(body.itemIds);
         json(response, 200, { queue: queueSnapshot() });
@@ -292,7 +346,13 @@ export async function createMvpServer({
 
       const queueItemMatch = url.pathname.match(/^\/api\/queue\/items\/([^/]+)$/);
       if (request.method === "DELETE" && queueItemMatch) {
-        assertQueueEditable();
+        if (streamController.isCurrentQueueItem?.(queueItemMatch[1])) {
+          throw new ApiError(
+            409,
+            "QUEUE_ITEM_PLAYING",
+            "Поточне відео не можна видалити з черги під час відтворення.",
+          );
+        }
         await liveQueue.remove(queueItemMatch[1]);
         json(response, 200, { queue: queueSnapshot() });
         return;
@@ -300,8 +360,13 @@ export async function createMvpServer({
 
       const playNextMatch = url.pathname.match(/^\/api\/queue\/items\/([^/]+)\/play-next$/);
       if (request.method === "POST" && playNextMatch) {
-        assertQueueEditable();
-        await liveQueue.moveNext(playNextMatch[1]);
+        if (streamController.isCurrentQueueItem?.(playNextMatch[1])) {
+          throw new ApiError(409, "QUEUE_ITEM_PLAYING", "Це відео вже відтворюється.");
+        }
+        await liveQueue.moveNext(
+          playNextMatch[1],
+          streamIsActive() ? streamController.snapshot().queueItemId : null,
+        );
         json(response, 200, { queue: queueSnapshot() });
         return;
       }
@@ -349,20 +414,23 @@ export async function createMvpServer({
           throw new ApiError(409, "STREAM_ALREADY_RUNNING", "Трансляція вже запускається.");
         }
         const body = await readJson(request);
-        const videos = liveQueue.snapshot().items.map((item) => ({
-          ...videoStore.getReadyVideo(item.videoId),
-          queueItemId: item.id,
-        }));
-        if (videos.length === 0) {
-          throw new ApiError(409, "QUEUE_EMPTY", "Додайте хоча б одне готове відео до черги.");
+        if (
+          liveQueue.snapshot().items.length === 0 &&
+          !settingsStore.snapshot().fallbackVideoId
+        ) {
+          throw new ApiError(
+            409,
+            "QUEUE_EMPTY",
+            "Додайте готове відео до черги або виберіть резервне відео.",
+          );
         }
         const target = buildTarget(body.streamUrl, body.streamKey);
         streamStartInProgress = true;
         try {
           const stream = await streamController.start({
-            videos,
             target,
             streamKey: body.streamKey.trim(),
+            videoBitrateKbps: settingsStore.snapshot().videoBitrateKbps,
           });
           json(response, 202, { stream });
         } finally {
@@ -373,6 +441,12 @@ export async function createMvpServer({
 
       if (request.method === "POST" && url.pathname === "/api/stream/stop") {
         const stream = await streamController.stop();
+        json(response, 200, { stream });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/stream/skip") {
+        const stream = await streamController.skip();
         json(response, 200, { stream });
         return;
       }
@@ -396,6 +470,7 @@ export async function createMvpServer({
     controller: streamController,
     processor: mediaProcessor,
     queue: liveQueue,
+    settings: settingsStore,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -409,6 +484,8 @@ export async function createMvpServer({
       await mediaProcessor.shutdown?.();
       if (streamController.shutdown) await streamController.shutdown();
       else await streamController.stop();
+      for (const response of streamEventClients) response.end();
+      streamEventClients.clear();
       await new Promise((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
       );

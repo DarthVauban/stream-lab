@@ -48,6 +48,23 @@ test("persists queue order and restores it after restart", async (t) => {
   assert.deepEqual(restored.snapshot().items.map((item) => item.videoId), ["video-2"]);
 });
 
+test("moves an item directly after the live item", async (t) => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "streamlab-queue-next-test-"));
+  t.after(async () => rm(dataDir, { recursive: true, force: true }));
+  const queue = new QueueStore({ rootDir: dataDir });
+  await queue.init();
+  const current = await queue.add("video-1");
+  await queue.add("video-2");
+  const requested = await queue.add("video-3");
+
+  await queue.moveNext(requested.id, current.id);
+  assert.deepEqual(queue.snapshot().items.map((item) => item.videoId), [
+    "video-1",
+    "video-3",
+    "video-2",
+  ]);
+});
+
 test("rejects incomplete or foreign reorder payloads", async (t) => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "streamlab-queue-order-test-"));
   t.after(async () => rm(dataDir, { recursive: true, force: true }));
