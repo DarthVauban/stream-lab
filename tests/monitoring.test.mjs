@@ -128,3 +128,53 @@ test("persists monitoring history and stream transition events", async (t) => {
   assert.equal(raw.counters.uplinkRestarts, 1);
   assert.equal(raw.samples[0].bitrateKbps, null);
 });
+
+test("does not turn isolated metric jitter into health event spam", async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-monitoring-jitter-test-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  let now = Date.parse("2026-07-19T12:00:00.000Z");
+  const stableMetrics = () => ({
+    capturedAt: new Date(now).toISOString(),
+    bitrateKbps: 8_050,
+    fps: 30,
+    speed: 1,
+    droppedFrames: 0,
+    duplicateFrames: 0,
+  });
+  let stream = {
+    status: "LIVE",
+    startedAt: new Date(now - 60_000).toISOString(),
+    videoBitrateKbps: 8_000,
+    outputMetrics: stableMetrics(),
+  };
+  const store = new MonitoringStore({ rootDir, now: () => now });
+  const monitoring = new MonitoringService({
+    controller: { snapshot: () => ({ ...stream }) },
+    youtube: { snapshot: () => ({ connected: false }) },
+    store,
+    now: () => now,
+    sampleIntervalMs: 1,
+  });
+  await monitoring.init();
+
+  for (const speed of [0.95, 1, 0.95, 1]) {
+    now += 5_000;
+    stream = { ...stream, outputMetrics: { ...stableMetrics(), speed } };
+    await monitoring.capture({ forceSample: true });
+  }
+  assert.equal(store.events({ hours: 1 }).filter((event) => event.type === "STREAM_HEALTH_CHANGED").length, 0);
+
+  for (let index = 0; index < 3; index += 1) {
+    now += 5_000;
+    stream = { ...stream, outputMetrics: { ...stableMetrics(), speed: 0.95 } };
+    await monitoring.capture({ forceSample: true });
+  }
+  assert.equal(store.events({ hours: 1 }).filter((event) => event.type === "STREAM_HEALTH_CHANGED").length, 1);
+
+  for (let index = 0; index < 3; index += 1) {
+    now += 5_000;
+    stream = { ...stream, outputMetrics: stableMetrics() };
+    await monitoring.capture({ forceSample: true });
+  }
+  assert.equal(store.events({ hours: 1 }).filter((event) => event.type === "STREAM_HEALTH_RECOVERED").length, 1);
+});

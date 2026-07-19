@@ -18,6 +18,7 @@ class FakeChild extends EventEmitter {
     this.pid = pid;
     this.role = role;
     this.args = args;
+    this.stdin = new PassThrough();
     this.stdout = new PassThrough();
     this.stderr = new PassThrough();
   }
@@ -28,7 +29,7 @@ class FakeChild extends EventEmitter {
   }
 }
 
-function controllerHarness({ persisted = null, now } = {}) {
+function controllerHarness({ persisted = null, now, saveActiveImpl = null } = {}) {
   const children = [];
   const uplinks = [];
   const playouts = [];
@@ -42,6 +43,7 @@ function controllerHarness({ persisted = null, now } = {}) {
     },
     async saveActive(value) {
       persistedWrites.push(value);
+      await saveActiveImpl?.(value, persistedWrites.length);
     },
     async clear() {
       clears += 1;
@@ -179,6 +181,12 @@ test("keeps one uplink while the live queue advances and changes", async (t) => 
   assert.equal(harness.controller.snapshot().outputMetrics.bitrateKbps, 7692);
   assert.doesNotMatch(JSON.stringify(harness.controller.snapshot()), /super-secret-key/);
 
+  const relayed = [];
+  harness.uplinks[0].stdin.on("data", (chunk) => relayed.push(chunk));
+  harness.playouts[0].stdout.write(Buffer.from("lossless-local-mpegts"));
+  await delay(0);
+  assert.equal(Buffer.concat(relayed).toString(), "lossless-local-mpegts");
+
   const thirdVideo = {
     id: "video-3",
     name: "inserted.mp4",
@@ -198,6 +206,36 @@ test("keeps one uplink while the live queue advances and changes", async (t) => 
   assert.equal(harness.controller.snapshot().queueItemId, thirdVideo.queueItemId);
   assert.equal(harness.playouts[1].args[harness.playouts[1].args.indexOf("-i") + 1], thirdVideo.filePath);
   assert.equal(harness.playouts[1].args[harness.playouts[1].args.indexOf("-output_ts_offset") + 1], "10.000");
+  assert.equal(harness.playouts[1].args.at(-1), "pipe:1");
+  assert.equal(harness.uplinks[0].args[harness.uplinks[0].args.indexOf("-i") + 1], "pipe:0");
+});
+
+test("starts the next playout before slow state persistence completes", async (t) => {
+  let releaseSave;
+  const blockedSave = new Promise((resolve) => {
+    releaseSave = resolve;
+  });
+  const harness = controllerHarness({
+    saveActiveImpl: async (_value, writeNumber) => {
+      if (writeNumber === 2) await blockedSave;
+    },
+  });
+  harness.setQueue([firstVideo, secondVideo]);
+  await harness.init();
+  t.after(() => harness.controller.stop());
+  await harness.controller.start({
+    target: "rtmps://example.test/live/persistence-key",
+    streamKey: "persistence-key",
+  });
+
+  harness.playouts[0].emit("exit", 0, null);
+  await delay(0);
+  await delay(0);
+  assert.equal(harness.playouts.length, 2);
+  assert.equal(harness.controller.snapshot().videoId, secondVideo.id);
+
+  releaseSave();
+  await delay(0);
 });
 
 test("skips the current video without restarting the uplink", async (t) => {

@@ -600,8 +600,12 @@ test("builds separate dynamic playout and configurable CBR uplink commands", () 
   assert.ok(args.includes("-nostats"));
   assert.equal(args[args.indexOf("-progress") + 1], "pipe:1");
   assert.equal(args.at(-1), "rtmps://example.test/live/key");
-  assert.match(args[args.indexOf("-vf") + 1], /scale=1920:1080/);
+  assert.equal(args.includes("-vf"), false);
   assert.equal(args[args.indexOf("-i") + 1], "udp://127.0.0.1:23000");
+  assert.equal(args[args.indexOf("-fps_mode") + 1], "cfr");
+  assert.equal(args[args.indexOf("-ar") + 1], "44100");
+  assert.match(args[args.indexOf("-x264-params") + 1], /nal-hrd=cbr/);
+  assert.equal(args[args.indexOf("-rw_timeout") + 1], "15000000");
 
   const playoutArgs = buildPlayoutFfmpegArgs({
     inputPath: "C:/media/first.mp4",
@@ -612,6 +616,7 @@ test("builds separate dynamic playout and configurable CBR uplink commands", () 
   assert.equal(playoutArgs[playoutArgs.indexOf("-c") + 1], "copy");
   assert.equal(playoutArgs[playoutArgs.indexOf("-output_ts_offset") + 1], "10.000");
   assert.equal(playoutArgs[playoutArgs.indexOf("-f") + 1], "mpegts");
+  assert.match(playoutArgs[playoutArgs.indexOf("-mpegts_flags") + 1], /initial_discontinuity/);
 
   const promoArgs = buildPlayoutFfmpegArgs({
     inputPath: "C:/media/first.mp4",

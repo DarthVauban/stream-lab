@@ -188,7 +188,7 @@ export async function createMvpServer({
     new StreamController({
       ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
       videoBitrateKbps: settingsStore.snapshot().videoBitrateKbps,
-      audioBitrate: process.env.MVP_AUDIO_BITRATE || "192k",
+      audioBitrate: process.env.MVP_AUDIO_BITRATE || "128k",
       stateStore: encryptedStateStore,
     });
   const promoIntegration =
@@ -219,7 +219,7 @@ export async function createMvpServer({
       ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
       ffprobePath: process.env.FFPROBE_PATH || "ffprobe",
       videoBitrate: process.env.MEDIA_TRANSCODE_VIDEO_BITRATE || "8M",
-      audioBitrate: process.env.MVP_AUDIO_BITRATE || "192k",
+      audioBitrate: process.env.MVP_AUDIO_BITRATE || "128k",
       preset: process.env.MEDIA_TRANSCODE_PRESET || "veryfast",
       keepOriginalUploads: process.env.MEDIA_KEEP_ORIGINAL_UPLOADS === "true",
       onEvent: async (type, payload) => {

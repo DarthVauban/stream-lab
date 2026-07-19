@@ -22,9 +22,12 @@ export function buildUplinkFfmpegArgs({
   inputUrl,
   target,
   videoBitrateKbps = 8_000,
-  audioBitrate = "192k",
+  audioBitrate = "128k",
+  inputFormat = null,
+  networkTimeoutMs = 15_000,
 }) {
   const bitrate = normalizeVideoBitrateKbps(videoBitrateKbps);
+  const timeoutMicroseconds = Math.max(1_000, Number(networkTimeoutMs) || 15_000) * 1_000;
   return [
     "-hide_banner",
     "-loglevel",
@@ -35,19 +38,28 @@ export function buildUplinkFfmpegArgs({
     "-fflags",
     "+genpts+discardcorrupt",
     "-thread_queue_size",
-    "2048",
+    "8192",
+    ...(inputFormat ? ["-f", inputFormat] : []),
     "-i",
     inputUrl,
-    "-vf",
-    "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0",
     "-r",
     "30",
+    "-fps_mode",
+    "cfr",
     "-c:v",
     "libx264",
     "-preset",
     "veryfast",
-    "-tune",
-    "zerolatency",
+    "-profile:v",
+    "high",
+    "-level:v",
+    "4.1",
+    "-pix_fmt",
+    "yuv420p",
     "-b:v",
     `${bitrate}k`,
     "-minrate",
@@ -62,16 +74,30 @@ export function buildUplinkFfmpegArgs({
     "60",
     "-sc_threshold",
     "0",
+    "-bf",
+    "2",
+    "-refs",
+    "1",
+    "-x264-params",
+    "nal-hrd=cbr:force-cfr=1:open-gop=0",
     "-c:a",
     "aac",
     "-b:a",
     audioBitrate,
     "-ar",
-    "48000",
+    "44100",
     "-ac",
     "2",
     "-af",
-    "aresample=async=1:first_pts=0",
+    "aresample=async=1000:min_hard_comp=0.100:first_pts=0",
+    "-max_muxing_queue_size",
+    "4096",
+    "-rw_timeout",
+    String(Math.round(timeoutMicroseconds)),
+    "-tcp_nodelay",
+    "1",
+    "-flvflags",
+    "no_duration_filesize",
     "-f",
     "flv",
     target,
@@ -205,7 +231,11 @@ export function buildPlayoutFfmpegArgs({
     "-output_ts_offset",
     Math.max(0, timestampOffsetSeconds + safeStart).toFixed(3),
     "-mpegts_flags",
-    "+resend_headers",
+    "+resend_headers+initial_discontinuity",
+    "-pat_period",
+    "0.1",
+    "-sdt_period",
+    "0.5",
     "-muxdelay",
     "0",
     "-muxpreload",
@@ -245,9 +275,8 @@ export class StreamController {
   constructor({
     ffmpegPath = "ffmpeg",
     videoBitrateKbps = 8_000,
-    audioBitrate = "192k",
-    udpHost = "127.0.0.1",
-    udpPort = Number(process.env.PLAYOUT_UDP_PORT || 23_000),
+    audioBitrate = "128k",
+    networkTimeoutMs = Number(process.env.STREAM_NETWORK_TIMEOUT_MS || 15_000),
     spawnImpl = spawn,
     spawnSyncImpl = spawnSync,
     stateStore = null,
@@ -261,8 +290,11 @@ export class StreamController {
     this.ffmpegPath = ffmpegPath;
     this.defaultVideoBitrateKbps = normalizeVideoBitrateKbps(videoBitrateKbps);
     this.audioBitrate = audioBitrate;
-    this.udpInputUrl = `udp://${udpHost}:${udpPort}?fifo_size=262144&overrun_nonfatal=1&buffer_size=1048576`;
-    this.udpOutputUrl = `udp://${udpHost}:${udpPort}?pkt_size=1316&buffer_size=1048576`;
+    this.networkTimeoutMs = Math.max(1_000, Number(networkTimeoutMs) || 15_000);
+    // Node relays MPEG-TS through OS pipes. Unlike local UDP, pipe backpressure
+    // cannot silently discard packets when the encoder or host is briefly busy.
+    this.playoutInputUrl = "pipe:0";
+    this.playoutOutputUrl = "pipe:1";
     this.spawnImpl = spawnImpl;
     this.spawnSyncImpl = spawnSyncImpl;
     this.stateStore = stateStore;
@@ -297,6 +329,7 @@ export class StreamController {
     this.ffmpegHealth = null;
     this.ffmpegHealthCheckedAt = 0;
     this.outputMetrics = null;
+    this.playoutPausedForBackpressure = null;
     this.state = {
       status: "STOPPED",
       startedAt: null,
@@ -551,6 +584,27 @@ export class StreamController {
     return lines;
   }
 
+  resumePlayoutAfterBackpressure() {
+    const source = this.playoutPausedForBackpressure;
+    this.playoutPausedForBackpressure = null;
+    source?.stdout?.resume?.();
+  }
+
+  relayPlayoutChunk(chunk, source, runId) {
+    if (runId !== this.playoutRunId || source !== this.playoutChild) return;
+    const destination = this.uplinkChild?.stdin;
+    if (!destination || destination.destroyed || destination.writableEnded) return;
+    if (destination.write(chunk) || this.playoutPausedForBackpressure === source) return;
+
+    this.playoutPausedForBackpressure = source;
+    source.stdout?.pause?.();
+    destination.once("drain", () => {
+      if (this.playoutPausedForBackpressure !== source) return;
+      this.playoutPausedForBackpressure = null;
+      if (runId === this.playoutRunId && source === this.playoutChild) source.stdout?.resume?.();
+    });
+  }
+
   async launchUplink({ initial }) {
     if (!this.desired || this.shuttingDown || this.uplinkChild) return this.snapshot();
     const ffmpeg = this.checkFfmpeg(true);
@@ -567,16 +621,18 @@ export class StreamController {
     this.state.status = initial ? "STARTING" : "RECONNECTING";
     this.state.nextRetryAt = null;
     const args = buildUplinkFfmpegArgs({
-      inputUrl: this.udpInputUrl,
+      inputUrl: this.playoutInputUrl,
+      inputFormat: "mpegts",
       target: this.desired.target,
       videoBitrateKbps: this.desired.videoBitrateKbps,
       audioBitrate: this.audioBitrate,
+      networkTimeoutMs: this.networkTimeoutMs,
     });
     let child;
     try {
       child = this.spawnImpl(this.ffmpegPath, args, {
         windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
       if (initial) throw error;
@@ -584,6 +640,9 @@ export class StreamController {
       return this.snapshot();
     }
     this.uplinkChild = child;
+    child.stdin?.on("error", () => {
+      this.resumePlayoutAfterBackpressure();
+    });
     this.uplinkAttemptStartedAt = this.now();
     let spawned = false;
     let terminalHandled = false;
@@ -614,6 +673,7 @@ export class StreamController {
       const ranFor = this.uplinkAttemptStartedAt === null ? 0 : this.now() - this.uplinkAttemptStartedAt;
       this.uplinkChild = null;
       this.uplinkAttemptStartedAt = null;
+      this.resumePlayoutAfterBackpressure();
       if (!this.desired || this.shuttingDown || this.state.status === "STOPPING") return;
       if (ranFor >= this.stableRunMs) this.failureStreak = 0;
       this.scheduleReconnect(reason);
@@ -651,7 +711,7 @@ export class StreamController {
     this.skipRequested = false;
     const args = buildPlayoutFfmpegArgs({
       inputPath: item.filePath,
-      outputUrl: this.udpOutputUrl,
+      outputUrl: this.playoutOutputUrl,
       timestampOffsetSeconds: this.playoutClockSeconds,
       startSeconds: resumeSeconds,
       overlays: this.getOverlays?.() || [],
@@ -660,7 +720,7 @@ export class StreamController {
     try {
       child = this.spawnImpl(this.ffmpegPath, args, {
         windowsHide: true,
-        stdio: ["ignore", "ignore", "pipe"],
+        stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (error) {
       if (initial) throw error;
@@ -668,6 +728,9 @@ export class StreamController {
       return this.snapshot();
     }
     this.playoutChild = child;
+    child.stdout?.on("data", (chunk) => {
+      this.relayPlayoutChunk(chunk, child, runId);
+    });
     let spawned = false;
     let terminalHandled = false;
 
@@ -679,6 +742,7 @@ export class StreamController {
       if (terminalHandled || runId !== this.playoutRunId) return;
       terminalHandled = true;
       this.playoutChild = null;
+      if (this.playoutPausedForBackpressure === child) this.resumePlayoutAfterBackpressure();
       if (!this.desired || this.shuttingDown || this.state.status === "STOPPING") {
         this.skipCompletion?.();
         this.skipCompletion = null;
@@ -745,7 +809,6 @@ export class StreamController {
     }
     this.currentItem = next;
     try {
-      await this.persistCurrent();
       await this.launchPlayout(next);
     } catch (error) {
       this.state.status = "DEGRADED";
@@ -756,6 +819,16 @@ export class StreamController {
         void this.launchPlayout(this.nextItem({ failed: true }) ?? this.currentItem);
       }, 2_000);
       this.playoutRetryTimer?.unref?.();
+      return;
+    }
+    try {
+      await this.persistCurrent();
+    } catch (error) {
+      // Persistence must never create or extend an on-air gap. The active
+      // playout continues and the next successful transition retries the save.
+      const message = error instanceof Error ? error.message : "Не вдалося зберегти стан ефіру.";
+      this.state.lastFailure = message;
+      this.pushLogs(`Stream state persistence delayed: ${message}`, "controller");
     }
   }
 
@@ -870,6 +943,7 @@ export class StreamController {
     this.currentItem = null;
     this.currentStartedAtMs = null;
     this.outputMetrics = null;
+    this.resumePlayoutAfterBackpressure();
     this.state = {
       ...this.state,
       status: "STOPPED",
@@ -891,6 +965,7 @@ export class StreamController {
     await this.stopChild(this.uplinkChild);
     this.playoutChild = null;
     this.uplinkChild = null;
+    this.resumePlayoutAfterBackpressure();
     return this.snapshot();
   }
 }

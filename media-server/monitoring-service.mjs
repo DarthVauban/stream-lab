@@ -131,6 +131,7 @@ export class MonitoringService {
     setIntervalImpl = setInterval,
     clearIntervalImpl = clearInterval,
     onEvent = async () => {},
+    healthConfirmSamples = 3,
   } = {}) {
     if (!controller || !store) throw new Error("Для моніторингу потрібні controller і store.");
     this.controller = controller;
@@ -142,8 +143,12 @@ export class MonitoringService {
     this.setIntervalImpl = setIntervalImpl;
     this.clearIntervalImpl = clearIntervalImpl;
     this.onEvent = onEvent;
+    this.healthConfirmSamples = Math.max(1, Math.round(Number(healthConfirmSamples) || 3));
     this.interval = null;
     this.previous = null;
+    this.confirmedHealthStatus = null;
+    this.healthCandidateStatus = null;
+    this.healthCandidateCount = 0;
     this.lastSampleAt = 0;
     this.captureQueue = Promise.resolve();
   }
@@ -205,6 +210,49 @@ export class MonitoringService {
     return event;
   }
 
+  async confirmHealthTransition(current, capturedAt) {
+    const status = current.health.status;
+    if (status === "OFFLINE") {
+      this.confirmedHealthStatus = status;
+      this.healthCandidateStatus = null;
+      this.healthCandidateCount = 0;
+      return;
+    }
+    if (this.confirmedHealthStatus === null) {
+      this.confirmedHealthStatus = status;
+      return;
+    }
+    if (status === this.confirmedHealthStatus) {
+      this.healthCandidateStatus = null;
+      this.healthCandidateCount = 0;
+      return;
+    }
+
+    if (this.healthCandidateStatus === status) this.healthCandidateCount += 1;
+    else {
+      this.healthCandidateStatus = status;
+      this.healthCandidateCount = 1;
+    }
+    const hardFailure = ["ERROR", "RECONNECTING"].includes(current.stream.status);
+    const requiredSamples = hardFailure ? 1 : this.healthConfirmSamples;
+    if (this.healthCandidateCount < requiredSamples) return;
+
+    const previousStatus = this.confirmedHealthStatus;
+    this.confirmedHealthStatus = status;
+    this.healthCandidateStatus = null;
+    this.healthCandidateCount = 0;
+    if (["BUFFERING_RISK", "CRITICAL"].includes(status)) {
+      await this.event(
+        "STREAM_HEALTH_CHANGED",
+        status === "CRITICAL" ? "critical" : "warning",
+        current.health.reason,
+        capturedAt,
+      );
+    } else if (status === "STABLE" && ["BUFFERING_RISK", "CRITICAL"].includes(previousStatus)) {
+      await this.event("STREAM_HEALTH_RECOVERED", "success", current.health.reason, capturedAt);
+    }
+  }
+
   capture({ forceSample = false } = {}) {
     const operation = this.captureQueue.catch(() => {}).then(async () => {
       const current = this.currentState();
@@ -244,22 +292,9 @@ export class MonitoringService {
             capturedAt,
           );
         }
-        if (previous.health.status !== current.health.status) {
-          if (["BUFFERING_RISK", "CRITICAL"].includes(current.health.status)) {
-            await this.event(
-              "STREAM_HEALTH_CHANGED",
-              current.health.status === "CRITICAL" ? "critical" : "warning",
-              current.health.reason,
-              capturedAt,
-            );
-          } else if (
-            current.health.status === "STABLE" &&
-            ["BUFFERING_RISK", "CRITICAL"].includes(previous.health.status)
-          ) {
-            await this.event("STREAM_HEALTH_RECOVERED", "success", current.health.reason, capturedAt);
-          }
-        }
       }
+
+      await this.confirmHealthTransition(current, capturedAt);
 
       if (forceSample || this.now() - this.lastSampleAt >= this.sampleIntervalMs) {
         await this.store.appendSample(this.makeSample(current, capturedAt));
