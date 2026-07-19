@@ -102,6 +102,7 @@ function setCommonHeaders(request, response, allowedOrigins) {
 function mutationMetadata(method, pathname) {
   if (!["POST", "PUT", "PATCH", "DELETE"].includes(method || "")) return null;
   if (/^\/api\/uploads\/[^/]+\/chunks$/.test(pathname)) return null;
+  if (pathname === "/api/telegram/webhook") return null;
   const segments = pathname.split("/").filter(Boolean);
   return {
     action: `${method} ${pathname.replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, ":id")}`,
@@ -251,11 +252,6 @@ export async function createMvpServer({
           }
         : {},
     );
-  const telegramIntegration =
-    telegram ??
-    new TelegramService({
-      store: new EncryptedTelegramStore({ rootDir: dataDir }),
-    });
   await encryptedStateStore?.init();
   await promoIntegration.init?.();
   await streamController.init?.({
@@ -277,7 +273,6 @@ export async function createMvpServer({
   await mediaProcessor.init?.();
   await youtubeIntegration.init?.();
   youtubeIntegration.start?.();
-  await telegramIntegration.init?.();
   const monitoringService =
     monitoring ??
     new MonitoringService({
@@ -324,6 +319,33 @@ export async function createMvpServer({
         video: videoStore.getVideo(item.videoId),
       })),
     }));
+
+  const telegramIntegration =
+    telegram ??
+    new TelegramService({
+      store: new EncryptedTelegramStore({ rootDir: dataDir }),
+      getDashboardSnapshot: async () => {
+        const [storageStatus, databaseHealth, realtimeHealth] = await Promise.all([
+          storageMonitor.snapshot().catch(() => storageMonitor.last),
+          databaseService.health?.().catch(() => ({
+            configured: databaseService.configured,
+            connected: false,
+          })),
+          realtimeHub.health?.().catch(() => realtimeHub.snapshot()),
+        ]);
+        return {
+          stream: streamController.snapshot(),
+          queue: queueSnapshot(),
+          youtube: youtubeIntegration.snapshot(),
+          monitoring: monitoringService.snapshot({ hours: 24 }),
+          system: systemMonitor.snapshot?.() ?? null,
+          storage: storageStatus,
+          database: databaseHealth,
+          realtime: realtimeHealth,
+        };
+      },
+    });
+  await telegramIntegration.init?.();
 
   let streamStartInProgress = false;
   const deletingVideoIds = new Set();
@@ -434,6 +456,29 @@ export async function createMvpServer({
           if (!(error instanceof ApiError)) console.error(error);
           redirect(response, "/?youtube=error");
         }
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/telegram/webhook") {
+        const body = await readJson(request, 256 * 1024);
+        const result = await telegramIntegration.handleWebhook(
+          request.headers["x-telegram-bot-api-secret-token"],
+          body,
+        );
+        await auditStore.append({
+          actor: result.userId ? `telegram:${result.userId}` : "telegram",
+          action: result.command ? `TELEGRAM_${result.command.toUpperCase()}` : "TELEGRAM_UPDATE",
+          targetType: "telegram",
+          targetId: result.chatId || null,
+          status: result.authorized === false ? "REJECTED" : "SUCCESS",
+          details: {
+            updateId: result.updateId,
+            authorized: result.authorized ?? null,
+            duplicate: Boolean(result.duplicate),
+            rateLimited: Boolean(result.rateLimited),
+          },
+        }).catch((error) => console.error("StreamLab Telegram audit write failed.", error));
+        json(response, 200, { ok: true });
         return;
       }
 
@@ -655,7 +700,14 @@ export async function createMvpServer({
 
       if (request.method === "POST" && url.pathname === "/api/telegram/connect") {
         const body = await readJson(request, 8 * 1024);
-        const snapshot = await telegramIntegration.connect(body.token);
+        const snapshot = await telegramIntegration.connect(body);
+        json(response, 200, { telegram: snapshot });
+        return;
+      }
+
+      if (request.method === "PATCH" && url.pathname === "/api/telegram/settings") {
+        const body = await readJson(request, 8 * 1024);
+        const snapshot = await telegramIntegration.configure(body);
         json(response, 200, { telegram: snapshot });
         return;
       }

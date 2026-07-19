@@ -429,6 +429,17 @@ type TelegramStatus = {
     username: string | null;
     displayName: string | null;
   } | null;
+  webhook: {
+    configured: boolean;
+    url: string;
+    allowedUserIds: string[];
+    allowedChatIds: string[];
+    registeredAt: string | null;
+    lastUpdateAt: string | null;
+    lastUpdateId: number | null;
+    lastCommandAt: string | null;
+    lastError: string | null;
+  } | null;
 };
 
 class ApiRequestError extends Error {
@@ -678,6 +689,9 @@ export default function Home() {
   const [telegram, setTelegram] = useState<TelegramStatus | null>(null);
   const [telegramToken, setTelegramToken] = useState("");
   const [telegramTokenVisible, setTelegramTokenVisible] = useState(false);
+  const [telegramWebhookUrl, setTelegramWebhookUrl] = useState("");
+  const [telegramAllowedUserIds, setTelegramAllowedUserIds] = useState("");
+  const [telegramAllowedChatIds, setTelegramAllowedChatIds] = useState("");
   const [telegramAction, setTelegramAction] = useState("");
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -894,6 +908,9 @@ export default function Home() {
         setCompressionProfileDraft(settings.compressionProfile);
         setStreamPresets(presets);
         setTelegram(telegram);
+        setTelegramWebhookUrl(telegram.webhook?.url || `${window.location.origin}/api/telegram/webhook`);
+        setTelegramAllowedUserIds(telegram.webhook?.allowedUserIds.join(", ") || "");
+        setTelegramAllowedChatIds(telegram.webhook?.allowedChatIds.join(", ") || "");
         setCompressionProfiles(profiles);
       })
       .catch((error) => {
@@ -1150,6 +1167,9 @@ export default function Home() {
       setTelegram(null);
       setTelegramToken("");
       setTelegramTokenVisible(false);
+      setTelegramWebhookUrl("");
+      setTelegramAllowedUserIds("");
+      setTelegramAllowedChatIds("");
       setTelegramAction("");
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
@@ -1824,23 +1844,44 @@ export default function Home() {
   }
 
   async function connectTelegram() {
-    if (telegramAction || !telegramToken.trim()) return;
-    setTelegramAction("connect");
+    const replacingToken = Boolean(telegramToken.trim());
+    if (
+      telegramAction ||
+      (!telegram?.connected && !replacingToken) ||
+      !telegramWebhookUrl.trim() ||
+      !telegramAllowedUserIds.trim() ||
+      !telegramAllowedChatIds.trim()
+    ) return;
+    setTelegramAction("save");
     setNotice(null);
     try {
+      const updatingSettings = Boolean(telegram?.connected && !replacingToken);
       const result = await api<{ telegram: TelegramStatus }>(
-        "/api/telegram/connect",
+        updatingSettings ? "/api/telegram/settings" : "/api/telegram/connect",
         {
-          method: "POST",
+          method: updatingSettings ? "PATCH" : "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: telegramToken.trim() }),
+          body: JSON.stringify({
+            token: telegramToken.trim() || undefined,
+            webhookUrl: telegramWebhookUrl.trim(),
+            allowedUserIds: telegramAllowedUserIds,
+            allowedChatIds: telegramAllowedChatIds,
+          }),
         },
         csrfToken,
       );
       setTelegram(result.telegram);
+      setTelegramWebhookUrl(result.telegram.webhook?.url || telegramWebhookUrl.trim());
+      setTelegramAllowedUserIds(result.telegram.webhook?.allowedUserIds.join(", ") || "");
+      setTelegramAllowedChatIds(result.telegram.webhook?.allowedChatIds.join(", ") || "");
       setTelegramToken("");
       setTelegramTokenVisible(false);
-      setNotice({ type: "success", text: "Telegram-бот підключено й перевірено." });
+      setNotice({
+        type: "success",
+        text: updatingSettings
+          ? "Налаштування Telegram webhook оновлено."
+          : "Telegram-бот підключено, webhook активовано.",
+      });
     } catch (error) {
       setNotice({
         type: "error",
@@ -3598,27 +3639,90 @@ export default function Home() {
                   void connectTelegram();
                 }}
               >
-                <label className="field">
-                  <span>{telegram?.connected ? "Новий bot token" : "Bot token від @BotFather"}</span>
-                  <div className="secret-input">
+                <div className="telegram-settings-grid">
+                  <label className="field telegram-webhook-field">
+                    <span>Webhook URL</span>
                     <input
-                      type={telegramTokenVisible ? "text" : "password"}
-                      value={telegramToken}
-                      onChange={(event) => setTelegramToken(event.target.value)}
-                      placeholder={telegram?.connected ? "Вставте токен, щоб замінити поточний" : "123456789:AA…"}
+                      type="url"
+                      value={telegramWebhookUrl}
+                      onChange={(event) => setTelegramWebhookUrl(event.target.value)}
+                      placeholder="https://stream.mt-panel.sbs/api/telegram/webhook"
                       autoComplete="off"
                       spellCheck={false}
                       disabled={Boolean(telegramAction)}
                     />
-                    <button type="button" onClick={() => setTelegramTokenVisible((visible) => !visible)} disabled={!telegramToken}>
-                      {telegramTokenVisible ? "Сховати" : "Показати"}
-                    </button>
+                    <small>Публічна HTTPS-адреса. Секрет перевірки StreamLab створює автоматично.</small>
+                  </label>
+                  <label className="field">
+                    <span>Дозволені Telegram user ID</span>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={telegramAllowedUserIds}
+                      onChange={(event) => setTelegramAllowedUserIds(event.target.value)}
+                      placeholder="123456789"
+                      autoComplete="off"
+                      spellCheck={false}
+                      disabled={Boolean(telegramAction)}
+                    />
+                    <small>Кілька числових ID можна вказати через кому.</small>
+                  </label>
+                  <label className="field">
+                    <span>Дозволені Telegram chat ID</span>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={telegramAllowedChatIds}
+                      onChange={(event) => setTelegramAllowedChatIds(event.target.value)}
+                      placeholder="123456789 або -100…"
+                      autoComplete="off"
+                      spellCheck={false}
+                      disabled={Boolean(telegramAction)}
+                    />
+                    <small>Для особистого чату user ID і chat ID зазвичай однакові.</small>
+                  </label>
+                  <label className="field">
+                    <span>{telegram?.connected ? "Новий bot token (необов’язково)" : "Bot token від @BotFather"}</span>
+                    <div className="secret-input">
+                      <input
+                        type={telegramTokenVisible ? "text" : "password"}
+                        value={telegramToken}
+                        onChange={(event) => setTelegramToken(event.target.value)}
+                        placeholder={telegram?.connected ? "Залиште порожнім, щоб не змінювати" : "123456789:AA…"}
+                        autoComplete="off"
+                        spellCheck={false}
+                        disabled={Boolean(telegramAction)}
+                      />
+                      <button type="button" onClick={() => setTelegramTokenVisible((visible) => !visible)} disabled={!telegramToken}>
+                        {telegramTokenVisible ? "Сховати" : "Показати"}
+                      </button>
+                    </div>
+                    <small>StreamLab перевіряє токен через Telegram API й надалі показує лише масковане значення.</small>
+                  </label>
+                </div>
+                {telegram?.webhook?.configured && (
+                  <div className={`telegram-webhook-state ${telegram.webhook.lastError ? "telegram-webhook-state--error" : ""}`}>
+                    <strong>{telegram.webhook.lastError ? "Webhook потребує уваги" : "Webhook активний · режим лише для читання"}</strong>
+                    <span>
+                      {telegram.webhook.lastError || (telegram.webhook.lastUpdateAt
+                        ? `Остання команда: ${new Date(telegram.webhook.lastUpdateAt).toLocaleString("uk-UA")}`
+                        : "Надішліть боту /start, щоб відкрити меню.")}
+                    </span>
                   </div>
-                  <small>Перед збереженням StreamLab перевірить токен через Telegram API. Повне значення більше не показується.</small>
-                </label>
+                )}
                 <div className="profile-card-actions">
-                  <button className="button button--primary" type="submit" disabled={!telegramToken.trim() || Boolean(telegramAction)}>
-                    {telegramAction === "connect" ? "Перевіряємо…" : telegram?.connected ? "Замінити токен" : "Підключити бота"}
+                  <button
+                    className="button button--primary"
+                    type="submit"
+                    disabled={
+                      Boolean(telegramAction) ||
+                      (!telegram?.connected && !telegramToken.trim()) ||
+                      !telegramWebhookUrl.trim() ||
+                      !telegramAllowedUserIds.trim() ||
+                      !telegramAllowedChatIds.trim()
+                    }
+                  >
+                    {telegramAction === "save" ? "Зберігаємо…" : telegram?.connected ? "Зберегти webhook" : "Підключити й активувати"}
                   </button>
                   {telegram?.connected && (
                     <button className="button button--danger" type="button" onClick={disconnectTelegram} disabled={Boolean(telegramAction)}>

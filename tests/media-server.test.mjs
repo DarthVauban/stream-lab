@@ -201,7 +201,12 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
       Cookie: session.cookie,
       "X-CSRF-Token": session.csrfToken,
     },
-    body: JSON.stringify({ token: telegramToken }),
+    body: JSON.stringify({
+      token: telegramToken,
+      webhookUrl: "https://stream.example.test/api/telegram/webhook",
+      allowedUserIds: ["111"],
+      allowedChatIds: ["111"],
+    }),
   });
   assert.equal(telegramResponse.status, 200);
   const telegram = (await telegramResponse.json()).telegram;
@@ -213,6 +218,29 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
     await readFile(path.join(dataDir, "telegram-bot.enc.json"), "utf8"),
     new RegExp(telegramToken),
   );
+  const telegramSecret = app.telegram.store.readConnection().webhook.secret;
+  const webhookResponse = await fetch(`${baseUrl}/api/telegram/webhook`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": telegramSecret,
+    },
+    body: JSON.stringify({
+      update_id: 1,
+      message: { message_id: 1, from: { id: 111 }, chat: { id: 111 }, text: "/start" },
+    }),
+  });
+  assert.equal(webhookResponse.status, 200);
+  assert.deepEqual(await webhookResponse.json(), { ok: true });
+  const rejectedWebhookResponse = await fetch(`${baseUrl}/api/telegram/webhook`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "invalid-secret",
+    },
+    body: JSON.stringify({ update_id: 2 }),
+  });
+  assert.equal(rejectedWebhookResponse.status, 403);
   const createPresetResponse = await fetch(`${baseUrl}/api/stream-presets`, {
     method: "POST",
     headers: {

@@ -14,6 +14,40 @@ function emptyState() {
   return { connection: null };
 }
 
+function normalizeIdList(value, { allowNegative = false } = {}) {
+  const values = Array.isArray(value)
+    ? value
+    : String(value || "").split(/[\s,;]+/);
+  const pattern = allowNegative ? /^-?\d{1,20}$/ : /^\d{1,20}$/;
+  return [...new Set(values.map((item) => String(item).trim()).filter((item) => pattern.test(item)))].slice(0, 100);
+}
+
+function normalizeWebhook(value) {
+  if (!value) return null;
+  const url = typeof value.url === "string" ? value.url.trim() : "";
+  const secret = typeof value.secret === "string" ? value.secret : "";
+  if (
+    !url ||
+    !/^https:\/\//i.test(url) ||
+    !/^[A-Za-z0-9_-]{32,128}$/.test(secret)
+  ) {
+    throw new Error("Збережені налаштування Telegram webhook пошкоджені.");
+  }
+  return {
+    url,
+    secret,
+    allowedUserIds: normalizeIdList(value.allowedUserIds),
+    allowedChatIds: normalizeIdList(value.allowedChatIds, { allowNegative: true }),
+    registeredAt: typeof value.registeredAt === "string" ? value.registeredAt : null,
+    lastUpdateAt: typeof value.lastUpdateAt === "string" ? value.lastUpdateAt : null,
+    lastUpdateId: Number.isSafeInteger(value.lastUpdateId) && value.lastUpdateId >= 0
+      ? value.lastUpdateId
+      : null,
+    lastCommandAt: typeof value.lastCommandAt === "string" ? value.lastCommandAt : null,
+    lastError: typeof value.lastError === "string" ? value.lastError.slice(0, 300) : null,
+  };
+}
+
 function normalizeConnection(value) {
   if (!value) return null;
   if (
@@ -32,6 +66,7 @@ function normalizeConnection(value) {
     username: typeof value.username === "string" ? value.username : null,
     displayName: typeof value.displayName === "string" ? value.displayName : null,
     connectedAt: value.connectedAt,
+    webhook: normalizeWebhook(value.webhook),
   };
 }
 
@@ -80,7 +115,19 @@ export class EncryptedTelegramStore {
   }
 
   readConnection() {
-    return this.state.connection ? { ...this.state.connection } : null;
+    const connection = this.state.connection;
+    return connection
+      ? {
+          ...connection,
+          webhook: connection.webhook
+            ? {
+                ...connection.webhook,
+                allowedUserIds: [...connection.webhook.allowedUserIds],
+                allowedChatIds: [...connection.webhook.allowedChatIds],
+              }
+            : null,
+        }
+      : null;
   }
 
   snapshot() {
@@ -94,6 +141,19 @@ export class EncryptedTelegramStore {
             id: connection.botId,
             username: connection.username,
             displayName: connection.displayName,
+          }
+        : null,
+      webhook: connection?.webhook
+        ? {
+            configured: true,
+            url: connection.webhook.url,
+            allowedUserIds: [...connection.webhook.allowedUserIds],
+            allowedChatIds: [...connection.webhook.allowedChatIds],
+            registeredAt: connection.webhook.registeredAt,
+            lastUpdateAt: connection.webhook.lastUpdateAt,
+            lastUpdateId: connection.webhook.lastUpdateId,
+            lastCommandAt: connection.webhook.lastCommandAt,
+            lastError: connection.webhook.lastError,
           }
         : null,
     };
@@ -135,6 +195,27 @@ export class EncryptedTelegramStore {
   saveConnection(connection) {
     return this.mutate(() => {
       this.state.connection = normalizeConnection(connection);
+      return this.snapshot();
+    });
+  }
+
+  recordWebhookUpdate({ updateId, receivedAt, commandAt = null, error = null }) {
+    return this.mutate(() => {
+      const webhook = this.state.connection?.webhook;
+      if (!webhook) return this.snapshot();
+      webhook.lastUpdateId = Number(updateId);
+      webhook.lastUpdateAt = receivedAt;
+      if (commandAt) webhook.lastCommandAt = commandAt;
+      webhook.lastError = error ? String(error).slice(0, 300) : null;
+      return this.snapshot();
+    });
+  }
+
+  recordWebhookError(message) {
+    return this.mutate(() => {
+      const webhook = this.state.connection?.webhook;
+      if (!webhook) return this.snapshot();
+      webhook.lastError = String(message || "Невідома помилка Telegram webhook.").slice(0, 300);
       return this.snapshot();
     });
   }

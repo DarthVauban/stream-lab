@@ -14,7 +14,13 @@ async function proxy(request: NextRequest, context: RouteContext) {
   target.search = incomingUrl.search;
 
   const headers = new Headers();
-  for (const name of ["accept", "content-type", "cookie", "x-csrf-token"]) {
+  for (const name of [
+    "accept",
+    "content-type",
+    "cookie",
+    "x-csrf-token",
+    "x-telegram-bot-api-secret-token",
+  ]) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
