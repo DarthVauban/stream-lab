@@ -1,8 +1,19 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChangeEvent,
+  DragEvent as ReactDragEvent,
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 const CHUNK_SIZE = 8 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024 * 1024;
+const ALLOWED_VIDEO_EXTENSIONS = new Set(["mp4", "mov", "mkv", "webm", "m4v"]);
 
 type Video = {
   id: string;
@@ -131,12 +142,14 @@ export default function Home() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
   const [streamUrl, setStreamUrl] = useState("rtmps://a.rtmps.youtube.com/live2");
   const [streamKey, setStreamKey] = useState("");
   const [streamAction, setStreamAction] = useState(false);
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [now, setNow] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragDepthRef = useRef(0);
 
   const refresh = useCallback(async () => {
     try {
@@ -239,11 +252,63 @@ export default function Home() {
     }
   }
 
-  function handleFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0] ?? null;
+  function selectFile(file: File | null) {
+    if (file) {
+      const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+      if (!ALLOWED_VIDEO_EXTENSIONS.has(extension)) {
+        setSelectedFile(null);
+        setUploadProgress(0);
+        setNotice({ type: "error", text: "Оберіть відео у форматі MP4, MOV, MKV, WEBM або M4V." });
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        return;
+      }
+      if (file.size <= 0 || file.size > MAX_UPLOAD_BYTES) {
+        setSelectedFile(null);
+        setUploadProgress(0);
+        setNotice({ type: "error", text: "Файл має бути непорожнім і не перевищувати 50 ГБ." });
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        return;
+      }
+    }
+
     setSelectedFile(file);
     setUploadProgress(0);
     setNotice(null);
+  }
+
+  function handleFile(event: ChangeEvent<HTMLInputElement>) {
+    selectFile(event.target.files?.[0] ?? null);
+  }
+
+  function handleDragEnter(event: ReactDragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (uploading) return;
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  }
+
+  function handleDragOver(event: ReactDragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!uploading) event.dataTransfer.dropEffect = "copy";
+  }
+
+  function handleDragLeave(event: ReactDragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (uploading) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragActive(false);
+  }
+
+  function handleDrop(event: ReactDragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+    if (uploading) return;
+    selectFile(event.dataTransfer.files?.[0] ?? null);
   }
 
   async function uploadVideo() {
@@ -473,7 +538,14 @@ export default function Home() {
             <span className="panel-kicker">до 50 ГБ</span>
           </div>
 
-          <label className={`dropzone ${selectedFile ? "dropzone--selected" : ""}`}>
+          <label
+            className={`dropzone ${selectedFile ? "dropzone--selected" : ""} ${dragActive ? "dropzone--dragging" : ""}`}
+            onDragEnter={handleDragEnter}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            aria-disabled={uploading}
+          >
             <input
               ref={fileInputRef}
               type="file"
@@ -482,7 +554,12 @@ export default function Home() {
               disabled={uploading}
             />
             <span className="upload-glyph" aria-hidden="true">↑</span>
-            {selectedFile ? (
+            {dragActive ? (
+              <>
+                <strong>Відпустіть файл, щоб додати його</strong>
+                <span>Підтримуються MP4, MOV, MKV, WEBM і M4V</span>
+              </>
+            ) : selectedFile ? (
               <>
                 <strong>{selectedFile.name}</strong>
                 <span>{humanSize(selectedFile.size)}</span>

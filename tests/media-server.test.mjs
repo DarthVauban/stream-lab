@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createOwnerAuth, hashPassword } from "../media-server/auth.mjs";
-import { createMvpServer } from "../media-server/server.mjs";
+import { createMvpServer, normalizeServerError } from "../media-server/server.mjs";
 import { buildFfmpegArgs } from "../media-server/stream-controller.mjs";
 
 class FakeController {
@@ -185,4 +185,18 @@ test("builds a fixed 1080p30 CBR FFmpeg command without a shell", () => {
   assert.ok(args.includes("flv"));
   assert.equal(args.at(-1), "rtmps://example.test/live/key");
   assert.match(args[args.indexOf("-vf") + 1], /scale=1920:1080/);
+});
+
+test("returns actionable storage errors without exposing filesystem details", () => {
+  const permissionError = Object.assign(new Error("EACCES: /app/data/uploads/private.part"), {
+    code: "EACCES",
+  });
+  const normalizedPermissionError = normalizeServerError(permissionError);
+  assert.equal(normalizedPermissionError.status, 503);
+  assert.equal(normalizedPermissionError.code, "STORAGE_UNAVAILABLE");
+  assert.doesNotMatch(normalizedPermissionError.message, /\/app\/data/);
+
+  const fullDiskError = normalizeServerError(Object.assign(new Error("disk full"), { code: "ENOSPC" }));
+  assert.equal(fullDiskError.status, 507);
+  assert.equal(fullDiskError.code, "INSUFFICIENT_STORAGE");
 });

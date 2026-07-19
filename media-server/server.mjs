@@ -72,6 +72,21 @@ function setCommonHeaders(request, response, allowedOrigins) {
   response.setHeader("X-Frame-Options", "DENY");
 }
 
+export function normalizeServerError(error) {
+  if (error instanceof ApiError) return error;
+  if (["EACCES", "EPERM", "EROFS"].includes(error?.code)) {
+    return new ApiError(
+      503,
+      "STORAGE_UNAVAILABLE",
+      "Сховище відео тимчасово недоступне для запису.",
+    );
+  }
+  if (error?.code === "ENOSPC") {
+    return new ApiError(507, "INSUFFICIENT_STORAGE", "На сервері недостатньо місця для відео.");
+  }
+  return new ApiError(500, "INTERNAL_ERROR", "Внутрішня помилка медіасервера.");
+}
+
 export async function createMvpServer({
   dataDir = process.env.MEDIA_DATA_DIR || path.join(projectRoot, "data"),
   allowedOrigins = (process.env.MEDIA_ALLOWED_ORIGINS || "")
@@ -213,15 +228,14 @@ export async function createMvpServer({
 
       throw new ApiError(404, "NOT_FOUND", "Маршрут не знайдено.");
     } catch (error) {
-      const status = error instanceof ApiError ? error.status : 500;
-      const code = error instanceof ApiError ? error.code : "INTERNAL_ERROR";
-      const message =
-        error instanceof ApiError ? error.message : "Внутрішня помилка медіасервера.";
-      if (error instanceof ApiError && error.retryAfter) {
-        response.setHeader("Retry-After", String(error.retryAfter));
+      const normalizedError = normalizeServerError(error);
+      if (normalizedError.retryAfter) {
+        response.setHeader("Retry-After", String(normalizedError.retryAfter));
       }
       if (!(error instanceof ApiError)) console.error(error);
-      json(response, status, { error: { code, message } });
+      json(response, normalizedError.status, {
+        error: { code: normalizedError.code, message: normalizedError.message },
+      });
     }
   });
 
