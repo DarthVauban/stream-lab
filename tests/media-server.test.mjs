@@ -298,6 +298,18 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(videos.videos[0].preparedSize, 6);
   assert.ok((await readdir(path.join(dataDir, "uploads"))).every((name) => !name.includes(".source.")));
 
+  const renameResponse = await fetch(`${baseUrl}/api/videos/${created.upload.id}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: session.cookie,
+      "X-CSRF-Token": session.csrfToken,
+    },
+    body: JSON.stringify({ name: "Broadcast loop" }),
+  });
+  assert.equal(renameResponse.status, 200);
+  assert.equal((await renameResponse.json()).video.name, "Broadcast loop.mp4");
+
   const customThumbnailResponse = await fetch(`${baseUrl}/api/videos/${created.upload.id}/thumbnail`, {
     method: "PUT",
     headers: {
@@ -326,7 +338,7 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(addQueueResponse.status, 201);
   const queueBody = await addQueueResponse.json();
   assert.equal(queueBody.queue.items.length, 1);
-  assert.equal(queueBody.queue.items[0].video.name, "demo.mp4");
+  assert.equal(queueBody.queue.items[0].video.name, "Broadcast loop.mp4");
 
   const addAgainResponse = await fetch(`${baseUrl}/api/queue/items`, {
     method: "POST",
@@ -384,7 +396,7 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(startResponse.status, 202);
   const started = await startResponse.json();
   assert.equal(started.stream.status, "LIVE");
-  assert.equal(started.stream.videoName, "demo.mp4");
+  assert.equal(started.stream.videoName, "Broadcast loop.mp4");
   assert.equal(controller.lastBitrate, 7_500);
   assert.doesNotMatch(JSON.stringify(started), /abcd-efgh/);
 

@@ -471,6 +471,23 @@ function formatRate(bytes: number | null | undefined) {
   return `${humanSize(bytes)}/с`;
 }
 
+function normalizeVideoFileName(file: File, draft: string) {
+  const sourceExtension = file.name.includes(".") ? `.${file.name.split(".").pop()?.toLowerCase()}` : "";
+  const trimmed = draft.trim();
+  const fallbackBase = sourceExtension ? file.name.slice(0, -sourceExtension.length) : file.name;
+  const typedExtension = trimmed.includes(".") ? `.${trimmed.split(".").pop()?.toLowerCase()}` : "";
+  const base = typedExtension && ALLOWED_VIDEO_EXTENSIONS.has(typedExtension.slice(1))
+    ? trimmed.slice(0, -typedExtension.length)
+    : trimmed;
+  return `${base || fallbackBase}${sourceExtension}`;
+}
+
+function sampleChartHistory<T>(items: T[], limit = 180) {
+  if (items.length <= limit) return items;
+  const step = (items.length - 1) / (limit - 1);
+  return Array.from({ length: limit }, (_, index) => items[Math.round(index * step)]);
+}
+
 function formatDuration(startedAt: string | null, currentTime: number) {
   if (!startedAt) return "—";
   if (!currentTime) return "00:00:00";
@@ -516,17 +533,6 @@ function youtubeHealthLabel(status: string | undefined) {
     bad: "Потрібна увага",
     noData: "Очікуємо сигнал",
   }[status || "noData"] || "Стан невідомий";
-}
-
-function youtubeBroadcastStatus(status: string) {
-  return {
-    live: "в ефірі",
-    liveStarting: "запускається",
-    testing: "тестування",
-    testStarting: "запуск тесту",
-    ready: "готова",
-    created: "запланована",
-  }[status] || status;
 }
 
 function monitoringStatusLabel(status: MonitoringHealthState | undefined) {
@@ -630,7 +636,9 @@ export default function Home() {
   const [compressionProfileDraft, setCompressionProfileDraft] = useState<CompressionProfile["id"]>("STANDARD");
   const [settingsAction, setSettingsAction] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploadName, setUploadName] = useState("");
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadSpeedBytesPerSecond, setUploadSpeedBytesPerSecond] = useState(0);
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [processingAction, setProcessingAction] = useState("");
@@ -638,6 +646,9 @@ export default function Home() {
   const [draggedQueueItemId, setDraggedQueueItemId] = useState("");
   const [queueDropTarget, setQueueDropTarget] = useState<{ itemId: string; edge: "before" | "after" } | null>(null);
   const [deletingVideoId, setDeletingVideoId] = useState("");
+  const [renamingVideoId, setRenamingVideoId] = useState("");
+  const [videoNameDraft, setVideoNameDraft] = useState("");
+  const [videoRenameAction, setVideoRenameAction] = useState("");
   const [streamUrl, setStreamUrl] = useState("rtmps://a.rtmps.youtube.com/live2");
   const [streamKey, setStreamKey] = useState("");
   const [streamKeyVisible, setStreamKeyVisible] = useState(false);
@@ -677,7 +688,7 @@ export default function Home() {
   const [now, setNow] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
-  const promoDragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
+  const promoDragRef = useRef<{ offsetX: number; offsetY: number; pointerId: number } | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -900,6 +911,7 @@ export default function Home() {
 
   const active = ["LIVE", "STARTING", "DEGRADED", "RECONNECTING", "STOPPING"].includes(stream.status);
   const selectedPromo = promos?.assets.find((asset) => asset.id === selectedPromoId) || null;
+  const monitoringChartHistory = sampleChartHistory(monitoring?.history ?? []);
   const selectedPlaylist = playlists.find((playlist) => playlist.id === selectedPlaylistId) || null;
   const currentQueueIndex = stream.queueItemId
     ? queue.items.findIndex((item) => item.id === stream.queueItemId)
@@ -935,7 +947,7 @@ export default function Home() {
     stream: { eyebrow: "Трансляція", title: "Керування ефіром", description: "Профіль сигналу, RTMPS-підключення та запуск." },
     promos: { eyebrow: "Оформлення ефіру", title: "Промоматеріали", description: "Банери, позиціонування, ручний показ і кампанії за розкладом." },
     monitoring: { eyebrow: "Діагностика", title: "Моніторинг ефіру", description: "Якість сигналу, продуктивність і журнал подій." },
-    youtube: { eyebrow: "Аналітика", title: "YouTube", description: "Активна трансляція, показники каналу та сигнал ingest." },
+    youtube: { eyebrow: "Аналітика", title: "YouTube", description: "Показники каналу, аналітика та стан сигналу ingest." },
     profile: { eyebrow: "Обліковий запис", title: "Профіль та інтеграції", description: "Доступ власника, YouTube і Telegram-бот." },
   }[activeTab];
   const navigationItems: Array<{
@@ -1142,6 +1154,11 @@ export default function Home() {
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
       setThumbnailAction("");
+      setUploadName("");
+      setUploadSpeedBytesPerSecond(0);
+      setRenamingVideoId("");
+      setVideoNameDraft("");
+      setVideoRenameAction("");
       setRealtimeConnected(false);
     }
   }
@@ -1151,14 +1168,18 @@ export default function Home() {
       const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
       if (!ALLOWED_VIDEO_EXTENSIONS.has(extension)) {
         setSelectedFile(null);
+        setUploadName("");
         setUploadProgress(0);
+        setUploadSpeedBytesPerSecond(0);
         setNotice({ type: "error", text: "Оберіть відео у форматі MP4, MOV, MKV, WEBM або M4V." });
         if (fileInputRef.current) fileInputRef.current.value = "";
         return;
       }
       if (file.size <= 0 || file.size > MAX_UPLOAD_BYTES) {
         setSelectedFile(null);
+        setUploadName("");
         setUploadProgress(0);
+        setUploadSpeedBytesPerSecond(0);
         setNotice({ type: "error", text: "Файл має бути непорожнім і не перевищувати 50 ГБ." });
         if (fileInputRef.current) fileInputRef.current.value = "";
         return;
@@ -1166,7 +1187,11 @@ export default function Home() {
     }
 
     setSelectedFile(file);
+    const fingerprint = file ? `${file.name}:${file.size}:${file.lastModified}` : "";
+    const resumableUpload = activeUploads.find((upload) => upload.fingerprint === fingerprint);
+    setUploadName(file ? resumableUpload?.name || file.name : "");
     setUploadProgress(0);
+    setUploadSpeedBytesPerSecond(0);
     setNotice(null);
   }
 
@@ -1207,15 +1232,17 @@ export default function Home() {
 
   async function uploadVideo() {
     if (!selectedFile || uploading) return;
+    const resolvedName = normalizeVideoFileName(selectedFile, uploadName);
     setUploading(true);
     setNotice(null);
     setUploadProgress(0);
+    setUploadSpeedBytesPerSecond(0);
     try {
       const created = await api<{ upload: Video }>("/api/uploads", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: selectedFile.name,
+          name: resolvedName,
           size: selectedFile.size,
           mimeType: selectedFile.type,
           fingerprint: `${selectedFile.name}:${selectedFile.size}:${selectedFile.lastModified}`,
@@ -1224,6 +1251,8 @@ export default function Home() {
       }, csrfToken);
 
       let offset = created.upload.uploadedBytes;
+      const initialOffset = offset;
+      const uploadStartedAt = performance.now();
       setUploadProgress(Math.round((offset / selectedFile.size) * 100));
       while (offset < selectedFile.size) {
         const chunk = selectedFile.slice(offset, Math.min(offset + CHUNK_SIZE, selectedFile.size));
@@ -1233,6 +1262,8 @@ export default function Home() {
           csrfToken,
         );
         offset = result.upload.uploadedBytes;
+        const elapsedSeconds = Math.max(0.001, (performance.now() - uploadStartedAt) / 1_000);
+        setUploadSpeedBytesPerSecond((offset - initialOffset) / elapsedSeconds);
         setUploadProgress(Math.round((offset / selectedFile.size) * 100));
       }
 
@@ -1242,6 +1273,7 @@ export default function Home() {
         csrfToken,
       );
       setSelectedFile(null);
+      setUploadName("");
       if (fileInputRef.current) fileInputRef.current.value = "";
       setUploadProgress(100);
       setNotice({
@@ -1258,6 +1290,7 @@ export default function Home() {
       });
     } finally {
       setUploading(false);
+      setUploadSpeedBytesPerSecond(0);
     }
   }
 
@@ -1325,6 +1358,44 @@ export default function Home() {
       });
     } finally {
       setThumbnailAction("");
+    }
+  }
+
+  function beginVideoRename(video: Video) {
+    if (videoRenameAction) return;
+    setRenamingVideoId(video.id);
+    setVideoNameDraft(video.name);
+  }
+
+  function cancelVideoRename() {
+    if (videoRenameAction) return;
+    setRenamingVideoId("");
+    setVideoNameDraft("");
+  }
+
+  async function renameVideo(video: Video) {
+    const name = videoNameDraft.trim();
+    if (!name || videoRenameAction) return;
+    setVideoRenameAction(video.id);
+    setNotice(null);
+    try {
+      const result = await api<{ video: Video }>(`/api/videos/${video.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      }, csrfToken);
+      setVideos((current) => current.map((item) => item.id === video.id ? result.video : item));
+      setRenamingVideoId("");
+      setVideoNameDraft("");
+      setNotice({ type: "success", text: "Назву відео змінено." });
+      await refresh();
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося змінити назву відео.",
+      });
+    } finally {
+      setVideoRenameAction("");
     }
   }
 
@@ -1845,20 +1916,58 @@ export default function Home() {
 
   function applyPromoZone(zone: string) {
     if (!promoPlacementDraft) return;
-    const { width, height } = promoPlacementDraft;
+    const sourceRatio = selectedPromo && selectedPromo.height > 0 ? selectedPromo.width / selectedPromo.height : 16 / 9;
+    const fullscreenScale = Math.min(1_920 / sourceRatio, 1_080);
+    const width = zone === "fullscreen" ? Math.round(fullscreenScale * sourceRatio) : promoPlacementDraft.width;
+    const height = zone === "fullscreen" ? Math.round(fullscreenScale) : promoPlacementDraft.height;
     const horizontal = zone.endsWith("left") ? 54 : zone.endsWith("right") ? 1_920 - width - 54 : (1_920 - width) / 2;
     const vertical = zone.startsWith("top") ? 54 : zone.startsWith("bottom") ? 1_080 - height - 54 : (1_080 - height) / 2;
     setPromoPlacementDraft({
       ...promoPlacementDraft,
       zone,
-      x: Math.max(0, Math.round(zone === "fullscreen" ? 0 : horizontal)),
-      y: Math.max(0, Math.round(zone === "fullscreen" ? 0 : vertical)),
-      ...(zone === "fullscreen" ? { width: 1_920, height: 1_080 } : {}),
+      x: Math.max(0, Math.round(horizontal)),
+      y: Math.max(0, Math.round(vertical)),
+      width,
+      height,
+    });
+  }
+
+  function updatePromoDimension(dimension: "width" | "height", rawValue: number) {
+    if (!promoPlacementDraft || !selectedPromo) return;
+    const ratio = selectedPromo.height > 0 ? selectedPromo.width / selectedPromo.height : 16 / 9;
+    let width = dimension === "width" ? Math.min(1_920, Math.max(32, rawValue)) : rawValue * ratio;
+    let height = dimension === "height" ? Math.min(1_080, Math.max(32, rawValue)) : rawValue / ratio;
+    if (width > 1_920) {
+      width = 1_920;
+      height = width / ratio;
+    }
+    if (height > 1_080) {
+      height = 1_080;
+      width = height * ratio;
+    }
+    if (width < 32) {
+      width = 32;
+      height = width / ratio;
+    }
+    if (height < 32) {
+      height = 32;
+      width = height * ratio;
+    }
+    width = Math.min(1_920, Math.round(width));
+    height = Math.min(1_080, Math.round(height));
+    setPromoPlacementDraft({
+      ...promoPlacementDraft,
+      zone: "custom",
+      width,
+      height,
+      x: Math.min(promoPlacementDraft.x, 1_920 - width),
+      y: Math.min(promoPlacementDraft.y, 1_080 - height),
     });
   }
 
   function handlePromoPointerDown(event: ReactPointerEvent<HTMLImageElement>) {
     if (!promoPlacementDraft) return;
+    event.preventDefault();
     const canvas = event.currentTarget.parentElement?.getBoundingClientRect();
     if (!canvas) return;
     const pointerX = ((event.clientX - canvas.left) / canvas.width) * 1_920;
@@ -1866,22 +1975,28 @@ export default function Home() {
     promoDragRef.current = {
       offsetX: pointerX - promoPlacementDraft.x,
       offsetY: pointerY - promoPlacementDraft.y,
+      pointerId: event.pointerId,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
   function handlePromoPointerMove(event: ReactPointerEvent<HTMLImageElement>) {
-    if (!promoDragRef.current || !promoPlacementDraft) return;
+    if (!promoDragRef.current || promoDragRef.current.pointerId !== event.pointerId) return;
+    if ((event.buttons & 1) === 0) {
+      promoDragRef.current = null;
+      return;
+    }
+    event.preventDefault();
     const canvas = event.currentTarget.parentElement?.getBoundingClientRect();
     if (!canvas) return;
     const x = ((event.clientX - canvas.left) / canvas.width) * 1_920 - promoDragRef.current.offsetX;
     const y = ((event.clientY - canvas.top) / canvas.height) * 1_080 - promoDragRef.current.offsetY;
-    setPromoPlacementDraft({
-      ...promoPlacementDraft,
+    setPromoPlacementDraft((current) => current ? {
+      ...current,
       zone: "custom",
-      x: Math.round(Math.min(1_920 - promoPlacementDraft.width, Math.max(0, x))),
-      y: Math.round(Math.min(1_080 - promoPlacementDraft.height, Math.max(0, y))),
-    });
+      x: Math.round(Math.min(1_920 - current.width, Math.max(0, x))),
+      y: Math.round(Math.min(1_080 - current.height, Math.max(0, y))),
+    } : current);
   }
 
   function handlePromoPointerUp(event: ReactPointerEvent<HTMLImageElement>) {
@@ -2032,32 +2147,6 @@ export default function Home() {
       setNotice({
         type: "error",
         text: error instanceof Error ? error.message : "Не вдалося оновити YouTube.",
-      });
-    } finally {
-      setYoutubeAction("");
-    }
-  }
-
-  async function selectYouTubeBroadcast(broadcastId: string) {
-    if (youtubeAction || !broadcastId) return;
-    setYoutubeAction("select");
-    setNotice(null);
-    try {
-      const result = await api<{ youtube: YouTubeStatus }>(
-        "/api/youtube/broadcast/select",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ broadcastId }),
-        },
-        csrfToken,
-      );
-      setYoutube(result.youtube);
-      setNotice({ type: "success", text: "Трансляцію вибрано. Сигнал і статистика оновляться автоматично." });
-    } catch (error) {
-      setNotice({
-        type: "error",
-        text: error instanceof Error ? error.message : "Не вдалося вибрати трансляцію.",
       });
     } finally {
       setYoutubeAction("");
@@ -2223,6 +2312,18 @@ export default function Home() {
             <p>{pageMeta.description}</p>
           </div>
           <div className="page-status">
+            {active && (
+              <div className="header-stream-controls" aria-label="Керування активним ефіром">
+                <button type="button" onClick={skipStreamVideo} disabled={streamAction || stream.status === "STOPPING"}>
+                  <span aria-hidden="true">▶|</span>
+                  Наступне відео
+                </button>
+                <button className="header-stream-stop" type="button" onClick={stopStream} disabled={streamAction || stream.status === "STOPPING"}>
+                  <span className="button-stop" aria-hidden="true" />
+                  Зупинити стрім
+                </button>
+              </div>
+            )}
             <div className={`live-indicator live-indicator--${stream.status.toLowerCase()}`}>
               <span className="status-dot" aria-hidden="true" />
               {statusLabel(stream.status)}
@@ -2333,10 +2434,27 @@ export default function Home() {
             )}
           </label>
 
+          {selectedFile && (
+            <label className="field upload-name-field">
+              <span>Назва відео після завантаження</span>
+              <input
+                value={uploadName}
+                onChange={(event) => setUploadName(event.target.value)}
+                maxLength={255}
+                disabled={uploading}
+                placeholder={selectedFile.name}
+              />
+              <small>Формат файлу буде збережено: {normalizeVideoFileName(selectedFile, uploadName)}</small>
+            </label>
+          )}
+
           {(uploading || uploadProgress > 0) && (
             <div className="progress-block">
               <div className="progress-copy">
-                <span>{uploading ? "Завантаження" : "Готово"}</span>
+                <span>
+                  {uploading ? "Завантаження" : "Готово"}
+                  {uploading && uploadSpeedBytesPerSecond > 0 && <b> · {formatRate(uploadSpeedBytesPerSecond)}</b>}
+                </span>
                 <strong>{uploadProgress}%</strong>
               </div>
               <div className="progress-track" role="progressbar" aria-valuenow={uploadProgress} aria-valuemin={0} aria-valuemax={100}>
@@ -2391,36 +2509,77 @@ export default function Home() {
                         ) : video.status === "FAILED" ? "!" : ready ? "▶" : "…"}
                       </span>
                       <span className="video-copy">
-                        <strong>{video.name}</strong>
+                        {renamingVideoId === video.id ? (
+                          <input
+                            className="video-name-input"
+                            value={videoNameDraft}
+                            onChange={(event) => setVideoNameDraft(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") void renameVideo(video);
+                              if (event.key === "Escape") cancelVideoRename();
+                            }}
+                            maxLength={255}
+                            autoFocus
+                            aria-label="Нова назва відео"
+                          />
+                        ) : (
+                          <strong>{video.name}</strong>
+                        )}
                         <span>{videoMeta(video)} · {videoStatusLabel(video)}</span>
                       </span>
                       <div className="video-library-actions">
-                        {ready ? (
-                          <button
-                            className="video-add-queue"
-                            type="button"
-                            onClick={() => addVideoToQueue(video.id)}
-                            disabled={Boolean(queueAction) || Boolean(deletingVideoId)}
-                          >
-                            {queueAction === `add:${video.id}` ? "Додаємо…" : "+ До черги"}
-                          </button>
+                        {renamingVideoId === video.id ? (
+                          <>
+                            <button
+                              className="video-rename video-rename--save"
+                              type="button"
+                              onClick={() => renameVideo(video)}
+                              disabled={!videoNameDraft.trim() || Boolean(videoRenameAction)}
+                            >
+                              {videoRenameAction === video.id ? "Зберігаємо…" : "Зберегти"}
+                            </button>
+                            <button className="video-rename" type="button" onClick={cancelVideoRename} disabled={Boolean(videoRenameAction)}>
+                              Скасувати
+                            </button>
+                          </>
                         ) : (
-                        <span className={`video-status video-status--${video.status.toLowerCase()}`}>
-                          {video.status === "FAILED" ? "FAILED" : "PROCESSING"}
-                        </span>
+                          <>
+                            <button
+                              className="video-rename"
+                              type="button"
+                              onClick={() => beginVideoRename(video)}
+                              disabled={Boolean(videoRenameAction) || Boolean(deletingVideoId)}
+                            >
+                              Перейменувати
+                            </button>
+                            {ready ? (
+                              <button
+                                className="video-add-queue"
+                                type="button"
+                                onClick={() => addVideoToQueue(video.id)}
+                                disabled={Boolean(queueAction) || Boolean(deletingVideoId)}
+                              >
+                                {queueAction === `add:${video.id}` ? "Додаємо…" : "+ До черги"}
+                              </button>
+                            ) : (
+                              <span className={`video-status video-status--${video.status.toLowerCase()}`}>
+                                {video.status === "FAILED" ? "FAILED" : "PROCESSING"}
+                              </span>
+                            )}
+                            <button
+                              className="video-delete"
+                              type="button"
+                              onClick={() => deleteVideo(video)}
+                              disabled={
+                                processing ||
+                                Boolean(deletingVideoId) ||
+                                (active && stream.videoId === video.id)
+                              }
+                            >
+                              {deletingVideoId === video.id ? "Видаляємо…" : "Видалити"}
+                            </button>
+                          </>
                         )}
-                        <button
-                          className="video-delete"
-                          type="button"
-                          onClick={() => deleteVideo(video)}
-                          disabled={
-                            processing ||
-                            Boolean(deletingVideoId) ||
-                            (active && stream.videoId === video.id)
-                          }
-                        >
-                          {deletingVideoId === video.id ? "Видаляємо…" : "Видалити"}
-                        </button>
                       </div>
                     </div>
                     {processing && (
@@ -2817,6 +2976,7 @@ export default function Home() {
                       <img
                         src={selectedPromo.fileUrl}
                         alt={`Розміщення ${selectedPromo.name}`}
+                        draggable={false}
                         style={{
                           left: `${(promoPlacementDraft.x / 1_920) * 100}%`,
                           top: `${(promoPlacementDraft.y / 1_080) * 100}%`,
@@ -2829,6 +2989,8 @@ export default function Home() {
                         onPointerMove={handlePromoPointerMove}
                         onPointerUp={handlePromoPointerUp}
                         onPointerCancel={handlePromoPointerUp}
+                        onLostPointerCapture={() => { promoDragRef.current = null; }}
+                        onDragStart={(event) => event.preventDefault()}
                       />
                     </div>
 
@@ -2843,8 +3005,8 @@ export default function Home() {
                     <div className="promo-controls-grid">
                       <label><span>X</span><input type="number" min={0} max={1_920 - promoPlacementDraft.width} value={promoPlacementDraft.x} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, x: Number(event.target.value), zone: "custom" })} /></label>
                       <label><span>Y</span><input type="number" min={0} max={1_080 - promoPlacementDraft.height} value={promoPlacementDraft.y} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, y: Number(event.target.value), zone: "custom" })} /></label>
-                      <label><span>Ширина</span><input type="number" min={32} max={1_920} value={promoPlacementDraft.width} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, width: Number(event.target.value), zone: "custom" })} /></label>
-                      <label><span>Висота</span><input type="number" min={32} max={1_080} value={promoPlacementDraft.height} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, height: Number(event.target.value), zone: "custom" })} /></label>
+                      <label><span>Ширина</span><input type="number" min={32} max={1_920} value={promoPlacementDraft.width} onChange={(event) => updatePromoDimension("width", Number(event.target.value))} /></label>
+                      <label><span>Висота</span><input type="number" min={32} max={1_080} value={promoPlacementDraft.height} onChange={(event) => updatePromoDimension("height", Number(event.target.value))} /></label>
                       <label className="promo-opacity-control"><span>Прозорість · {Math.round(promoPlacementDraft.opacity * 100)}%</span><input type="range" min={0.05} max={1} step={0.05} value={promoPlacementDraft.opacity} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, opacity: Number(event.target.value) })} /></label>
                     </div>
 
@@ -3078,7 +3240,7 @@ export default function Home() {
                   </div>
                   {monitoring.history.some((item) => item.bitrateKbps !== null) ? (
                     <div className="monitoring-chart" aria-label="Історія вихідного бітрейту">
-                      {monitoring.history.map((item) => (
+                      {monitoringChartHistory.map((item) => (
                         <span
                           key={`bitrate-${item.capturedAt}`}
                           title={`${formatEventTime(item.capturedAt)} · ${formatMetric(item.bitrateKbps, " Кбіт/с")}`}
@@ -3102,7 +3264,7 @@ export default function Home() {
                   </div>
                   {monitoring.history.some((item) => item.speed !== null) ? (
                     <div className="monitoring-chart" aria-label="Історія швидкості кодування">
-                      {monitoring.history.map((item) => (
+                      {monitoringChartHistory.map((item) => (
                         <span
                           key={`speed-${item.capturedAt}`}
                           title={`${formatEventTime(item.capturedAt)} · ${formatMetric(item.speed, "×", 2)}`}
@@ -3225,6 +3387,14 @@ export default function Home() {
                   </div>
                 </div>
                 <div className="youtube-toolbar-actions">
+                  <button
+                    className="youtube-preset-button"
+                    type="button"
+                    onClick={createYouTubePreset}
+                    disabled={Boolean(youtubeAction) || active || !youtube.stream?.ingestionReady}
+                  >
+                    {youtubeAction === "preset" ? "Створюємо…" : "Створити RTMPS-пресет"}
+                  </button>
                   <button type="button" onClick={refreshYouTube} disabled={Boolean(youtubeAction)}>
                     {youtubeAction === "refresh" ? "Синхронізуємо…" : "Оновити зараз"}
                   </button>
@@ -3236,32 +3406,6 @@ export default function Home() {
                 статус ефіру — {youtube.polling.broadcastSeconds} с, підписники — {youtube.polling.subscribersMinutes} хв,
                 Analytics — {youtube.polling.analyticsMinutes} хв. Орієнтовно {youtube.polling.estimatedDailyUnits.toLocaleString("uk-UA")} одиниць квоти на добу.
                 {youtube.lastUpdatedAt && <span> Остання синхронізація: {new Date(youtube.lastUpdatedAt).toLocaleString("uk-UA")}.</span>}
-              </div>
-
-              <div className="youtube-broadcast-row">
-                <label className="field">
-                  <span>Активна трансляція</span>
-                  <select
-                    value={youtube.selected?.id || ""}
-                    onChange={(event) => void selectYouTubeBroadcast(event.target.value)}
-                    disabled={Boolean(youtubeAction) || youtube.broadcasts.length === 0}
-                  >
-                    {youtube.broadcasts.length === 0 && <option value="">Немає активних або запланованих ефірів</option>}
-                    {youtube.broadcasts.map((broadcast) => (
-                      <option key={broadcast.id} value={broadcast.id}>
-                        {broadcast.title} · {youtubeBroadcastStatus(broadcast.lifeCycleStatus)}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <button
-                  className="button button--quiet youtube-preset-button"
-                  type="button"
-                  onClick={createYouTubePreset}
-                  disabled={Boolean(youtubeAction) || active || !youtube.stream?.ingestionReady}
-                >
-                  {youtubeAction === "preset" ? "Створюємо…" : "Створити RTMPS-пресет"}
-                </button>
               </div>
 
               <div className="youtube-metrics" aria-label="Поточні показники YouTube">

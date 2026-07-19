@@ -775,9 +775,15 @@ export async function createMvpServer({
         return;
       }
 
-      const deleteVideoMatch = url.pathname.match(/^\/api\/videos\/([^/]+)$/);
-      if (request.method === "DELETE" && deleteVideoMatch) {
-        const videoId = deleteVideoMatch[1];
+      const videoMatch = url.pathname.match(/^\/api\/videos\/([^/]+)$/);
+      if (request.method === "PATCH" && videoMatch) {
+        const body = await readJson(request);
+        const video = await videoStore.renameVideo(videoMatch[1], body.name);
+        json(response, 200, { video });
+        return;
+      }
+      if (request.method === "DELETE" && videoMatch) {
+        const videoId = videoMatch[1];
         if (deletingVideoIds.has(videoId)) {
           throw new ApiError(409, "VIDEO_DELETE_IN_PROGRESS", "Відео вже видаляється.");
         }

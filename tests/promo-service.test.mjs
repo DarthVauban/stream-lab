@@ -46,6 +46,9 @@ test("stores promo assets, applies a live overlay and schedules a campaign", asy
   assert.deepEqual(asset.tags, ["qr", "social"]);
 
   await service.updateAsset(asset.id, { placement: { x: 100, y: 200, width: 400, height: 200, opacity: 0.8 } });
+  const resized = await service.updateAsset(asset.id, { placement: { width: 300, height: 1_000 } });
+  assert.equal(resized.placement.width, 300);
+  assert.equal(resized.placement.height, 150);
   await service.show(asset.id, { durationSeconds: 8 });
   assert.equal(overlays.at(-1)[0].placement.x, 100);
   assert.equal(service.snapshot().active.assetId, asset.id);

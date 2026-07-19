@@ -17,9 +17,43 @@ function numberInRange(value, fallback, minimum, maximum) {
   return Number.isFinite(number) ? Math.min(maximum, Math.max(minimum, number)) : fallback;
 }
 
-export function normalizePromoPlacement(value = {}) {
-  const width = Math.round(numberInRange(value.width, 384, 32, 1_920));
-  const height = Math.round(numberInRange(value.height, 216, 32, 1_080));
+export function normalizePromoPlacement(value = {}, aspectRatio = null) {
+  const ratio = Number(aspectRatio);
+  let width;
+  let height;
+  if (Number.isFinite(ratio) && ratio > 0) {
+    if (Number.isFinite(Number(value.width))) {
+      width = numberInRange(value.width, 384, 32, 1_920);
+      height = width / ratio;
+    } else if (Number.isFinite(Number(value.height))) {
+      height = numberInRange(value.height, 216, 32, 1_080);
+      width = height * ratio;
+    } else {
+      height = Math.min(216, 384 / ratio);
+      width = height * ratio;
+    }
+    if (width > 1_920) {
+      width = 1_920;
+      height = width / ratio;
+    }
+    if (height > 1_080) {
+      height = 1_080;
+      width = height * ratio;
+    }
+    if (width < 32) {
+      width = 32;
+      height = width / ratio;
+    }
+    if (height < 32) {
+      height = 32;
+      width = height * ratio;
+    }
+  } else {
+    width = numberInRange(value.width, 384, 32, 1_920);
+    height = numberInRange(value.height, 216, 32, 1_080);
+  }
+  width = Math.round(Math.min(1_920, width));
+  height = Math.round(Math.min(1_080, height));
   return {
     x: Math.round(numberInRange(value.x, 1_476, 0, Math.max(0, 1_920 - width))),
     y: Math.round(numberInRange(value.y, 54, 0, Math.max(0, 1_080 - height))),
@@ -39,6 +73,8 @@ function cleanTags(value) {
 
 function normalizeAsset(value) {
   if (typeof value?.id !== "string" || typeof value.fileName !== "string") return null;
+  const width = Math.max(1, Number(value.width) || 1);
+  const height = Math.max(1, Number(value.height) || 1);
   return {
     id: value.id,
     name: String(value.name || "Промоматеріал").trim().slice(0, 120),
@@ -46,10 +82,10 @@ function normalizeAsset(value) {
     sourceMimeType: typeof value.sourceMimeType === "string" ? value.sourceMimeType : "image/png",
     mimeType: "image/webp",
     size: Math.max(0, Number(value.size) || 0),
-    width: Math.max(1, Number(value.width) || 1),
-    height: Math.max(1, Number(value.height) || 1),
+    width,
+    height,
     tags: cleanTags(value.tags),
-    placement: normalizePromoPlacement(value.placement),
+    placement: normalizePromoPlacement(value.placement, width / height),
     createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date(0).toISOString(),
     updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : null,
     impressions: Math.max(0, Number(value.impressions) || 0),
@@ -194,7 +230,9 @@ export class PromoStore {
       const asset = this.requireAsset(id);
       if (typeof changes.name === "string" && changes.name.trim()) asset.name = changes.name.trim().slice(0, 120);
       if (changes.tags !== undefined) asset.tags = cleanTags(changes.tags);
-      if (changes.placement) asset.placement = normalizePromoPlacement({ ...asset.placement, ...changes.placement });
+      if (changes.placement) {
+        asset.placement = normalizePromoPlacement({ ...asset.placement, ...changes.placement }, asset.width / asset.height);
+      }
       asset.updatedAt = new Date().toISOString();
       return publicAsset(asset);
     });

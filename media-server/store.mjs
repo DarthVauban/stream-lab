@@ -68,6 +68,19 @@ function validateUpload(input, maxUploadBytes) {
   return { name, size, mimeType, extension, fingerprint };
 }
 
+function normalizeVideoName(value, extension) {
+  let name = typeof value === "string" ? value.trim() : "";
+  if (!name || name.length > 255 || /[\\/\u0000-\u001f]/.test(name)) {
+    throw new ApiError(400, "INVALID_FILE_NAME", "Некоректна назва файлу.");
+  }
+  const requestedExtension = path.extname(name).toLowerCase();
+  if (!requestedExtension) name += extension;
+  else if (requestedExtension !== extension) {
+    throw new ApiError(400, "INVALID_FILE_EXTENSION", `Формат відео має залишатися ${extension}.`);
+  }
+  return name;
+}
+
 export class VideoStore {
   constructor({ rootDir, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, repository = null }) {
     this.rootDir = rootDir;
@@ -537,6 +550,13 @@ export class VideoStore {
   getVideo(id) {
     const record = this.find(id);
     return record ? publicRecord(record) : null;
+  }
+
+  async renameVideo(id, name) {
+    const record = this.requireUpload(id);
+    record.name = normalizeVideoName(name, record.extension);
+    await this.persist();
+    return publicRecord(record);
   }
 
   getThumbnailPath(id) {
