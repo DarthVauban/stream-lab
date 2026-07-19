@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, open, readFile, rename, stat, truncate, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, stat, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -15,10 +15,16 @@ function publicRecord(record) {
     name: record.name,
     mimeType: record.mimeType,
     size: record.size,
+    preparedSize: record.preparedSize ?? null,
     uploadedBytes: record.uploadedBytes,
     status: record.status,
     createdAt: record.createdAt,
     completedAt: record.completedAt ?? null,
+    processingProgress: record.processingProgress ?? (record.status === "READY" ? 100 : 0),
+    processingError: record.processingError ?? null,
+    processingStartedAt: record.processingStartedAt ?? null,
+    processedAt: record.processedAt ?? null,
+    media: record.mediaInfo ?? record.sourceMediaInfo ?? null,
   };
 }
 
@@ -67,7 +73,7 @@ export class VideoStore {
   async persist() {
     const snapshot = JSON.stringify(this.records, null, 2);
     const tempPath = `${this.catalogPath}.tmp`;
-    this.persistQueue = this.persistQueue.then(async () => {
+    this.persistQueue = this.persistQueue.catch(() => {}).then(async () => {
       await writeFile(tempPath, snapshot, "utf8");
       await rename(tempPath, this.catalogPath);
     });
@@ -98,7 +104,11 @@ export class VideoStore {
       uploadedBytes: 0,
       status: "UPLOADING",
       extension: validated.extension,
-      storedName: `${id}${validated.extension}`,
+      storedName: null,
+      sourceStoredName: `${id}.source${validated.extension}`,
+      streamStoredName: `${id}.stream.mp4`,
+      processingProgress: 0,
+      processingError: null,
       createdAt: now,
     };
 
@@ -170,7 +180,7 @@ export class VideoStore {
 
   async completeUpload(id) {
     const record = this.requireUpload(id);
-    if (record.status === "READY") return publicRecord(record);
+    if (record.status !== "UPLOADING") return publicRecord(record);
     if (record.uploadedBytes !== record.size) {
       throw new ApiError(
         409,
@@ -179,18 +189,121 @@ export class VideoStore {
       );
     }
 
-    await rename(this.partialPath(record), this.videoPath(record));
-    record.status = "READY";
+    await rename(this.partialPath(record), this.sourcePath(record));
+    record.status = "ANALYZING";
     record.completedAt = new Date().toISOString();
+    record.processingProgress = 0;
+    record.processingError = null;
     await this.persist();
     return publicRecord(record);
   }
 
   listVideos() {
     return this.records
-      .filter((record) => record.status === "READY")
+      .filter((record) => record.status !== "UPLOADING")
       .map(publicRecord)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  listPendingProcessingIds() {
+    return this.records
+      .filter((record) => ["ANALYZING", "PROCESSING"].includes(record.status))
+      .map((record) => record.id);
+  }
+
+  async beginAnalysis(id) {
+    const record = this.requireUpload(id);
+    if (!["ANALYZING", "PROCESSING"].includes(record.status)) {
+      throw new ApiError(409, "VIDEO_NOT_PROCESSABLE", "Відео не очікує обробки.");
+    }
+    record.status = "ANALYZING";
+    record.processingProgress = 0;
+    record.processingError = null;
+    record.processingStartedAt = new Date().toISOString();
+    await rm(this.tempOutputPath(record), { force: true }).catch(() => {});
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  async beginTranscode(id, sourceMediaInfo) {
+    const record = this.requireUpload(id);
+    if (record.status !== "ANALYZING") {
+      throw new ApiError(409, "VIDEO_NOT_ANALYZING", "Аналіз відео ще не завершено.");
+    }
+    record.status = "PROCESSING";
+    record.sourceMediaInfo = sourceMediaInfo;
+    record.processingProgress = 0;
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  async updateProcessingProgress(id, progress) {
+    const record = this.find(id);
+    if (!record || record.status !== "PROCESSING") return;
+    const normalized = Math.min(99, Math.max(0, Math.floor(Number(progress) || 0)));
+    if (normalized <= (record.processingProgress ?? 0)) return;
+    record.processingProgress = normalized;
+    await this.persist();
+  }
+
+  async completeProcessing(id, mediaInfo, { keepOriginal = false } = {}) {
+    const record = this.requireUpload(id);
+    if (record.status !== "PROCESSING") {
+      throw new ApiError(409, "VIDEO_NOT_PROCESSING", "Відео зараз не обробляється.");
+    }
+    await rm(this.outputPath(record), { force: true }).catch(() => {});
+    await rename(this.tempOutputPath(record), this.outputPath(record));
+    record.preparedSize = (await stat(this.outputPath(record))).size;
+    record.storedName = record.streamStoredName;
+    record.mediaInfo = mediaInfo;
+    record.status = "READY";
+    record.processingProgress = 100;
+    record.processingError = null;
+    record.processedAt = new Date().toISOString();
+    await this.persist();
+    if (!keepOriginal) {
+      try {
+        await rm(this.sourcePath(record), { force: true });
+        record.sourceStoredName = null;
+        await this.persist();
+      } catch {
+        // The verified stream copy remains READY even if source cleanup must be retried later.
+      }
+    }
+    return publicRecord(record);
+  }
+
+  async failProcessing(id, message) {
+    const record = this.requireUpload(id);
+    await rm(this.tempOutputPath(record), { force: true }).catch(() => {});
+    record.status = "FAILED";
+    record.processingError = String(message || "Не вдалося обробити відео.").slice(0, 500);
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  async retryProcessing(id) {
+    const record = this.requireUpload(id);
+    if (record.status !== "FAILED" || !record.sourceStoredName) {
+      throw new ApiError(409, "VIDEO_NOT_RETRYABLE", "Це відео неможливо обробити повторно.");
+    }
+    record.status = "ANALYZING";
+    record.processingProgress = 0;
+    record.processingError = null;
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  getProcessingPaths(id) {
+    const record = this.requireUpload(id);
+    if (!record.sourceStoredName) {
+      throw new ApiError(409, "VIDEO_SOURCE_MISSING", "Оригінальний файл відео не знайдено.");
+    }
+    return {
+      sourcePath: this.sourcePath(record),
+      tempOutputPath: this.tempOutputPath(record),
+      outputPath: this.outputPath(record),
+    };
   }
 
   getReadyVideo(id) {
@@ -207,5 +320,17 @@ export class VideoStore {
 
   videoPath(record) {
     return path.join(this.uploadsDir, record.storedName);
+  }
+
+  sourcePath(record) {
+    return path.join(this.uploadsDir, record.sourceStoredName);
+  }
+
+  tempOutputPath(record) {
+    return path.join(this.uploadsDir, `${record.id}.processing.tmp.mp4`);
+  }
+
+  outputPath(record) {
+    return path.join(this.uploadsDir, record.streamStoredName || `${record.id}.stream.mp4`);
   }
 }

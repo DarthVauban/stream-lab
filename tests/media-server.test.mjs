@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createOwnerAuth, hashPassword } from "../media-server/auth.mjs";
+import { MediaProcessor } from "../media-server/media-processor.mjs";
 import { createMvpServer, normalizeServerError } from "../media-server/server.mjs";
+import { VideoStore } from "../media-server/store.mjs";
 import { buildFfmpegArgs } from "../media-server/stream-controller.mjs";
 
 class FakeController {
@@ -73,7 +75,41 @@ async function login(baseUrl) {
 test("uploads a video in chunks and starts the selected stream", async (t) => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "streamlab-test-"));
   const controller = new FakeController();
-  const app = await createMvpServer({ dataDir, controller, auth: testAuth() });
+  const store = new VideoStore({ rootDir: dataDir });
+  const sourceMedia = {
+    durationSeconds: 10,
+    width: 1280,
+    height: 720,
+    fps: 25,
+    videoCodec: "h264",
+    audioCodec: "aac",
+    audioSampleRate: 44_100,
+    bitrate: 2_000_000,
+    format: "mov,mp4",
+  };
+  const streamMedia = {
+    ...sourceMedia,
+    width: 1920,
+    height: 1080,
+    fps: 30,
+    bitrate: 8_000_000,
+  };
+  const processor = new MediaProcessor({
+    store,
+    probeImpl: async (filePath) => filePath.endsWith(".processing.tmp.mp4") ? streamMedia : sourceMedia,
+    transcodeImpl: async ({ inputPath, outputPath, onProgress }) => {
+      onProgress(50);
+      await copyFile(inputPath, outputPath);
+      onProgress(100);
+    },
+  });
+  const app = await createMvpServer({
+    dataDir,
+    store,
+    processor,
+    controller,
+    auth: testAuth(),
+  });
   const address = await app.listen(0, "127.0.0.1");
   const baseUrl = `http://127.0.0.1:${address.port}`;
 
@@ -125,7 +161,10 @@ test("uploads a video in chunks and starts the selected stream", async (t) => {
       headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
     },
   );
-  assert.equal(completeResponse.status, 200);
+  assert.equal(completeResponse.status, 202);
+  const processingVideo = await completeResponse.json();
+  assert.equal(processingVideo.video.status, "ANALYZING");
+  await processor.waitForIdle();
 
   const videosResponse = await fetch(`${baseUrl}/api/videos`, {
     headers: { Cookie: session.cookie },
@@ -133,6 +172,11 @@ test("uploads a video in chunks and starts the selected stream", async (t) => {
   const videos = await videosResponse.json();
   assert.equal(videos.videos.length, 1);
   assert.equal(videos.videos[0].name, "demo.mp4");
+  assert.equal(videos.videos[0].status, "READY");
+  assert.equal(videos.videos[0].processingProgress, 100);
+  assert.equal(videos.videos[0].media.width, 1920);
+  assert.equal(videos.videos[0].preparedSize, 6);
+  assert.ok((await readdir(path.join(dataDir, "uploads"))).every((name) => !name.includes(".source.")));
 
   const startResponse = await fetch(`${baseUrl}/api/stream/start`, {
     method: "POST",

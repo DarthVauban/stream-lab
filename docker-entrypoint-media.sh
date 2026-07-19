@@ -16,7 +16,8 @@ if [ "$(id -u)" = "0" ]; then
     "$data_dir/videos.json.tmp" \
     "$data_dir/stream-state.enc.json" \
     "$data_dir/stream-state.enc.json.tmp" \
-    "$data_dir/uploads"/*.part
+    "$data_dir/uploads"/*.part \
+    "$data_dir/uploads"/*.processing.tmp.mp4
   do
     if [ -e "$item" ]; then
       chown node:node "$item"

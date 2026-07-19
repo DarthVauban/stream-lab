@@ -20,10 +20,23 @@ type Video = {
   name: string;
   mimeType: string;
   size: number;
+  preparedSize: number | null;
   uploadedBytes: number;
-  status: "READY" | "UPLOADING";
+  status: "UPLOADING" | "ANALYZING" | "PROCESSING" | "READY" | "FAILED";
   createdAt: string;
   completedAt: string | null;
+  processingProgress: number;
+  processingError: string | null;
+  processingStartedAt: string | null;
+  processedAt: string | null;
+  media: {
+    durationSeconds: number;
+    width: number | null;
+    height: number | null;
+    fps: number | null;
+    videoCodec: string | null;
+    audioCodec: string | null;
+  } | null;
 };
 
 type StreamStatus = {
@@ -44,6 +57,7 @@ type StreamStatus = {
 type Health = {
   ok: boolean;
   ffmpeg: { available: boolean; version: string | null; message: string | null };
+  processing: { activeVideoId: string | null; queued: number; lastError: string | null } | null;
 };
 
 type AuthSession =
@@ -112,6 +126,24 @@ function statusLabel(status: StreamStatus["status"]) {
   }[status];
 }
 
+function videoStatusLabel(video: Video) {
+  if (video.status === "ANALYZING") return "аналіз файлу";
+  if (video.status === "PROCESSING") return `підготовка ${video.processingProgress}%`;
+  if (video.status === "FAILED") return "помилка обробки";
+  return "готово до ефіру";
+}
+
+function videoMeta(video: Video) {
+  if (!video.media) return humanSize(video.size);
+  const minutes = Math.floor(video.media.durationSeconds / 60);
+  const seconds = Math.floor(video.media.durationSeconds % 60);
+  const duration = `${minutes}:${String(seconds).padStart(2, "0")}`;
+  const resolution = video.media.width && video.media.height
+    ? `${video.media.width}×${video.media.height}`
+    : null;
+  return [humanSize(video.preparedSize ?? video.size), duration, resolution].filter(Boolean).join(" · ");
+}
+
 const emptyStream: StreamStatus = {
   status: "STOPPED",
   videoId: null,
@@ -143,6 +175,7 @@ export default function Home() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
+  const [processingAction, setProcessingAction] = useState("");
   const [streamUrl, setStreamUrl] = useState("rtmps://a.rtmps.youtube.com/live2");
   const [streamKey, setStreamKey] = useState("");
   const [streamAction, setStreamAction] = useState(false);
@@ -162,8 +195,9 @@ export default function Home() {
       setVideos(videosResult.videos);
       setStream(streamResult.stream);
       setSelectedVideoId((current) => {
-        if (current && videosResult.videos.some((video) => video.id === current)) return current;
-        return videosResult.videos[0]?.id || "";
+        const readyVideos = videosResult.videos.filter((video) => video.status === "READY");
+        if (current && readyVideos.some((video) => video.id === current)) return current;
+        return readyVideos[0]?.id || "";
       });
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
@@ -214,7 +248,7 @@ export default function Home() {
     [selectedVideoId, videos],
   );
   const readyToStart = Boolean(
-    selectedVideoId && streamUrl.trim() && streamKey.trim() && health?.ffmpeg.available,
+    selectedVideo?.status === "READY" && streamUrl.trim() && streamKey.trim() && health?.ffmpeg.available,
   );
 
   async function login(event: FormEvent) {
@@ -344,11 +378,16 @@ export default function Home() {
         { method: "POST" },
         csrfToken,
       );
-      setSelectedVideoId(completed.video.id);
+      if (completed.video.status === "READY") setSelectedVideoId(completed.video.id);
       setSelectedFile(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
       setUploadProgress(100);
-      setNotice({ type: "success", text: "Відео завантажено й готове до трансляції." });
+      setNotice({
+        type: "success",
+        text: completed.video.status === "READY"
+          ? "Відео завантажено й готове до трансляції."
+          : "Відео завантажено. Почалася автоматична підготовка до трансляції.",
+      });
       await refresh();
     } catch (error) {
       setNotice({
@@ -357,6 +396,28 @@ export default function Home() {
       });
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function retryVideoProcessing(videoId: string) {
+    if (processingAction) return;
+    setProcessingAction(videoId);
+    setNotice(null);
+    try {
+      await api<{ video: Video }>(
+        `/api/videos/${videoId}/process`,
+        { method: "POST" },
+        csrfToken,
+      );
+      setNotice({ type: "success", text: "Повторну обробку відео запущено." });
+      await refresh();
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося повторити обробку відео.",
+      });
+    } finally {
+      setProcessingAction("");
     }
   }
 
@@ -485,8 +546,8 @@ export default function Home() {
           <p className="eyebrow">YouTube 24/7 Stream Manager</p>
           <h1>Одне відео. Один ефір. Без зайвого.</h1>
           <p className="hero-copy">
-            Завантажте готовий файл, додайте дані трансляції YouTube і запустіть
-            циклічний стрім через FFmpeg.
+            Завантажте відео, дочекайтеся автоматичної підготовки, додайте дані
+            трансляції YouTube і запустіть циклічний стрім через FFmpeg.
           </p>
         </div>
         <div className="hero-stats" aria-label="Поточний стан">
@@ -516,7 +577,7 @@ export default function Home() {
           <span aria-hidden="true">!</span>
           <div>
             <strong>FFmpeg не знайдено</strong>
-            <p>Завантаження працює, але для старту ефіру встановіть FFmpeg або запустіть медіасервер через Docker.</p>
+            <p>Завантаження доступне, але підготовка відео та ефір потребують FFmpeg. Встановіть його або запустіть медіасервер через Docker.</p>
           </div>
         </div>
       )}
@@ -594,31 +655,72 @@ export default function Home() {
           </button>
 
           <div className="video-list-heading">
-            <h3>Готові файли</h3>
+            <h3>Бібліотека</h3>
             <span>{videos.length}</span>
           </div>
           <div className="video-list">
             {videos.length === 0 ? (
               <div className="empty-state">Після завантаження відео з’явиться тут.</div>
             ) : (
-              videos.map((video) => (
-                <label className={`video-row ${selectedVideoId === video.id ? "video-row--selected" : ""}`} key={video.id}>
-                  <input
-                    type="radio"
-                    name="selected-video"
-                    value={video.id}
-                    checked={selectedVideoId === video.id}
-                    onChange={() => setSelectedVideoId(video.id)}
-                    disabled={active}
-                  />
-                  <span className="video-thumb" aria-hidden="true">▶</span>
-                  <span className="video-copy">
-                    <strong>{video.name}</strong>
-                    <span>{humanSize(video.size)} · готово</span>
-                  </span>
-                  <span className="radio-mark" aria-hidden="true" />
-                </label>
-              ))
+              videos.map((video) => {
+                const ready = video.status === "READY";
+                const processing = ["ANALYZING", "PROCESSING"].includes(video.status);
+                return (
+                  <div
+                    className={`video-row video-row--${video.status.toLowerCase()} ${selectedVideoId === video.id ? "video-row--selected" : ""}`}
+                    key={video.id}
+                  >
+                    <label className="video-row-main">
+                      <input
+                        type="radio"
+                        name="selected-video"
+                        value={video.id}
+                        checked={selectedVideoId === video.id}
+                        onChange={() => setSelectedVideoId(video.id)}
+                        disabled={active || !ready}
+                      />
+                      <span className="video-thumb" aria-hidden="true">
+                        {video.status === "FAILED" ? "!" : ready ? "▶" : "…"}
+                      </span>
+                      <span className="video-copy">
+                        <strong>{video.name}</strong>
+                        <span>{videoMeta(video)} · {videoStatusLabel(video)}</span>
+                      </span>
+                      {ready ? (
+                        <span className="radio-mark" aria-hidden="true" />
+                      ) : (
+                        <span className={`video-status video-status--${video.status.toLowerCase()}`}>
+                          {video.status === "FAILED" ? "FAILED" : "PROCESSING"}
+                        </span>
+                      )}
+                    </label>
+                    {processing && (
+                      <div
+                        className="video-processing-track"
+                        role="progressbar"
+                        aria-label={`Підготовка ${video.name}`}
+                        aria-valuenow={video.processingProgress}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                      >
+                        <span style={{ width: `${video.processingProgress}%` }} />
+                      </div>
+                    )}
+                    {video.status === "FAILED" && (
+                      <div className="video-processing-error" role="alert">
+                        <span>{video.processingError || "Не вдалося підготувати відео."}</span>
+                        <button
+                          type="button"
+                          onClick={() => retryVideoProcessing(video.id)}
+                          disabled={Boolean(processingAction)}
+                        >
+                          {processingAction === video.id ? "Запускаємо…" : "Повторити"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
             )}
           </div>
         </section>

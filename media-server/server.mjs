@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ApiError } from "./api-error.mjs";
 import { createOwnerAuth } from "./auth.mjs";
+import { MediaProcessor } from "./media-processor.mjs";
 import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
 import { EncryptedStreamStateStore } from "./stream-state-store.mjs";
@@ -97,6 +98,7 @@ export async function createMvpServer({
   controller,
   auth,
   stateStore,
+  processor,
 } = {}) {
   const videoStore = store ?? new VideoStore({ rootDir: dataDir });
   const encryptedStateStore =
@@ -115,6 +117,17 @@ export async function createMvpServer({
       audioBitrate: process.env.MVP_AUDIO_BITRATE || "128k",
       stateStore: encryptedStateStore,
     });
+  const mediaProcessor =
+    processor ??
+    new MediaProcessor({
+      store: videoStore,
+      ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
+      ffprobePath: process.env.FFPROBE_PATH || "ffprobe",
+      videoBitrate: process.env.MEDIA_TRANSCODE_VIDEO_BITRATE || "8M",
+      audioBitrate: process.env.MVP_AUDIO_BITRATE || "128k",
+      preset: process.env.MEDIA_TRANSCODE_PRESET || "veryfast",
+      keepOriginalUploads: process.env.MEDIA_KEEP_ORIGINAL_UPLOADS === "true",
+    });
   const corsOrigins = allowedOrigins.length ? allowedOrigins : DEFAULT_ALLOWED_ORIGINS;
   const ownerAuth = auth ?? createOwnerAuth();
   await videoStore.init();
@@ -122,6 +135,7 @@ export async function createMvpServer({
   await streamController.init?.({
     resolveVideo: (videoId) => videoStore.getReadyVideo(videoId),
   });
+  await mediaProcessor.init?.();
 
   const server = createServer(async (request, response) => {
     setCommonHeaders(request, response, corsOrigins);
@@ -138,6 +152,7 @@ export async function createMvpServer({
           ok: true,
           service: "streamlab-media",
           ffmpeg: streamController.checkFfmpeg(),
+          processing: mediaProcessor.snapshot?.() ?? null,
         });
         return;
       }
@@ -198,7 +213,16 @@ export async function createMvpServer({
       const completeMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)\/complete$/);
       if (request.method === "POST" && completeMatch) {
         const video = await videoStore.completeUpload(completeMatch[1]);
-        json(response, 200, { video });
+        if (["ANALYZING", "PROCESSING"].includes(video.status)) mediaProcessor.enqueue(video.id);
+        json(response, video.status === "READY" ? 200 : 202, { video });
+        return;
+      }
+
+      const retryProcessingMatch = url.pathname.match(/^\/api\/videos\/([^/]+)\/process$/);
+      if (request.method === "POST" && retryProcessingMatch) {
+        const video = await videoStore.retryProcessing(retryProcessingMatch[1]);
+        mediaProcessor.enqueue(video.id);
+        json(response, 202, { video });
         return;
       }
 
@@ -243,6 +267,7 @@ export async function createMvpServer({
     server,
     store: videoStore,
     controller: streamController,
+    processor: mediaProcessor,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -253,6 +278,7 @@ export async function createMvpServer({
       });
     },
     async close() {
+      await mediaProcessor.shutdown?.();
       if (streamController.shutdown) await streamController.shutdown();
       else await streamController.stop();
       await new Promise((resolve, reject) =>
