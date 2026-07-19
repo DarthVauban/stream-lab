@@ -22,6 +22,10 @@ if [ "$(id -u)" = "0" ]; then
     "$data_dir/stream-presets.enc.json.tmp" \
     "$data_dir/stream-state.enc.json" \
     "$data_dir/stream-state.enc.json.tmp" \
+    "$data_dir/youtube-oauth.enc.json" \
+    "$data_dir/youtube-oauth.enc.json.tmp" \
+    "$data_dir/youtube-stats.json" \
+    "$data_dir/youtube-stats.json.tmp" \
     "$data_dir/uploads"/*.part \
     "$data_dir/uploads"/*.processing.tmp.mp4
   do

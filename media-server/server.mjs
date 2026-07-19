@@ -10,6 +10,8 @@ import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
 import { EncryptedStreamPresetStore } from "./stream-preset-store.mjs";
 import { EncryptedStreamStateStore } from "./stream-state-store.mjs";
+import { YouTubeService } from "./youtube-service.mjs";
+import { EncryptedYouTubeStore, YouTubeStatsStore } from "./youtube-store.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, "..");
@@ -18,6 +20,11 @@ const DEFAULT_ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173
 function json(response, status, payload) {
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(payload));
+}
+
+function redirect(response, location) {
+  response.writeHead(303, { Location: location });
+  response.end();
 }
 
 async function readJson(request, limit = 64 * 1024) {
@@ -105,6 +112,7 @@ export async function createMvpServer({
   queue,
   settings,
   presets,
+  youtube,
 } = {}) {
   const videoStore = store ?? new VideoStore({ rootDir: dataDir });
   const liveQueue = queue ?? new QueueStore({ rootDir: dataDir });
@@ -148,6 +156,21 @@ export async function createMvpServer({
     });
   const corsOrigins = allowedOrigins.length ? allowedOrigins : DEFAULT_ALLOWED_ORIGINS;
   const ownerAuth = auth ?? createOwnerAuth();
+  const youtubeConfigured = [
+    process.env.GOOGLE_OAUTH_CLIENT_ID,
+    process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+    process.env.GOOGLE_OAUTH_REDIRECT_URI,
+  ].every((value) => typeof value === "string" && value.trim());
+  const youtubeIntegration =
+    youtube ??
+    new YouTubeService(
+      youtubeConfigured
+        ? {
+            store: new EncryptedYouTubeStore({ rootDir: dataDir }),
+            statsStore: new YouTubeStatsStore({ rootDir: dataDir }),
+          }
+        : {},
+    );
   await encryptedStateStore?.init();
   await streamController.init?.({
     resolveVideo: (videoId) => videoStore.getReadyVideo(videoId),
@@ -164,6 +187,8 @@ export async function createMvpServer({
     },
   });
   await mediaProcessor.init?.();
+  await youtubeIntegration.init?.();
+  youtubeIntegration.start?.();
 
   const queueSnapshot = () => {
     const snapshot = liveQueue.snapshot();
@@ -237,6 +262,21 @@ export async function createMvpServer({
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/api/youtube/oauth/callback") {
+        try {
+          await youtubeIntegration.completeOAuth({
+            code: url.searchParams.get("code"),
+            state: url.searchParams.get("state"),
+            error: url.searchParams.get("error"),
+          });
+          redirect(response, "/?youtube=connected");
+        } catch (error) {
+          if (!(error instanceof ApiError)) console.error(error);
+          redirect(response, "/?youtube=error");
+        }
+        return;
+      }
+
       ownerAuth.assertAuthenticated(request, {
         requireCsrf: !["GET", "HEAD"].includes(request.method || "GET"),
       });
@@ -275,6 +315,61 @@ export async function createMvpServer({
 
       if (request.method === "GET" && url.pathname === "/api/stream-presets") {
         json(response, 200, { presets: streamPresetStore.list() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/youtube/status") {
+        json(response, 200, { youtube: youtubeIntegration.snapshot() });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/youtube/oauth/start") {
+        const authorizationUrl = await youtubeIntegration.beginOAuth();
+        json(response, 200, { authorizationUrl });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/youtube/disconnect") {
+        const snapshot = await youtubeIntegration.disconnect();
+        json(response, 200, { youtube: snapshot });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/youtube/refresh") {
+        const snapshot = await youtubeIntegration.refreshAll();
+        json(response, 200, { youtube: snapshot });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/youtube/broadcast/select") {
+        const body = await readJson(request, 8 * 1024);
+        const snapshot = await youtubeIntegration.selectBroadcast(body.broadcastId);
+        json(response, 200, { youtube: snapshot });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/youtube/stats") {
+        json(response, 200, {
+          stats: youtubeIntegration.history({ hours: url.searchParams.get("hours") }),
+        });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/youtube/stream-preset") {
+        const body = await readJson(request, 8 * 1024);
+        const ingestion = youtubeIntegration.getSelectedIngestion();
+        buildTarget(ingestion.streamUrl, ingestion.streamKey);
+        const youtubeSnapshot = youtubeIntegration.snapshot();
+        const createdPreset = await streamPresetStore.create({
+          name:
+            typeof body.name === "string" && body.name.trim()
+              ? body.name.trim()
+              : `YouTube · ${youtubeSnapshot.selected?.title || youtubeSnapshot.channel?.title || "Ефір"}`,
+          ...ingestion,
+        });
+        json(response, 201, {
+          preset: streamPresetStore.list().find((preset) => preset.id === createdPreset.id),
+        });
         return;
       }
 
@@ -528,6 +623,7 @@ export async function createMvpServer({
     queue: liveQueue,
     settings: settingsStore,
     presets: streamPresetStore,
+    youtube: youtubeIntegration,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -538,6 +634,7 @@ export async function createMvpServer({
       });
     },
     async close() {
+      youtubeIntegration.stop?.();
       await mediaProcessor.shutdown?.();
       if (streamController.shutdown) await streamController.shutdown();
       else await streamController.stop();

@@ -445,3 +445,84 @@ test("returns actionable storage errors without exposing filesystem details", ()
   assert.equal(fullDiskError.status, 507);
   assert.equal(fullDiskError.code, "INSUFFICIENT_STORAGE");
 });
+
+test("protects YouTube controls while allowing the state-validated OAuth callback", async (t) => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "streamlab-youtube-api-test-"));
+  let callbackCount = 0;
+  const youtube = {
+    async init() {},
+    start() {},
+    stop() {},
+    snapshot() {
+      return {
+        configured: true,
+        connected: true,
+        channel: { title: "Test channel" },
+        selected: { title: "Test live" },
+      };
+    },
+    async beginOAuth() {
+      return "https://accounts.google.com/o/oauth2/v2/auth?state=test";
+    },
+    async completeOAuth({ code, state }) {
+      assert.equal(code, "oauth-code");
+      assert.equal(state, "oauth-state");
+      callbackCount += 1;
+    },
+    getSelectedIngestion() {
+      return {
+        streamUrl: "rtmps://a.rtmps.youtube.com/live2",
+        streamKey: "youtube-secret-key",
+      };
+    },
+  };
+  const app = await createMvpServer({
+    dataDir,
+    controller: new FakeController(),
+    auth: testAuth(),
+    presets: testPresetStore(dataDir),
+    youtube,
+  });
+  const address = await app.listen(0, "127.0.0.1");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  t.after(async () => {
+    await app.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  const callback = await fetch(
+    `${baseUrl}/api/youtube/oauth/callback?code=oauth-code&state=oauth-state`,
+    { redirect: "manual" },
+  );
+  assert.equal(callback.status, 303);
+  assert.equal(callback.headers.get("location"), "/?youtube=connected");
+  assert.equal(callbackCount, 1);
+
+  const unauthorized = await fetch(`${baseUrl}/api/youtube/status`);
+  assert.equal(unauthorized.status, 401);
+  const session = await login(baseUrl);
+
+  const missingCsrf = await fetch(`${baseUrl}/api/youtube/oauth/start`, {
+    method: "POST",
+    headers: { Cookie: session.cookie },
+  });
+  assert.equal(missingCsrf.status, 403);
+
+  const oauthStart = await fetch(`${baseUrl}/api/youtube/oauth/start`, {
+    method: "POST",
+    headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+  });
+  assert.equal(oauthStart.status, 200);
+  assert.match((await oauthStart.json()).authorizationUrl, /^https:\/\/accounts\.google\.com\//);
+
+  const presetResponse = await fetch(`${baseUrl}/api/youtube/stream-preset`, {
+    method: "POST",
+    headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+  });
+  assert.equal(presetResponse.status, 201);
+  const preset = (await presetResponse.json()).preset;
+  assert.equal(preset.name, "YouTube · Test live");
+  assert.equal(preset.streamKey, undefined);
+  const rawPresets = await readFile(path.join(dataDir, "stream-presets.enc.json"), "utf8");
+  assert.doesNotMatch(rawPresets, /youtube-secret-key/);
+});

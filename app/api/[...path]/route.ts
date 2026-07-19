@@ -32,7 +32,7 @@ async function proxy(request: NextRequest, context: RouteContext) {
   try {
     const upstream = await fetch(target, init);
     const responseHeaders = new Headers();
-    for (const name of ["content-type", "cache-control", "set-cookie", "retry-after"]) {
+    for (const name of ["content-type", "cache-control", "set-cookie", "retry-after", "location"]) {
       const value = upstream.headers.get(name);
       if (value) responseHeaders.set(name, value);
     }

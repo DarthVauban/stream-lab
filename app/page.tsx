@@ -107,6 +107,73 @@ type AuthSession =
   | { authenticated: false }
   | { authenticated: true; owner: string; csrfToken: string; expiresAt: string };
 
+type YouTubeBroadcast = {
+  id: string;
+  title: string;
+  scheduledStartAt: string | null;
+  actualStartAt: string | null;
+  lifeCycleStatus: string;
+  privacyStatus: string;
+  boundStreamId: string | null;
+  liveChatId: string | null;
+};
+
+type YouTubeStatus = {
+  configured: boolean;
+  connected: boolean;
+  connectedAt: string | null;
+  channel: {
+    id: string;
+    title: string;
+    thumbnailUrl: string | null;
+    subscribers: number | null;
+    totalViews: number;
+    videos: number;
+  } | null;
+  broadcasts: YouTubeBroadcast[];
+  selected: YouTubeBroadcast | null;
+  stream: {
+    id: string;
+    title: string;
+    streamStatus: string;
+    healthStatus: "good" | "ok" | "bad" | "noData" | string;
+    lastHealthUpdateAt: string | null;
+    configurationIssues: Array<{
+      type: string;
+      severity: string;
+      reason: string;
+      description: string;
+    }>;
+    resolution: string | null;
+    frameRate: string | null;
+    ingestionReady: boolean;
+  } | null;
+  metrics: {
+    viewers: number;
+    views: number;
+    likes: number;
+    actualStartAt: string | null;
+    scheduledStartAt: string | null;
+  } | null;
+  history: Array<{
+    capturedAt: string;
+    broadcastId: string;
+    viewers: number;
+    views: number;
+    likes: number;
+    health: string;
+  }>;
+  quota: {
+    date: string;
+    used: number;
+    limit: number;
+    remaining: number;
+    updatedAt: string | null;
+  };
+  lastUpdatedAt: string | null;
+  lastError: string | null;
+};
+
 class ApiRequestError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
@@ -178,6 +245,26 @@ function statusLabel(status: StreamStatus["status"]) {
     STOPPING: "Зупинка",
     ERROR: "Помилка",
   }[status];
+}
+
+function youtubeHealthLabel(status: string | undefined) {
+  return {
+    good: "Сигнал добрий",
+    ok: "Є попередження",
+    bad: "Потрібна увага",
+    noData: "Очікуємо сигнал",
+  }[status || "noData"] || "Стан невідомий";
+}
+
+function youtubeBroadcastStatus(status: string) {
+  return {
+    live: "в ефірі",
+    liveStarting: "запускається",
+    testing: "тестування",
+    testStarting: "запуск тесту",
+    ready: "готова",
+    created: "запланована",
+  }[status] || status;
 }
 
 function videoStatusLabel(video: Video) {
@@ -262,6 +349,8 @@ export default function Home() {
   const [presetName, setPresetName] = useState("");
   const [presetAction, setPresetAction] = useState("");
   const [streamAction, setStreamAction] = useState(false);
+  const [youtube, setYoutube] = useState<YouTubeStatus | null>(null);
+  const [youtubeAction, setYoutubeAction] = useState("");
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [now, setNow] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -269,16 +358,18 @@ export default function Home() {
 
   const refresh = useCallback(async () => {
     try {
-      const [healthResult, videosResult, streamResult, queueResult] = await Promise.all([
+      const [healthResult, videosResult, streamResult, queueResult, youtubeResult] = await Promise.all([
         api<Health>("/api/health"),
         api<{ videos: Video[] }>("/api/videos"),
         api<{ stream: StreamStatus }>("/api/stream/status"),
         api<{ queue: QueueState }>("/api/queue"),
+        api<{ youtube: YouTubeStatus }>("/api/youtube/status"),
       ]);
       setHealth(healthResult);
       setVideos(videosResult.videos);
       setStream(streamResult.stream);
       setQueue(queueResult.queue);
+      setYoutube(youtubeResult.youtube);
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
         setAuthState("anonymous");
@@ -338,6 +429,21 @@ export default function Home() {
 
   useEffect(() => {
     if (authState !== "authenticated") return;
+    const result = new URLSearchParams(window.location.search).get("youtube");
+    if (!result) return;
+    const notification = window.setTimeout(() => {
+      setNotice(
+        result === "connected"
+          ? { type: "success", text: "YouTube-канал підключено." }
+          : { type: "error", text: "Не вдалося підключити YouTube. Спробуйте ще раз." },
+      );
+    }, 0);
+    window.history.replaceState({}, "", window.location.pathname);
+    return () => window.clearTimeout(notification);
+  }, [authState]);
+
+  useEffect(() => {
+    if (authState !== "authenticated") return;
     let cancelled = false;
     void Promise.all([
       api<{ settings: StreamSettings }>("/api/settings/stream"),
@@ -384,6 +490,8 @@ export default function Home() {
   const playbackProgress = stream.durationMs > 0
     ? Math.min(100, Math.max(0, (stream.positionMs / stream.durationMs) * 100))
     : 0;
+  const youtubeChart = youtube?.history.slice(-48) ?? [];
+  const youtubeChartMax = Math.max(1, ...youtubeChart.map((item) => item.viewers));
 
   async function login(event: FormEvent) {
     event.preventDefault();
@@ -426,6 +534,8 @@ export default function Home() {
       setPresetName("");
       setStreamKey("");
       setStreamKeyVisible(false);
+      setYoutube(null);
+      setYoutubeAction("");
     }
   }
 
@@ -941,6 +1051,129 @@ export default function Home() {
     }
   }
 
+  async function connectYouTube() {
+    if (youtubeAction) return;
+    setYoutubeAction("connect");
+    setNotice(null);
+    try {
+      const result = await api<{ authorizationUrl: string }>(
+        "/api/youtube/oauth/start",
+        { method: "POST" },
+        csrfToken,
+      );
+      window.location.assign(result.authorizationUrl);
+    } catch (error) {
+      setYoutubeAction("");
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося почати підключення YouTube.",
+      });
+    }
+  }
+
+  async function disconnectYouTube() {
+    if (youtubeAction || !window.confirm("Відключити YouTube-канал від StreamLab?")) return;
+    setYoutubeAction("disconnect");
+    setNotice(null);
+    try {
+      const result = await api<{ youtube: YouTubeStatus }>(
+        "/api/youtube/disconnect",
+        { method: "POST" },
+        csrfToken,
+      );
+      setYoutube(result.youtube);
+      setNotice({ type: "success", text: "YouTube-канал відключено, доступ відкликано." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося відключити YouTube.",
+      });
+    } finally {
+      setYoutubeAction("");
+    }
+  }
+
+  async function refreshYouTube() {
+    if (youtubeAction) return;
+    setYoutubeAction("refresh");
+    setNotice(null);
+    try {
+      const result = await api<{ youtube: YouTubeStatus }>(
+        "/api/youtube/refresh",
+        { method: "POST" },
+        csrfToken,
+      );
+      setYoutube(result.youtube);
+      setNotice({ type: "success", text: "Дані YouTube оновлено." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося оновити YouTube.",
+      });
+    } finally {
+      setYoutubeAction("");
+    }
+  }
+
+  async function selectYouTubeBroadcast(broadcastId: string) {
+    if (youtubeAction || !broadcastId) return;
+    setYoutubeAction("select");
+    setNotice(null);
+    try {
+      const result = await api<{ youtube: YouTubeStatus }>(
+        "/api/youtube/broadcast/select",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ broadcastId }),
+        },
+        csrfToken,
+      );
+      setYoutube(result.youtube);
+      setNotice({ type: "success", text: "Активну трансляцію YouTube змінено." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося вибрати трансляцію.",
+      });
+    } finally {
+      setYoutubeAction("");
+    }
+  }
+
+  async function createYouTubePreset() {
+    if (youtubeAction || active) return;
+    setYoutubeAction("preset");
+    setNotice(null);
+    try {
+      const created = await api<{ preset: StreamPresetSummary }>(
+        "/api/youtube/stream-preset",
+        { method: "POST" },
+        csrfToken,
+      );
+      const details = await api<{ preset: StreamPresetDetails }>(
+        `/api/stream-presets/${encodeURIComponent(created.preset.id)}`,
+      );
+      setStreamPresets((current) => [...current, created.preset]);
+      setSelectedPresetId(created.preset.id);
+      setPresetName(details.preset.name);
+      setStreamUrl(details.preset.streamUrl);
+      setStreamKey(details.preset.streamKey);
+      setStreamKeyVisible(false);
+      setNotice({
+        type: "success",
+        text: "RTMPS-пресет YouTube створено й підставлено у форму запуску.",
+      });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося створити YouTube-пресет.",
+      });
+    } finally {
+      setYoutubeAction("");
+    }
+  }
+
   if (authState === "loading") {
     return (
       <main className="login-shell" aria-busy="true">
@@ -1449,10 +1682,172 @@ export default function Home() {
           )}
         </section>
 
-        <section className="panel queue-panel" aria-labelledby="queue-title">
+        <section className="panel youtube-panel" aria-labelledby="youtube-title">
           <div className="panel-heading">
             <div>
               <span className="step-number">03</span>
+              <h2 id="youtube-title">YouTube</h2>
+            </div>
+            <span className={`youtube-connection ${youtube?.connected ? "youtube-connection--active" : ""}`}>
+              {youtube?.connected ? "канал підключено" : "не підключено"}
+            </span>
+          </div>
+
+          {!youtube?.configured ? (
+            <div className="youtube-empty">
+              <strong>OAuth ще не налаштовано</strong>
+              <p>Додайте три GOOGLE_OAUTH змінні на сервері та перезапустіть контейнери.</p>
+            </div>
+          ) : !youtube.connected ? (
+            <div className="youtube-connect">
+              <div>
+                <span className="youtube-logo" aria-hidden="true">▶</span>
+                <div>
+                  <strong>Підключіть канал через Google</strong>
+                  <p>StreamLab отримає лише доступ для читання даних каналу, ефірів і їхніх показників.</p>
+                </div>
+              </div>
+              <button
+                className="button button--primary"
+                type="button"
+                onClick={connectYouTube}
+                disabled={Boolean(youtubeAction)}
+              >
+                {youtubeAction === "connect" ? "Переходимо…" : "Підключити YouTube"}
+              </button>
+            </div>
+          ) : (
+            <div className="youtube-dashboard">
+              <div className="youtube-toolbar">
+                <div className="youtube-channel">
+                  <span className="youtube-avatar" aria-hidden="true">
+                    {(youtube.channel?.title || "Y").slice(0, 1).toUpperCase()}
+                  </span>
+                  <div>
+                    <span>Підключений канал</span>
+                    <strong>{youtube.channel?.title || "Завантажуємо канал…"}</strong>
+                  </div>
+                </div>
+                <div className="youtube-toolbar-actions">
+                  <button type="button" onClick={refreshYouTube} disabled={Boolean(youtubeAction)}>
+                    {youtubeAction === "refresh" ? "Оновлюємо…" : "Оновити"}
+                  </button>
+                  <button
+                    className="youtube-disconnect"
+                    type="button"
+                    onClick={disconnectYouTube}
+                    disabled={Boolean(youtubeAction)}
+                  >
+                    Відключити
+                  </button>
+                </div>
+              </div>
+
+              <div className="youtube-broadcast-row">
+                <label className="field">
+                  <span>Активна трансляція</span>
+                  <select
+                    value={youtube.selected?.id || ""}
+                    onChange={(event) => void selectYouTubeBroadcast(event.target.value)}
+                    disabled={Boolean(youtubeAction) || youtube.broadcasts.length === 0}
+                  >
+                    {youtube.broadcasts.length === 0 && <option value="">Немає активних або запланованих ефірів</option>}
+                    {youtube.broadcasts.map((broadcast) => (
+                      <option key={broadcast.id} value={broadcast.id}>
+                        {broadcast.title} · {youtubeBroadcastStatus(broadcast.lifeCycleStatus)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  className="button button--quiet youtube-preset-button"
+                  type="button"
+                  onClick={createYouTubePreset}
+                  disabled={Boolean(youtubeAction) || active || !youtube.stream?.ingestionReady}
+                >
+                  {youtubeAction === "preset" ? "Створюємо…" : "Створити RTMPS-пресет"}
+                </button>
+              </div>
+
+              <div className="youtube-metrics" aria-label="Поточні показники YouTube">
+                <div>
+                  <span>Глядачі зараз</span>
+                  <strong>{youtube.metrics?.viewers.toLocaleString("uk-UA") ?? "—"}</strong>
+                </div>
+                <div>
+                  <span>Перегляди</span>
+                  <strong>{youtube.metrics?.views.toLocaleString("uk-UA") ?? "—"}</strong>
+                </div>
+                <div>
+                  <span>Вподобання</span>
+                  <strong>{youtube.metrics?.likes.toLocaleString("uk-UA") ?? "—"}</strong>
+                </div>
+                <div className={`youtube-health youtube-health--${youtube.stream?.healthStatus || "nodata"}`}>
+                  <span>Сигнал YouTube</span>
+                  <strong>{youtubeHealthLabel(youtube.stream?.healthStatus)}</strong>
+                </div>
+              </div>
+
+              <div className="youtube-detail-grid">
+                <div className="youtube-chart-card">
+                  <div className="youtube-card-heading">
+                    <div>
+                      <span>Глядачі</span>
+                      <strong>Останні 24 години</strong>
+                    </div>
+                    <span>пік {youtubeChartMax.toLocaleString("uk-UA")}</span>
+                  </div>
+                  {youtubeChart.length > 1 ? (
+                    <div className="youtube-chart" aria-label="Історія одночасних глядачів">
+                      {youtubeChart.map((item) => (
+                        <span
+                          key={`${item.capturedAt}-${item.broadcastId}`}
+                          style={{ height: `${Math.max(4, (item.viewers / youtubeChartMax) * 100)}%` }}
+                          title={`${item.viewers} · ${new Date(item.capturedAt).toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" })}`}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="youtube-chart-empty">Графік з’явиться після перших двох знімків статистики.</p>
+                  )}
+                </div>
+
+                <div className="youtube-quota-card">
+                  <div className="youtube-card-heading">
+                    <div>
+                      <span>API квота</span>
+                      <strong>{youtube.quota.used.toLocaleString("uk-UA")} / {youtube.quota.limit.toLocaleString("uk-UA")}</strong>
+                    </div>
+                    <span>{Math.max(0, Math.round((youtube.quota.remaining / youtube.quota.limit) * 100))}% вільно</span>
+                  </div>
+                  <div className="youtube-quota-track" aria-hidden="true">
+                    <span style={{ width: `${Math.min(100, (youtube.quota.used / youtube.quota.limit) * 100)}%` }} />
+                  </div>
+                  <p>Опитування розподілені так, щоб стандартної денної квоти вистачало на безперервну роботу.</p>
+                </div>
+              </div>
+
+              {youtube.stream?.configurationIssues.length ? (
+                <div className="youtube-issues" role="status">
+                  <strong>Зауваження YouTube до сигналу</strong>
+                  <ul>
+                    {youtube.stream.configurationIssues.map((issue, index) => (
+                      <li key={`${issue.type}-${index}`}>
+                        {issue.description || issue.reason || issue.type}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {youtube.lastError && <p className="youtube-error">{youtube.lastError}</p>}
+            </div>
+          )}
+        </section>
+
+        <section className="panel queue-panel" aria-labelledby="queue-title">
+          <div className="panel-heading">
+            <div>
+              <span className="step-number">04</span>
               <h2 id="queue-title">Черга трансляції</h2>
             </div>
             <span className="panel-kicker">{queue.items.length} · LOOP</span>
