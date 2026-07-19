@@ -5,6 +5,8 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 RUN mkdir -p /app/data && chown -R node:node /app
 COPY --chown=node:node media-server ./media-server
 COPY --chmod=755 docker-entrypoint-media.sh /usr/local/bin/streamlab-media-entrypoint

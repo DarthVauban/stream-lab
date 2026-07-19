@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { compressionProfile } from "./compression-profiles.mjs";
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024 * 1024;
 const ALLOWED_PRESETS = new Set([
@@ -221,6 +222,42 @@ export function buildTranscodeArgs({
   ];
 }
 
+export function buildThumbnailArgs({ inputPath, outputPath, durationSeconds = 0 }) {
+  const seekSeconds = Math.max(0, Math.min(10, Number(durationSeconds) * 0.1 || 1));
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-y",
+    "-ss",
+    seekSeconds.toFixed(3),
+    "-i",
+    inputPath,
+    "-frames:v",
+    "1",
+    "-vf",
+    "scale=480:-2:force_original_aspect_ratio=decrease",
+    "-q:v",
+    "3",
+    outputPath,
+  ];
+}
+
+export async function generateThumbnail({
+  inputPath,
+  outputPath,
+  durationSeconds,
+  ffmpegPath = "ffmpeg",
+  spawnImpl = spawn,
+  signal,
+}) {
+  await collectProcess(
+    ffmpegPath,
+    buildThumbnailArgs({ inputPath, outputPath, durationSeconds }),
+    { spawnImpl, signal },
+  );
+}
+
 export function transcodeMedia({
   inputPath,
   outputPath,
@@ -310,6 +347,8 @@ export class MediaProcessor {
     keepOriginalUploads = process.env.MEDIA_KEEP_ORIGINAL_UPLOADS === "true",
     probeImpl = probeMedia,
     transcodeImpl = transcodeMedia,
+    thumbnailImpl = generateThumbnail,
+    onEvent = () => {},
     logger = console,
   } = {}) {
     if (!store) throw new Error("MediaProcessor потребує VideoStore.");
@@ -322,6 +361,8 @@ export class MediaProcessor {
     this.keepOriginalUploads = keepOriginalUploads;
     this.probeImpl = probeImpl;
     this.transcodeImpl = transcodeImpl;
+    this.thumbnailImpl = thumbnailImpl;
+    this.onEvent = onEvent;
     this.logger = logger;
     this.queue = [];
     this.queued = new Set();
@@ -335,25 +376,35 @@ export class MediaProcessor {
 
   async init() {
     for (const videoId of this.store.listPendingProcessingIds()) this.enqueue(videoId);
+    for (const videoId of this.store.listMissingThumbnailIds?.() || []) this.enqueueThumbnail(videoId);
   }
 
   enqueue(videoId) {
     if (this.shuttingDown || this.queued.has(videoId) || this.activeVideoId === videoId) return;
-    this.queue.push(videoId);
+    this.queue.push({ videoId, thumbnailOnly: false });
     this.queued.add(videoId);
     if (!this.drainPromise) {
       this.drainPromise = Promise.resolve().then(() => this.drain());
     }
   }
 
+  enqueueThumbnail(videoId) {
+    if (this.shuttingDown || this.queued.has(videoId) || this.activeVideoId === videoId) return;
+    this.queue.push({ videoId, thumbnailOnly: true });
+    this.queued.add(videoId);
+    if (!this.drainPromise) this.drainPromise = Promise.resolve().then(() => this.drain());
+  }
+
   async drain() {
     try {
       while (!this.shuttingDown && this.queue.length) {
-        const videoId = this.queue.shift();
+        const task = this.queue.shift();
+        const videoId = task.videoId;
         this.queued.delete(videoId);
         this.activeVideoId = videoId;
         this.abortController = new AbortController();
-        await this.processOne(videoId, this.abortController.signal);
+        if (task.thumbnailOnly) await this.processThumbnail(videoId, this.abortController.signal);
+        else await this.processOne(videoId, this.abortController.signal);
         this.activeVideoId = null;
         this.abortController = null;
       }
@@ -371,8 +422,10 @@ export class MediaProcessor {
 
   async processOne(videoId, signal) {
     try {
+      await this.onEvent("VIDEO_PROCESSING_STARTED", { videoId });
       await this.store.beginAnalysis(videoId);
       const paths = this.store.getProcessingPaths(videoId);
+      const profile = compressionProfile(paths.compressionProfile);
       const sourceMedia = await this.probeImpl(paths.sourcePath, {
         ffprobePath: this.ffprobePath,
         signal,
@@ -383,9 +436,9 @@ export class MediaProcessor {
         outputPath: paths.tempOutputPath,
         durationSeconds: sourceMedia.durationSeconds,
         ffmpegPath: this.ffmpegPath,
-        videoBitrate: this.videoBitrate,
-        audioBitrate: this.audioBitrate,
-        preset: this.preset,
+        videoBitrate: profile?.videoBitrate || this.videoBitrate,
+        audioBitrate: profile?.audioBitrate || this.audioBitrate,
+        preset: profile?.preset || this.preset,
         signal,
         onProgress: (progress) => void this.store.updateProcessingProgress(videoId, progress),
       });
@@ -395,9 +448,17 @@ export class MediaProcessor {
           signal,
         }),
       );
+      await this.thumbnailImpl({
+        inputPath: paths.tempOutputPath,
+        outputPath: paths.tempThumbnailPath,
+        durationSeconds: streamMedia.durationSeconds,
+        ffmpegPath: this.ffmpegPath,
+        signal,
+      });
       await this.store.completeProcessing(videoId, streamMedia, {
         keepOriginal: this.keepOriginalUploads,
       });
+      await this.onEvent("VIDEO_READY", { videoId });
       this.lastError = null;
     } catch (error) {
       if (this.shuttingDown && (signal.aborted || error?.name === "AbortError")) return;
@@ -410,6 +471,27 @@ export class MediaProcessor {
       await this.store.failProcessing(videoId, publicMessage).catch((storeError) => {
         this.logger.error(`Не вдалося зберегти помилку обробки ${videoId}:`, storeError);
       });
+      await this.onEvent("VIDEO_PROCESSING_FAILED", { videoId, message: publicMessage });
+    }
+  }
+
+  async processThumbnail(videoId, signal) {
+    try {
+      const paths = this.store.getThumbnailBackfillPaths(videoId);
+      await this.thumbnailImpl({
+        inputPath: paths.inputPath,
+        outputPath: paths.tempThumbnailPath,
+        durationSeconds: paths.durationSeconds,
+        ffmpegPath: this.ffmpegPath,
+        signal,
+      });
+      await this.store.completeThumbnail(videoId);
+      await this.onEvent("VIDEO_THUMBNAIL_READY", { videoId });
+    } catch (error) {
+      if (this.shuttingDown && (signal.aborted || error?.name === "AbortError")) return;
+      this.logger.error(`Помилка створення прев’ю відео ${videoId}:`, error);
+      await this.store.failThumbnail?.(videoId);
+      await this.onEvent("VIDEO_THUMBNAIL_FAILED", { videoId });
     }
   }
 

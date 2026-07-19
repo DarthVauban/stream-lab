@@ -18,6 +18,10 @@ if [ "$(id -u)" = "0" ]; then
     "$data_dir/queue.json.tmp" \
     "$data_dir/settings.json" \
     "$data_dir/settings.json.tmp" \
+    "$data_dir/playlists.json" \
+    "$data_dir/playlists.json.tmp" \
+    "$data_dir/audit-log.json" \
+    "$data_dir/audit-log.json.tmp" \
     "$data_dir/stream-presets.enc.json" \
     "$data_dir/stream-presets.enc.json.tmp" \
     "$data_dir/stream-state.enc.json" \
@@ -31,7 +35,9 @@ if [ "$(id -u)" = "0" ]; then
     "$data_dir/telegram-bot.enc.json" \
     "$data_dir/telegram-bot.enc.json.tmp" \
     "$data_dir/uploads"/*.part \
-    "$data_dir/uploads"/*.processing.tmp.mp4
+    "$data_dir/uploads"/*.processing.tmp.mp4 \
+    "$data_dir/uploads"/*.thumbnail.tmp.jpg \
+    "$data_dir/uploads"/*.thumbnail.jpg
   do
     if [ -e "$item" ]; then
       chown node:node "$item"

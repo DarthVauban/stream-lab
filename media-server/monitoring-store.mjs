@@ -75,24 +75,30 @@ function normalizeState(value) {
 }
 
 export class MonitoringStore {
-  constructor({ rootDir, now = () => Date.now() } = {}) {
+  constructor({ rootDir, now = () => Date.now(), repository = null } = {}) {
     if (!rootDir) throw new Error("Для моніторингу не вказано rootDir.");
     this.rootDir = rootDir;
     this.filePath = path.join(rootDir, "monitoring.json");
     this.tempPath = `${this.filePath}.tmp`;
     this.now = now;
+    this.repository = repository;
+    this.documentKey = "monitoring";
     this.state = emptyState();
     this.mutationQueue = Promise.resolve();
   }
 
   async init() {
     await mkdir(this.rootDir, { recursive: true });
-    try {
-      this.state = normalizeState(JSON.parse(await readFile(this.filePath, "utf8")));
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      await this.persist();
+    let parsed = await this.repository?.readDocument?.(this.documentKey);
+    if (!parsed) {
+      try {
+        parsed = JSON.parse(await readFile(this.filePath, "utf8"));
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
     }
+    this.state = normalizeState(parsed);
+    await this.persist();
     return this.read();
   }
 
@@ -105,6 +111,7 @@ export class MonitoringStore {
       const payload = JSON.stringify({ schemaVersion: 1, ...this.state }, null, 2);
       await writeFile(this.tempPath, payload, "utf8");
       await rename(this.tempPath, this.filePath);
+      await this.repository?.writeDocument?.(this.documentKey, JSON.parse(payload));
     });
     this.mutationQueue = operation;
     return operation;
@@ -116,6 +123,7 @@ export class MonitoringStore {
       const payload = JSON.stringify({ schemaVersion: 1, ...this.state }, null, 2);
       await writeFile(this.tempPath, payload, "utf8");
       await rename(this.tempPath, this.filePath);
+      await this.repository?.writeDocument?.(this.documentKey, JSON.parse(payload));
       return result;
     });
     this.mutationQueue = operation;

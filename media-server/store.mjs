@@ -5,6 +5,7 @@ import path from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { ApiError } from "./api-error.mjs";
+import { normalizeCompressionProfile } from "./compression-profiles.mjs";
 
 const ALLOWED_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".webm", ".m4v"]);
 const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024 * 1024;
@@ -25,6 +26,9 @@ function publicRecord(record) {
     processingStartedAt: record.processingStartedAt ?? null,
     processedAt: record.processedAt ?? null,
     media: record.mediaInfo ?? record.sourceMediaInfo ?? null,
+    compressionProfile: normalizeCompressionProfile(record.compressionProfile),
+    fingerprint: record.fingerprint ?? null,
+    thumbnailUrl: record.thumbnailStoredName ? `/api/videos/${record.id}/thumbnail` : null,
   };
 }
 
@@ -44,16 +48,21 @@ function validateUpload(input, maxUploadBytes) {
     throw new ApiError(400, "INVALID_FILE_SIZE", "Некоректний розмір файлу або перевищено ліміт.");
   }
 
-  return { name, size, mimeType, extension };
+  const fingerprint = typeof input?.fingerprint === "string"
+    ? input.fingerprint.trim().slice(0, 300)
+    : "";
+  return { name, size, mimeType, extension, fingerprint };
 }
 
 export class VideoStore {
-  constructor({ rootDir, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES }) {
+  constructor({ rootDir, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, repository = null }) {
     this.rootDir = rootDir;
     this.uploadsDir = path.join(rootDir, "uploads");
     this.trashDir = path.join(this.uploadsDir, ".trash");
     this.catalogPath = path.join(rootDir, "videos.json");
     this.maxUploadBytes = maxUploadBytes;
+    this.repository = repository;
+    this.documentKey = "videos";
     this.records = [];
     this.activeWrites = new Set();
     this.persistQueue = Promise.resolve();
@@ -61,14 +70,19 @@ export class VideoStore {
 
   async init() {
     await mkdir(this.uploadsDir, { recursive: true });
-    try {
-      const parsed = JSON.parse(await readFile(this.catalogPath, "utf8"));
-      this.records = Array.isArray(parsed) ? parsed : [];
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      this.records = [];
-      await this.persist();
+    const saved = await this.repository?.readDocument?.(this.documentKey);
+    if (saved) {
+      this.records = Array.isArray(saved) ? saved : Array.isArray(saved.records) ? saved.records : [];
+    } else {
+      try {
+        const parsed = JSON.parse(await readFile(this.catalogPath, "utf8"));
+        this.records = Array.isArray(parsed) ? parsed : [];
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        this.records = [];
+      }
     }
+    await this.persist();
     await this.recoverTrash();
   }
 
@@ -102,6 +116,10 @@ export class VideoStore {
     this.persistQueue = this.persistQueue.catch(() => {}).then(async () => {
       await writeFile(tempPath, snapshot, "utf8");
       await rename(tempPath, this.catalogPath);
+      await this.repository?.writeDocument?.(this.documentKey, {
+        schemaVersion: 2,
+        records: this.records,
+      });
     });
     await this.persistQueue;
   }
@@ -120,6 +138,21 @@ export class VideoStore {
 
   async createUpload(input) {
     const validated = validateUpload(input, this.maxUploadBytes);
+    if (validated.fingerprint) {
+      const existing = this.records.find(
+        (record) =>
+          record.status === "UPLOADING" &&
+          record.fingerprint === validated.fingerprint &&
+          record.name === validated.name &&
+          record.size === validated.size,
+      );
+      if (existing) {
+        const actualSize = await stat(this.partialPath(existing)).then((value) => value.size).catch(() => 0);
+        existing.uploadedBytes = Math.min(existing.size, actualSize);
+        await this.persist();
+        return publicRecord(existing);
+      }
+    }
     const id = randomUUID();
     const now = new Date().toISOString();
     const record = {
@@ -133,6 +166,10 @@ export class VideoStore {
       storedName: null,
       sourceStoredName: `${id}.source${validated.extension}`,
       streamStoredName: `${id}.stream.mp4`,
+      thumbnailStoredName: null,
+      thumbnailTargetName: `${id}.thumbnail.jpg`,
+      fingerprint: validated.fingerprint || null,
+      compressionProfile: normalizeCompressionProfile(input?.compressionProfile),
       processingProgress: 0,
       processingError: null,
       createdAt: now,
@@ -224,6 +261,17 @@ export class VideoStore {
     return publicRecord(record);
   }
 
+  async cancelUpload(id) {
+    const record = this.requireUpload(id);
+    if (record.status !== "UPLOADING" || this.activeWrites.has(id)) {
+      throw new ApiError(409, "UPLOAD_NOT_CANCELLABLE", "Це завантаження зараз неможливо скасувати.");
+    }
+    await rm(this.partialPath(record), { force: true });
+    this.records.splice(this.records.indexOf(record), 1);
+    await this.persist();
+    return publicRecord(record);
+  }
+
   listVideos() {
     return this.records
       .filter((record) => record.status !== "UPLOADING")
@@ -231,9 +279,22 @@ export class VideoStore {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
+  listActiveUploads() {
+    return this.records
+      .filter((record) => record.status === "UPLOADING")
+      .map(publicRecord)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
   listPendingProcessingIds() {
     return this.records
       .filter((record) => ["ANALYZING", "PROCESSING"].includes(record.status))
+      .map((record) => record.id);
+  }
+
+  listMissingThumbnailIds() {
+    return this.records
+      .filter((record) => record.status === "READY" && !record.thumbnailStoredName && record.storedName)
       .map((record) => record.id);
   }
 
@@ -247,6 +308,7 @@ export class VideoStore {
     record.processingError = null;
     record.processingStartedAt = new Date().toISOString();
     await rm(this.tempOutputPath(record), { force: true }).catch(() => {});
+    await rm(this.tempThumbnailPath(record), { force: true }).catch(() => {});
     await this.persist();
     return publicRecord(record);
   }
@@ -279,6 +341,12 @@ export class VideoStore {
     }
     await rm(this.outputPath(record), { force: true }).catch(() => {});
     await rename(this.tempOutputPath(record), this.outputPath(record));
+    const thumbnailReady = await stat(this.tempThumbnailPath(record)).then(() => true).catch(() => false);
+    if (thumbnailReady) {
+      await rm(this.thumbnailPath(record), { force: true }).catch(() => {});
+      await rename(this.tempThumbnailPath(record), this.thumbnailPath(record));
+      record.thumbnailStoredName = record.thumbnailTargetName;
+    }
     record.preparedSize = (await stat(this.outputPath(record))).size;
     record.storedName = record.streamStoredName;
     record.mediaInfo = mediaInfo;
@@ -302,6 +370,7 @@ export class VideoStore {
   async failProcessing(id, message) {
     const record = this.requireUpload(id);
     await rm(this.tempOutputPath(record), { force: true }).catch(() => {});
+    await rm(this.tempThumbnailPath(record), { force: true }).catch(() => {});
     record.status = "FAILED";
     record.processingError = String(message || "Не вдалося обробити відео.").slice(0, 500);
     await this.persist();
@@ -329,7 +398,37 @@ export class VideoStore {
       sourcePath: this.sourcePath(record),
       tempOutputPath: this.tempOutputPath(record),
       outputPath: this.outputPath(record),
+      tempThumbnailPath: this.tempThumbnailPath(record),
+      thumbnailPath: this.thumbnailPath(record),
+      compressionProfile: normalizeCompressionProfile(record.compressionProfile),
     };
+  }
+
+  getThumbnailBackfillPaths(id) {
+    const record = this.find(id);
+    if (!record || record.status !== "READY" || !record.storedName) {
+      throw new ApiError(404, "VIDEO_NOT_FOUND", "Готове відео не знайдено.");
+    }
+    return {
+      inputPath: this.videoPath(record),
+      tempThumbnailPath: this.tempThumbnailPath(record),
+      durationSeconds: record.mediaInfo?.durationSeconds || 0,
+    };
+  }
+
+  async completeThumbnail(id) {
+    const record = this.requireUpload(id);
+    if (record.status !== "READY") return publicRecord(record);
+    await rm(this.thumbnailPath(record), { force: true }).catch(() => {});
+    await rename(this.tempThumbnailPath(record), this.thumbnailPath(record));
+    record.thumbnailStoredName = record.thumbnailTargetName || `${record.id}.thumbnail.jpg`;
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  async failThumbnail(id) {
+    const record = this.find(id);
+    if (record) await rm(this.tempThumbnailPath(record), { force: true }).catch(() => {});
   }
 
   getReadyVideo(id) {
@@ -345,6 +444,14 @@ export class VideoStore {
     return record ? publicRecord(record) : null;
   }
 
+  getThumbnailPath(id) {
+    const record = this.find(id);
+    if (!record?.thumbnailStoredName || record.status !== "READY") {
+      throw new ApiError(404, "THUMBNAIL_NOT_FOUND", "Прев’ю відео не знайдено.");
+    }
+    return this.thumbnailPath(record);
+  }
+
   deletionPaths(record) {
     const names = new Set([
       `${record.id}.part`,
@@ -352,6 +459,9 @@ export class VideoStore {
       `${record.id}.processing.tmp.mp4`,
       record.storedName,
       record.streamStoredName,
+      record.thumbnailStoredName,
+      record.thumbnailTargetName,
+      `${record.id}.thumbnail.tmp.jpg`,
     ].filter(Boolean));
     const uploadsRoot = `${path.resolve(this.uploadsDir)}${path.sep}`;
     return [...names].map((name) => {
@@ -430,5 +540,13 @@ export class VideoStore {
 
   outputPath(record) {
     return path.join(this.uploadsDir, record.streamStoredName || `${record.id}.stream.mp4`);
+  }
+
+  tempThumbnailPath(record) {
+    return path.join(this.uploadsDir, `${record.id}.thumbnail.tmp.jpg`);
+  }
+
+  thumbnailPath(record) {
+    return path.join(this.uploadsDir, record.thumbnailTargetName || `${record.id}.thumbnail.jpg`);
   }
 }

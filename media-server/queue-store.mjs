@@ -22,11 +22,13 @@ function normalizeItem(item) {
 }
 
 export class QueueStore {
-  constructor({ rootDir } = {}) {
+  constructor({ rootDir, repository = null } = {}) {
     if (!rootDir) throw new Error("Для черги не вказано rootDir.");
     this.rootDir = rootDir;
     this.filePath = path.join(rootDir, "queue.json");
     this.tempPath = `${this.filePath}.tmp`;
+    this.repository = repository;
+    this.documentKey = "queue";
     this.items = [];
     this.mode = "LOOP_ALL";
     this.version = 0;
@@ -36,8 +38,16 @@ export class QueueStore {
 
   async init() {
     await mkdir(this.rootDir, { recursive: true });
-    try {
-      const parsed = JSON.parse(await readFile(this.filePath, "utf8"));
+    let parsed = await this.repository?.readDocument?.(this.documentKey);
+    if (!parsed) {
+      try {
+        parsed = JSON.parse(await readFile(this.filePath, "utf8"));
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        parsed = null;
+      }
+    }
+    if (parsed) {
       const items = Array.isArray(parsed?.items)
         ? parsed.items.map(normalizeItem).filter(Boolean).slice(0, MAX_QUEUE_ITEMS)
         : [];
@@ -49,10 +59,8 @@ export class QueueStore {
       });
       this.version = Number.isSafeInteger(parsed?.version) ? parsed.version : 0;
       this.updatedAt = typeof parsed?.updatedAt === "string" ? parsed.updatedAt : null;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      await this.persist();
     }
+    await this.persist();
     return this.snapshot();
   }
 
@@ -79,6 +87,7 @@ export class QueueStore {
     );
     await writeFile(this.tempPath, payload, "utf8");
     await rename(this.tempPath, this.filePath);
+    await this.repository?.writeDocument?.(this.documentKey, JSON.parse(payload));
   }
 
   mutate(action) {
@@ -152,6 +161,20 @@ export class QueueStore {
       }
       const byId = new Map(this.items.map((item) => [item.id, item]));
       this.items = itemIds.map((id) => byId.get(id));
+      return this.snapshot().items;
+    });
+  }
+
+  replace(videoIds) {
+    if (!Array.isArray(videoIds) || videoIds.length > MAX_QUEUE_ITEMS) {
+      throw new ApiError(400, "INVALID_QUEUE_ITEMS", "Некоректний список відео для черги.");
+    }
+    if (videoIds.some((videoId) => typeof videoId !== "string" || !videoId)) {
+      throw new ApiError(400, "INVALID_QUEUE_ITEMS", "Список черги містить невідоме відео.");
+    }
+    return this.mutate(() => {
+      const now = new Date().toISOString();
+      this.items = videoIds.map((videoId) => ({ id: randomUUID(), videoId, addedAt: now }));
       return this.snapshot().items;
     });
   }

@@ -1,6 +1,9 @@
 {$STREAMLAB_DOMAIN:stream.mt-panel.sbs} {
   encode zstd gzip
 
+  @realtime path /api/events
+  reverse_proxy @realtime media-server:8788
+
   reverse_proxy web:3000 {
     health_uri /api/health
     health_interval 10s

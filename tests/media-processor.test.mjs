@@ -112,6 +112,7 @@ test("restores pending processing and supports retry after a failure", async (t)
       onProgress(60);
       await copyFile(inputPath, outputPath);
     },
+    thumbnailImpl: async ({ inputPath, outputPath }) => copyFile(inputPath, outputPath),
     logger: { error() {} },
   });
   t.after(async () => processor.shutdown());

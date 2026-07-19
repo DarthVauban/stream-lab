@@ -18,6 +18,7 @@ function emptyState() {
     selectedBroadcastId: null,
     connectedAt: null,
     quota: null,
+    runtimeCache: null,
   };
 }
 
@@ -54,6 +55,9 @@ function normalizeState(value) {
       used: Math.max(0, Number(value.quota.used) || 0),
       updatedAt: typeof value.quota.updatedAt === "string" ? value.quota.updatedAt : null,
     };
+  }
+  if (value?.runtimeCache && typeof value.runtimeCache === "object") {
+    state.runtimeCache = structuredClone(value.runtimeCache);
   }
   return state;
 }
@@ -170,6 +174,12 @@ export class EncryptedYouTubeStore {
     });
   }
 
+  setRuntimeCache(runtimeCache) {
+    return this.mutate((state) => {
+      state.runtimeCache = runtimeCache ? structuredClone(runtimeCache) : null;
+    });
+  }
+
   clearConnection() {
     return this.mutate((state) => {
       const quota = state.quota;
@@ -193,27 +203,35 @@ function normalizeStat(value) {
 }
 
 export class YouTubeStatsStore {
-  constructor({ rootDir } = {}) {
+  constructor({ rootDir, repository = null } = {}) {
     if (!rootDir) throw new Error("Для статистики YouTube не вказано rootDir.");
     this.rootDir = rootDir;
     this.filePath = path.join(rootDir, "youtube-stats.json");
     this.tempPath = `${this.filePath}.tmp`;
+    this.repository = repository;
+    this.documentKey = "youtube-stats";
     this.items = [];
     this.persistQueue = Promise.resolve();
   }
 
   async init() {
     await mkdir(this.rootDir, { recursive: true });
-    try {
-      const parsed = JSON.parse(await readFile(this.filePath, "utf8"));
+    let parsed = await this.repository?.readDocument?.(this.documentKey);
+    if (!parsed) {
+      try {
+        parsed = JSON.parse(await readFile(this.filePath, "utf8"));
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        parsed = null;
+      }
+    }
+    if (parsed) {
       this.items = (Array.isArray(parsed?.items) ? parsed.items : [])
         .map(normalizeStat)
         .filter(Boolean)
         .slice(-MAX_STATS_SNAPSHOTS);
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      await this.persist();
     }
+    await this.persist();
   }
 
   async persist() {
@@ -221,6 +239,7 @@ export class YouTubeStatsStore {
     const operation = this.persistQueue.catch(() => {}).then(async () => {
       await writeFile(this.tempPath, payload, "utf8");
       await rename(this.tempPath, this.filePath);
+      await this.repository?.writeDocument?.(this.documentKey, JSON.parse(payload));
     });
     this.persistQueue = operation;
     await operation;

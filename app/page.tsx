@@ -36,6 +36,9 @@ type Video = {
     videoCodec: string | null;
     audioCodec: string | null;
   } | null;
+  compressionProfile: "ECONOMY" | "STANDARD" | "QUALITY";
+  fingerprint: string | null;
+  thumbnailUrl: string | null;
 };
 
 type StreamStatus = {
@@ -65,7 +68,28 @@ type StreamStatus = {
 type StreamSettings = {
   videoBitrateKbps: number;
   fallbackVideoId: string | null;
+  compressionProfile: "ECONOMY" | "STANDARD" | "QUALITY";
   updatedAt: string | null;
+};
+
+type CompressionProfile = {
+  id: "ECONOMY" | "STANDARD" | "QUALITY";
+  label: string;
+  description: string;
+  videoBitrate: string;
+  audioBitrate: string;
+  preset: string;
+};
+
+type StorageStatus = {
+  totalBytes: number;
+  freeBytes: number;
+  usedBytes: number;
+  percentUsed: number;
+  level: "OK" | "WARNING" | "CRITICAL";
+  warningPercent: number;
+  criticalPercent: number;
+  updatedAt: string;
 };
 
 type StreamPresetSummary = {
@@ -86,6 +110,9 @@ type Health = {
   ffmpeg: { available: boolean; version: string | null; message: string | null };
   processing: { activeVideoId: string | null; queued: number; lastError: string | null } | null;
   queue: { items: number };
+  database: { configured: boolean; connected: boolean };
+  realtime: { configured: boolean; connected: boolean };
+  storage: StorageStatus | null;
 };
 
 type QueueItem = {
@@ -103,11 +130,19 @@ type QueueState = {
   items: QueueItem[];
 };
 
+type Playlist = {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string | null;
+  items: QueueItem[];
+};
+
 type AuthSession =
   | { authenticated: false }
   | { authenticated: true; owner: string; csrfToken: string; expiresAt: string };
 
-type WorkspaceTab = "library" | "queue" | "stream" | "monitoring" | "youtube" | "profile";
+type WorkspaceTab = "library" | "playlists" | "queue" | "stream" | "monitoring" | "youtube" | "profile";
 type MonitoringRange = 1 | 24 | 168;
 type MonitoringHealthState = "STABLE" | "BUFFERING_RISK" | "CRITICAL" | "OFFLINE";
 
@@ -159,6 +194,16 @@ type MonitoringStatus = {
     severity: "info" | "success" | "warning" | "critical";
     message: string;
   }>;
+};
+
+type AuditEntry = {
+  id: string;
+  occurredAt: string;
+  actor: string;
+  action: string;
+  targetType: string;
+  targetId: string | null;
+  status: "SUCCESS" | "FAILED";
 };
 
 type YouTubeBroadcast = {
@@ -419,11 +464,18 @@ export default function Home() {
   const [loginError, setLoginError] = useState("");
   const [health, setHealth] = useState<Health | null>(null);
   const [videos, setVideos] = useState<Video[]>([]);
+  const [activeUploads, setActiveUploads] = useState<Video[]>([]);
   const [stream, setStream] = useState<StreamStatus>(emptyStream);
   const [queue, setQueue] = useState<QueueState>(emptyQueue);
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [selectedPlaylistId, setSelectedPlaylistId] = useState("");
+  const [playlistName, setPlaylistName] = useState("");
+  const [playlistAction, setPlaylistAction] = useState("");
   const [streamSettings, setStreamSettings] = useState<StreamSettings | null>(null);
   const [bitrateDraft, setBitrateDraft] = useState(8000);
   const [fallbackVideoDraft, setFallbackVideoDraft] = useState("");
+  const [compressionProfiles, setCompressionProfiles] = useState<CompressionProfile[]>([]);
+  const [compressionProfileDraft, setCompressionProfileDraft] = useState<CompressionProfile["id"]>("STANDARD");
   const [settingsAction, setSettingsAction] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -445,6 +497,7 @@ export default function Home() {
   const [youtube, setYoutube] = useState<YouTubeStatus | null>(null);
   const [youtubeAction, setYoutubeAction] = useState("");
   const [monitoring, setMonitoring] = useState<MonitoringStatus | null>(null);
+  const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [monitoringRange, setMonitoringRange] = useState<MonitoringRange>(24);
   const [telegram, setTelegram] = useState<TelegramStatus | null>(null);
   const [telegramToken, setTelegramToken] = useState("");
@@ -453,6 +506,7 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [failedChannelAvatarUrl, setFailedChannelAvatarUrl] = useState("");
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [now, setNow] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -460,17 +514,22 @@ export default function Home() {
 
   const refresh = useCallback(async () => {
     try {
-      const [healthResult, videosResult, streamResult, queueResult, youtubeResult] = await Promise.all([
+      const [healthResult, videosResult, uploadsResult, streamResult, queueResult, playlistsResult, youtubeResult] = await Promise.all([
         api<Health>("/api/health"),
         api<{ videos: Video[] }>("/api/videos"),
+        api<{ uploads: Video[] }>("/api/uploads"),
         api<{ stream: StreamStatus }>("/api/stream/status"),
         api<{ queue: QueueState }>("/api/queue"),
+        api<{ playlists: Playlist[] }>("/api/playlists"),
         api<{ youtube: YouTubeStatus }>("/api/youtube/status"),
       ]);
       setHealth(healthResult);
       setVideos(videosResult.videos);
+      setActiveUploads(uploadsResult.uploads);
       setStream(streamResult.stream);
       setQueue(queueResult.queue);
+      setPlaylists(playlistsResult.playlists);
+      setSelectedPlaylistId((current) => current || playlistsResult.playlists[0]?.id || "");
       setYoutube(youtubeResult.youtube);
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
@@ -484,8 +543,12 @@ export default function Home() {
 
   const refreshMonitoring = useCallback(async (hours: MonitoringRange) => {
     try {
-      const result = await api<{ monitoring: MonitoringStatus }>(`/api/monitoring/status?hours=${hours}`);
+      const [result, auditResult] = await Promise.all([
+        api<{ monitoring: MonitoringStatus }>(`/api/monitoring/status?hours=${hours}`),
+        api<{ entries: AuditEntry[] }>("/api/audit?limit=40"),
+      ]);
       setMonitoring(result.monitoring);
+      setAuditEntries(auditResult.entries);
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
         setAuthState("anonymous");
@@ -526,7 +589,7 @@ export default function Home() {
   useEffect(() => {
     if (authState !== "authenticated") return;
     const initialRefresh = window.setTimeout(refresh, 0);
-    const poll = window.setInterval(refresh, 2000);
+    const poll = window.setInterval(refresh, 30_000);
     const clock = window.setInterval(() => setNow(Date.now()), 1000);
     return () => {
       window.clearTimeout(initialRefresh);
@@ -561,13 +624,62 @@ export default function Home() {
 
   useEffect(() => {
     if (authState !== "authenticated") return;
+    let refreshTimer = 0;
+    let fallback: EventSource | null = null;
+    let closed = false;
+    const handleMessage = (data: string) => {
+      try {
+        const payload = JSON.parse(data) as { type?: string };
+        if (payload.type === "READY") return;
+        window.clearTimeout(refreshTimer);
+        refreshTimer = window.setTimeout(() => void refresh(), 150);
+      } catch {
+        // A periodic refresh remains as a fallback.
+      }
+    };
+    const startFallback = () => {
+      if (closed || fallback) return;
+      fallback = new EventSource("/api/realtime/stream");
+      fallback.onopen = () => setRealtimeConnected(true);
+      fallback.onerror = () => setRealtimeConnected(false);
+      fallback.onmessage = (event) => handleMessage(event.data);
+    };
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${window.location.host}/api/events`);
+    const fallbackTimer = window.setTimeout(() => {
+      if (socket.readyState !== WebSocket.OPEN) startFallback();
+    }, 1_500);
+    socket.onopen = () => {
+      window.clearTimeout(fallbackTimer);
+      fallback?.close();
+      fallback = null;
+      setRealtimeConnected(true);
+    };
+    socket.onmessage = (event) => handleMessage(String(event.data));
+    socket.onerror = () => startFallback();
+    socket.onclose = () => {
+      setRealtimeConnected(false);
+      startFallback();
+    };
+    return () => {
+      closed = true;
+      window.clearTimeout(refreshTimer);
+      window.clearTimeout(fallbackTimer);
+      socket.close();
+      fallback?.close();
+      setRealtimeConnected(false);
+    };
+  }, [authState, refresh]);
+
+  useEffect(() => {
+    if (authState !== "authenticated") return;
     const result = new URLSearchParams(window.location.search).get("youtube");
     if (!result) return;
     const notification = window.setTimeout(() => {
       setActiveTab("profile");
       setNotice(
         result === "connected"
-          ? { type: "success", text: "YouTube-канал підключено." }
+          ? { type: "success", text: "YouTube-канал підключено. Дані з’являться після ручної синхронізації." }
           : { type: "error", text: "Не вдалося підключити YouTube. Спробуйте ще раз." },
       );
     }, 0);
@@ -582,14 +694,17 @@ export default function Home() {
       api<{ settings: StreamSettings }>("/api/settings/stream"),
       api<{ presets: StreamPresetSummary[] }>("/api/stream-presets"),
       api<{ telegram: TelegramStatus }>("/api/telegram/status"),
+      api<{ profiles: CompressionProfile[] }>("/api/compression-profiles"),
     ])
-      .then(([{ settings }, { presets }, { telegram }]) => {
+      .then(([{ settings }, { presets }, { telegram }, { profiles }]) => {
         if (cancelled) return;
         setStreamSettings(settings);
         setBitrateDraft(settings.videoBitrateKbps);
         setFallbackVideoDraft(settings.fallbackVideoId ?? "");
+        setCompressionProfileDraft(settings.compressionProfile);
         setStreamPresets(presets);
         setTelegram(telegram);
+        setCompressionProfiles(profiles);
       })
       .catch((error) => {
         if (!cancelled) {
@@ -605,6 +720,7 @@ export default function Home() {
   }, [authState]);
 
   const active = ["LIVE", "STARTING", "DEGRADED", "RECONNECTING", "STOPPING"].includes(stream.status);
+  const selectedPlaylist = playlists.find((playlist) => playlist.id === selectedPlaylistId) || null;
   const currentQueueIndex = stream.queueItemId
     ? queue.items.findIndex((item) => item.id === stream.queueItemId)
     : stream.videoId
@@ -634,6 +750,7 @@ export default function Home() {
   );
   const pageMeta = {
     library: { eyebrow: "Медіатека", title: "Бібліотека відео", description: "Завантаження, підготовка та керування файлами." },
+    playlists: { eyebrow: "Колекції", title: "Плейлисти", description: "Збережені набори відео для швидкого формування черги." },
     queue: { eyebrow: "Плейлист", title: "Черга трансляції", description: "Порядок безперервного відтворення в ефірі." },
     stream: { eyebrow: "Трансляція", title: "Керування ефіром", description: "Профіль сигналу, RTMPS-підключення та запуск." },
     monitoring: { eyebrow: "Діагностика", title: "Моніторинг ефіру", description: "Якість сигналу, продуктивність і журнал подій." },
@@ -647,11 +764,134 @@ export default function Home() {
     description: string;
   }> = [
     { id: "library", icon: "▦", label: "Бібліотека", description: "Відеофайли" },
+    { id: "playlists", icon: "☷", label: "Плейлисти", description: "Збережені набори" },
     { id: "queue", icon: "≡", label: "Черга", description: "Порядок ефіру" },
     { id: "stream", icon: "▶", label: "Ефір", description: "Запуск і керування" },
     { id: "monitoring", icon: "⌁", label: "Моніторинг", description: "Якість сигналу" },
     { id: "youtube", icon: "YT", label: "YouTube", description: "Канал і аналітика" },
   ];
+
+  async function createPlaylist() {
+    if (!playlistName.trim() || playlistAction) return;
+    setPlaylistAction("create");
+    try {
+      const result = await api<{ playlists: Playlist[] }>("/api/playlists", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: playlistName.trim() }),
+      }, csrfToken);
+      setPlaylists(result.playlists);
+      const created = result.playlists.at(-1);
+      if (created) setSelectedPlaylistId(created.id);
+      setPlaylistName("");
+      setNotice({ type: "success", text: "Плейлист створено." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося створити плейлист." });
+    } finally {
+      setPlaylistAction("");
+    }
+  }
+
+  async function renamePlaylist() {
+    if (!selectedPlaylist || !playlistName.trim() || playlistAction) return;
+    setPlaylistAction("rename");
+    try {
+      const result = await api<{ playlists: Playlist[] }>(`/api/playlists/${selectedPlaylist.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: playlistName.trim() }),
+      }, csrfToken);
+      setPlaylists(result.playlists);
+      setPlaylistName("");
+      setNotice({ type: "success", text: "Назву плейлиста оновлено." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося перейменувати плейлист." });
+    } finally {
+      setPlaylistAction("");
+    }
+  }
+
+  async function deletePlaylist() {
+    if (!selectedPlaylist || playlistAction || !window.confirm(`Видалити плейлист «${selectedPlaylist.name}»?`)) return;
+    setPlaylistAction("delete");
+    try {
+      const result = await api<{ playlists: Playlist[] }>(`/api/playlists/${selectedPlaylist.id}`, { method: "DELETE" }, csrfToken);
+      setPlaylists(result.playlists);
+      setSelectedPlaylistId(result.playlists[0]?.id || "");
+      setNotice({ type: "success", text: "Плейлист видалено. Відеофайли залишилися в бібліотеці." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося видалити плейлист." });
+    } finally {
+      setPlaylistAction("");
+    }
+  }
+
+  async function addVideoToPlaylist(videoId: string) {
+    if (!selectedPlaylist || playlistAction) return;
+    setPlaylistAction(`add:${videoId}`);
+    try {
+      const result = await api<{ playlists: Playlist[] }>(`/api/playlists/${selectedPlaylist.id}/items`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoId }),
+      }, csrfToken);
+      setPlaylists(result.playlists);
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося додати відео." });
+    } finally {
+      setPlaylistAction("");
+    }
+  }
+
+  async function removePlaylistItem(itemId: string) {
+    if (!selectedPlaylist || playlistAction) return;
+    setPlaylistAction(`remove:${itemId}`);
+    try {
+      const result = await api<{ playlists: Playlist[] }>(`/api/playlists/${selectedPlaylist.id}/items/${itemId}`, { method: "DELETE" }, csrfToken);
+      setPlaylists(result.playlists);
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося прибрати відео." });
+    } finally {
+      setPlaylistAction("");
+    }
+  }
+
+  async function movePlaylistItem(itemId: string, direction: -1 | 1) {
+    if (!selectedPlaylist || playlistAction) return;
+    const ids = selectedPlaylist.items.map((item) => item.id);
+    const index = ids.indexOf(itemId);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= ids.length) return;
+    [ids[index], ids[target]] = [ids[target], ids[index]];
+    setPlaylistAction("reorder");
+    try {
+      const result = await api<{ playlists: Playlist[] }>(`/api/playlists/${selectedPlaylist.id}/reorder`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ itemIds: ids }),
+      }, csrfToken);
+      setPlaylists(result.playlists);
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося змінити порядок." });
+    } finally {
+      setPlaylistAction("");
+    }
+  }
+
+  async function loadPlaylist() {
+    if (!selectedPlaylist || playlistAction || active) return;
+    setPlaylistAction("load");
+    try {
+      const result = await api<{ queue: QueueState }>(`/api/playlists/${selectedPlaylist.id}/load`, { method: "POST" }, csrfToken);
+      setQueue(result.queue);
+      setActiveTab("queue");
+      setNotice({ type: "success", text: `Плейлист «${selectedPlaylist.name}» завантажено в чергу.` });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося завантажити плейлист." });
+    } finally {
+      setPlaylistAction("");
+    }
+  }
 
   async function login(event: FormEvent) {
     event.preventDefault();
@@ -684,11 +924,17 @@ export default function Home() {
       setOwner("");
       setCsrfToken("");
       setVideos([]);
+      setActiveUploads([]);
       setStream(emptyStream);
       setQueue(emptyQueue);
+      setPlaylists([]);
+      setSelectedPlaylistId("");
+      setPlaylistName("");
       setStreamSettings(null);
       setBitrateDraft(8000);
       setFallbackVideoDraft("");
+      setCompressionProfileDraft("STANDARD");
+      setCompressionProfiles([]);
       setStreamPresets([]);
       setSelectedPresetId("");
       setPresetName("");
@@ -697,6 +943,7 @@ export default function Home() {
       setYoutube(null);
       setYoutubeAction("");
       setMonitoring(null);
+      setAuditEntries([]);
       setMonitoringRange(24);
       setTelegram(null);
       setTelegramToken("");
@@ -704,6 +951,7 @@ export default function Home() {
       setTelegramAction("");
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
+      setRealtimeConnected(false);
     }
   }
 
@@ -779,10 +1027,13 @@ export default function Home() {
           name: selectedFile.name,
           size: selectedFile.size,
           mimeType: selectedFile.type,
+          fingerprint: `${selectedFile.name}:${selectedFile.size}:${selectedFile.lastModified}`,
+          compressionProfile: compressionProfileDraft,
         }),
       }, csrfToken);
 
       let offset = created.upload.uploadedBytes;
+      setUploadProgress(Math.round((offset / selectedFile.size) * 100));
       while (offset < selectedFile.size) {
         const chunk = selectedFile.slice(offset, Math.min(offset + CHUNK_SIZE, selectedFile.size));
         const result = await api<{ upload: Video }>(
@@ -816,6 +1067,17 @@ export default function Home() {
       });
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function cancelInterruptedUpload(upload: Video) {
+    if (uploading || !window.confirm(`Скасувати завантаження «${upload.name}» і видалити отримані дані?`)) return;
+    try {
+      const result = await api<{ uploads: Video[] }>(`/api/uploads/${upload.id}`, { method: "DELETE" }, csrfToken);
+      setActiveUploads(result.uploads);
+      setNotice({ type: "success", text: "Незавершене завантаження видалено із сервера." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося скасувати завантаження." });
     }
   }
 
@@ -1126,11 +1388,13 @@ export default function Home() {
         body: JSON.stringify({
           videoBitrateKbps: bitrateDraft,
           fallbackVideoId: fallbackVideoDraft || null,
+          compressionProfile: compressionProfileDraft,
         }),
       }, csrfToken);
       setStreamSettings(result.settings);
       setBitrateDraft(result.settings.videoBitrateKbps);
       setFallbackVideoDraft(result.settings.fallbackVideoId ?? "");
+      setCompressionProfileDraft(result.settings.compressionProfile);
       if (showNotice) {
         setNotice({ type: "success", text: "Профіль ефіру збережено для наступного запуску." });
       }
@@ -1154,7 +1418,8 @@ export default function Home() {
     try {
       if (
         streamSettings?.videoBitrateKbps !== bitrateDraft ||
-        (streamSettings?.fallbackVideoId ?? "") !== fallbackVideoDraft
+        (streamSettings?.fallbackVideoId ?? "") !== fallbackVideoDraft ||
+        streamSettings?.compressionProfile !== compressionProfileDraft
       ) {
         const saved = await saveStreamSettings(false);
         if (!saved) return;
@@ -1333,7 +1598,7 @@ export default function Home() {
       );
       setYoutube(result.youtube);
       setFailedChannelAvatarUrl("");
-      setNotice({ type: "success", text: "Дані YouTube оновлено." });
+      setNotice({ type: "success", text: "Дані YouTube синхронізовано вручну." });
     } catch (error) {
       setNotice({
         type: "error",
@@ -1359,7 +1624,7 @@ export default function Home() {
         csrfToken,
       );
       setYoutube(result.youtube);
-      setNotice({ type: "success", text: "Активну трансляцію YouTube змінено." });
+      setNotice({ type: "success", text: "Трансляцію вибрано. Натисніть «Синхронізувати», щоб отримати її сигнал і статистику." });
     } catch (error) {
       setNotice({
         type: "error",
@@ -1493,6 +1758,7 @@ export default function Home() {
               <span className="sidebar-nav-icon" aria-hidden="true">{item.icon}</span>
               <span className="sidebar-nav-copy"><strong>{item.label}</strong><small>{item.description}</small></span>
               {item.id === "library" && <span className="sidebar-nav-value">{videos.length}</span>}
+              {item.id === "playlists" && <span className="sidebar-nav-value">{playlists.length}</span>}
               {item.id === "queue" && <span className="sidebar-nav-value">{queue.items.length}</span>}
               {item.id === "stream" && <span className={`sidebar-state-dot sidebar-state-dot--${stream.status.toLowerCase()}`} aria-hidden="true" />}
               {item.id === "monitoring" && <span className={`sidebar-state-dot sidebar-state-dot--${(monitoring?.status || "OFFLINE").toLowerCase()}`} aria-hidden="true" />}
@@ -1530,6 +1796,9 @@ export default function Home() {
               {statusLabel(stream.status)}
             </div>
             <div className="page-stat"><span>Відео</span><strong>{videos.length}</strong></div>
+            <div className={`page-stat realtime-state ${realtimeConnected ? "realtime-state--online" : ""}`}>
+              <span>Синхронізація</span><strong>{realtimeConnected ? "онлайн" : "резервна"}</strong>
+            </div>
             <div className="page-stat"><span>Uptime</span><strong>{formatDuration(stream.startedAt, now)}</strong></div>
           </div>
         </header>
@@ -1556,6 +1825,16 @@ export default function Home() {
         </div>
       )}
 
+      {health?.storage && health.storage.level !== "OK" && (
+        <div className={`system-banner system-banner--${health.storage.level === "CRITICAL" ? "error" : "warning"}`} role="alert">
+          <span aria-hidden="true">!</span>
+          <div>
+            <strong>Диск заповнений на {health.storage.percentUsed}%</strong>
+            <p>Вільно {humanSize(health.storage.freeBytes)} з {humanSize(health.storage.totalBytes)}. Видаліть непотрібні відео до наступного завантаження.</p>
+          </div>
+        </div>
+      )}
+
       {notice && (
         <div className={`notice notice--${notice.type}`} role="status">
           {notice.text}
@@ -1573,6 +1852,20 @@ export default function Home() {
             </div>
             <span className="panel-kicker">до 50 ГБ</span>
           </div>
+
+          <label className="field compression-profile-field">
+            <span>Профіль підготовки</span>
+            <select
+              value={compressionProfileDraft}
+              onChange={(event) => setCompressionProfileDraft(event.target.value as CompressionProfile["id"])}
+              disabled={uploading}
+            >
+              {compressionProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>{profile.label} · {profile.videoBitrate}</option>
+              ))}
+            </select>
+            <small>{compressionProfiles.find((profile) => profile.id === compressionProfileDraft)?.description || "Профіль застосовується до нових завантажень."}</small>
+          </label>
 
           <label
             className={`dropzone ${selectedFile ? "dropzone--selected" : ""} ${dragActive ? "dropzone--dragging" : ""}`}
@@ -1620,6 +1913,19 @@ export default function Home() {
             </div>
           )}
 
+          {activeUploads.length > 0 && !uploading && (
+            <div className="interrupted-uploads" role="status">
+              <strong>Незавершені завантаження</strong>
+              {activeUploads.map((upload) => (
+                <div key={upload.id}>
+                  <span><b>{upload.name}</b><small>{Math.round((upload.uploadedBytes / upload.size) * 100)}% · {humanSize(upload.uploadedBytes)} з {humanSize(upload.size)}</small></span>
+                  <span>Оберіть цей самий файл, щоб продовжити</span>
+                  <button type="button" onClick={() => cancelInterruptedUpload(upload)}>Скасувати</button>
+                </div>
+              ))}
+            </div>
+          )}
+
           <button
             className="button button--secondary button--full"
             type="button"
@@ -1646,8 +1952,11 @@ export default function Home() {
                     key={video.id}
                   >
                     <div className="video-row-main">
-                      <span className="video-thumb" aria-hidden="true">
-                        {video.status === "FAILED" ? "!" : ready ? "▶" : "…"}
+                      <span className={`video-thumb ${video.thumbnailUrl ? "video-thumb--image" : ""}`} aria-hidden="true">
+                        {video.thumbnailUrl ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={video.thumbnailUrl} alt="" loading="lazy" />
+                        ) : video.status === "FAILED" ? "!" : ready ? "▶" : "…"}
                       </span>
                       <span className="video-copy">
                         <strong>{video.name}</strong>
@@ -1833,6 +2142,20 @@ export default function Home() {
               <small>Вмикається, якщо черга порожня або поточний файл не відтворюється.</small>
             </label>
 
+            <label className="field">
+              <span>Профіль підготовки нових відео</span>
+              <select
+                value={compressionProfileDraft}
+                onChange={(event) => setCompressionProfileDraft(event.target.value as CompressionProfile["id"])}
+                disabled={active || settingsAction}
+              >
+                {compressionProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>{profile.label} · {profile.videoBitrate} / {profile.audioBitrate}</option>
+                ))}
+              </select>
+              <small>Зміна не перекодовує вже готові файли й застосовується до наступних завантажень.</small>
+            </label>
+
             <div className="bitrate-control">
               <label className="field" htmlFor="video-bitrate">
                 <span>Відеобітрейт</span>
@@ -1863,7 +2186,8 @@ export default function Home() {
                   bitrateDraft > 12000 ||
                   (
                     streamSettings?.videoBitrateKbps === bitrateDraft &&
-                    (streamSettings?.fallbackVideoId ?? "") === fallbackVideoDraft
+                    (streamSettings?.fallbackVideoId ?? "") === fallbackVideoDraft &&
+                    streamSettings?.compressionProfile === compressionProfileDraft
                   )
                 }
               >
@@ -2100,6 +2424,26 @@ export default function Home() {
                   <div className="monitoring-events-empty">Подій ще немає. Тут з’являться запуск, зупинка, відновлення та зміни відео.</div>
                 )}
               </div>
+
+              <div className="monitoring-events audit-events">
+                <div className="monitoring-events-heading">
+                  <div><span>Аудит дій</span><strong>Зміни власника та API</strong></div>
+                  <span>{auditEntries.length}</span>
+                </div>
+                {auditEntries.length ? (
+                  <div className="monitoring-event-list">
+                    {auditEntries.map((entry) => (
+                      <div className={`monitoring-event monitoring-event--${entry.status === "SUCCESS" ? "success" : "critical"}`} key={entry.id}>
+                        <span className="monitoring-event-dot" aria-hidden="true" />
+                        <p><b>{entry.action}</b> · {entry.actor}</p>
+                        <time dateTime={entry.occurredAt}>{formatEventTime(entry.occurredAt)}</time>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="monitoring-events-empty">Журнал заповниться після першої зміни налаштувань або контенту.</div>
+                )}
+              </div>
             </div>
           )}
         </section>
@@ -2162,14 +2506,19 @@ export default function Home() {
                   </span>
                   <div>
                     <span>Підключений канал</span>
-                    <strong>{youtube.channel?.title || "Завантажуємо канал…"}</strong>
+                    <strong>{youtube.channel?.title || "Очікує синхронізації"}</strong>
                   </div>
                 </div>
                 <div className="youtube-toolbar-actions">
                   <button type="button" onClick={refreshYouTube} disabled={Boolean(youtubeAction)}>
-                    {youtubeAction === "refresh" ? "Оновлюємо…" : "Оновити"}
+                    {youtubeAction === "refresh" ? "Синхронізуємо…" : "Синхронізувати з YouTube"}
                   </button>
                 </div>
+              </div>
+
+              <div className="youtube-manual-sync" role="note">
+                Автоматичні запити вимкнено. Канал, ефіри, сигнал і статистика оновлюються лише цією кнопкою, щоб берегти API-квоту.
+                {youtube.lastUpdatedAt && <span> Остання синхронізація: {new Date(youtube.lastUpdatedAt).toLocaleString("uk-UA")}.</span>}
               </div>
 
               <div className="youtube-broadcast-row">
@@ -2252,7 +2601,7 @@ export default function Home() {
                   <div className="youtube-quota-track" aria-hidden="true">
                     <span style={{ width: `${Math.min(100, (youtube.quota.used / youtube.quota.limit) * 100)}%` }} />
                   </div>
-                  <p>Опитування розподілені так, щоб стандартної денної квоти вистачало на безперервну роботу.</p>
+                  <p>Квота витрачається лише під час ручної синхронізації та OAuth-операцій.</p>
                 </div>
               </div>
 
@@ -2406,6 +2755,95 @@ export default function Home() {
               </form>
             </article>
           </div>
+        </section>
+        )}
+
+        {activeTab === "playlists" && (
+        <section id="workspace-playlists" className="panel playlists-panel" aria-labelledby="playlists-title">
+          <div className="panel-heading">
+            <div>
+              <span className="section-icon" aria-hidden="true">☷</span>
+              <h2 id="playlists-title">Збережені плейлисти</h2>
+            </div>
+            <span className="panel-kicker">{playlists.length}</span>
+          </div>
+
+          <div className="playlist-manager">
+            <label className="field">
+              <span>Активний плейлист</span>
+              <select
+                value={selectedPlaylistId}
+                onChange={(event) => {
+                  setSelectedPlaylistId(event.target.value);
+                  setPlaylistName("");
+                }}
+                disabled={Boolean(playlistAction) || playlists.length === 0}
+              >
+                {playlists.length === 0 && <option value="">Плейлистів ще немає</option>}
+                {playlists.map((playlist) => (
+                  <option key={playlist.id} value={playlist.id}>{playlist.name} · {playlist.items.length}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field playlist-name-field">
+              <span>Назва</span>
+              <input
+                value={playlistName}
+                onChange={(event) => setPlaylistName(event.target.value)}
+                placeholder={selectedPlaylist ? selectedPlaylist.name : "Наприклад, Нічний ефір"}
+                maxLength={120}
+                disabled={Boolean(playlistAction)}
+              />
+            </label>
+            <div className="playlist-manager-actions">
+              <button className="button button--primary" type="button" onClick={createPlaylist} disabled={!playlistName.trim() || Boolean(playlistAction)}>Створити</button>
+              <button className="button button--quiet" type="button" onClick={renamePlaylist} disabled={!selectedPlaylist || !playlistName.trim() || Boolean(playlistAction)}>Перейменувати</button>
+              <button className="button button--danger" type="button" onClick={deletePlaylist} disabled={!selectedPlaylist || Boolean(playlistAction)}>Видалити</button>
+            </div>
+          </div>
+
+          {selectedPlaylist ? (
+            <div className="playlist-workspace">
+              <div className="playlist-column">
+                <div className="video-list-heading"><h3>{selectedPlaylist.name}</h3><span>{selectedPlaylist.items.length}</span></div>
+                {selectedPlaylist.items.length === 0 ? (
+                  <div className="empty-state">Додайте готові відео з колонки бібліотеки.</div>
+                ) : (
+                  <div className="playlist-item-list">
+                    {selectedPlaylist.items.map((item, index) => (
+                      <div className="playlist-item" key={item.id}>
+                        <span>{String(index + 1).padStart(2, "0")}</span>
+                        <div><strong>{item.video?.name || "Відео недоступне"}</strong><small>{item.video ? videoMeta(item.video) : "Файл видалено"}</small></div>
+                        <div>
+                          <button type="button" onClick={() => movePlaylistItem(item.id, -1)} disabled={index === 0 || Boolean(playlistAction)} aria-label="Перемістити вище">↑</button>
+                          <button type="button" onClick={() => movePlaylistItem(item.id, 1)} disabled={index === selectedPlaylist.items.length - 1 || Boolean(playlistAction)} aria-label="Перемістити нижче">↓</button>
+                          <button type="button" onClick={() => removePlaylistItem(item.id)} disabled={Boolean(playlistAction)}>Прибрати</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <button className="button button--secondary button--full" type="button" onClick={loadPlaylist} disabled={active || selectedPlaylist.items.length === 0 || Boolean(playlistAction)}>
+                  {active ? "Зупиніть ефір, щоб замінити чергу" : playlistAction === "load" ? "Завантажуємо…" : "Завантажити плейлист у чергу"}
+                </button>
+              </div>
+              <div className="playlist-column playlist-library-column">
+                <div className="video-list-heading"><h3>Готові відео</h3><span>{videos.filter((video) => video.status === "READY").length}</span></div>
+                <div className="playlist-library-list">
+                  {videos.filter((video) => video.status === "READY").map((video) => (
+                    <div className="playlist-library-item" key={video.id}>
+                      <div><strong>{video.name}</strong><small>{videoMeta(video)}</small></div>
+                      <button type="button" onClick={() => addVideoToPlaylist(video.id)} disabled={Boolean(playlistAction)}>
+                        {playlistAction === `add:${video.id}` ? "Додаємо…" : "+ Додати"}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="empty-state">Створіть перший плейлист, щоб зберігати набори відео.</div>
+          )}
         </section>
         )}
 

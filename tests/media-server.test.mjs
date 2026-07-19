@@ -169,6 +169,7 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
       await copyFile(inputPath, outputPath);
       onProgress(100);
     },
+    thumbnailImpl: async ({ inputPath, outputPath }) => copyFile(inputPath, outputPath),
   });
   const app = await createMvpServer({
     dataDir,

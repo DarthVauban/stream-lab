@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { normalizeCompressionProfile } from "./compression-profiles.mjs";
 import { normalizeVideoBitrateKbps } from "./stream-controller.mjs";
 
 function parseEnvironmentBitrate(value) {
@@ -11,14 +12,21 @@ function parseEnvironmentBitrate(value) {
 }
 
 export class SettingsStore {
-  constructor({ rootDir, defaultVideoBitrate = process.env.MVP_VIDEO_BITRATE || "8M" } = {}) {
+  constructor({
+    rootDir,
+    defaultVideoBitrate = process.env.MVP_VIDEO_BITRATE || "8M",
+    repository = null,
+  } = {}) {
     if (!rootDir) throw new Error("Для налаштувань не вказано rootDir.");
     this.rootDir = rootDir;
     this.filePath = path.join(rootDir, "settings.json");
     this.tempPath = `${this.filePath}.tmp`;
+    this.repository = repository;
+    this.documentKey = "settings";
     this.state = {
       videoBitrateKbps: normalizeVideoBitrateKbps(parseEnvironmentBitrate(defaultVideoBitrate)),
       fallbackVideoId: null,
+      compressionProfile: normalizeCompressionProfile(process.env.MEDIA_COMPRESSION_PROFILE),
       updatedAt: null,
     };
     this.persistQueue = Promise.resolve();
@@ -26,8 +34,16 @@ export class SettingsStore {
 
   async init() {
     await mkdir(this.rootDir, { recursive: true });
-    try {
-      const parsed = JSON.parse(await readFile(this.filePath, "utf8"));
+    let parsed = await this.repository?.readDocument?.(this.documentKey);
+    if (!parsed) {
+      try {
+        parsed = JSON.parse(await readFile(this.filePath, "utf8"));
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        parsed = null;
+      }
+    }
+    if (parsed) {
       this.state = {
         videoBitrateKbps: normalizeVideoBitrateKbps(
           parsed?.videoBitrateKbps,
@@ -37,12 +53,14 @@ export class SettingsStore {
           typeof parsed?.fallbackVideoId === "string" && parsed.fallbackVideoId
             ? parsed.fallbackVideoId
             : null,
+        compressionProfile: normalizeCompressionProfile(
+          parsed?.compressionProfile,
+          this.state.compressionProfile,
+        ),
         updatedAt: typeof parsed?.updatedAt === "string" ? parsed.updatedAt : null,
       };
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      await this.persist();
     }
+    await this.persist();
     return this.snapshot();
   }
 
@@ -55,6 +73,10 @@ export class SettingsStore {
     const operation = this.persistQueue.catch(() => {}).then(async () => {
       await writeFile(this.tempPath, payload, "utf8");
       await rename(this.tempPath, this.filePath);
+      await this.repository?.writeDocument?.(this.documentKey, {
+        schemaVersion: 2,
+        ...this.state,
+      });
     });
     this.persistQueue = operation;
     await operation;
@@ -63,6 +85,7 @@ export class SettingsStore {
   async updateStream({
     videoBitrateKbps = this.state.videoBitrateKbps,
     fallbackVideoId = this.state.fallbackVideoId,
+    compressionProfile = this.state.compressionProfile,
   }) {
     const bitrate = Number(videoBitrateKbps);
     if (!Number.isInteger(bitrate)) {
@@ -74,6 +97,10 @@ export class SettingsStore {
     const normalizedBitrate = normalizeVideoBitrateKbps(bitrate);
     this.state.videoBitrateKbps = normalizedBitrate;
     this.state.fallbackVideoId = fallbackVideoId;
+    this.state.compressionProfile = normalizeCompressionProfile(
+      compressionProfile,
+      this.state.compressionProfile,
+    );
     this.state.updatedAt = new Date().toISOString();
     await this.persist();
     return this.snapshot();

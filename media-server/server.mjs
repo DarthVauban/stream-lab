@@ -1,13 +1,21 @@
 import { createServer } from "node:http";
+import { createReadStream } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { WebSocketServer } from "ws";
 import { ApiError } from "./api-error.mjs";
+import { AuditStore } from "./audit-store.mjs";
 import { createOwnerAuth } from "./auth.mjs";
+import { listCompressionProfiles } from "./compression-profiles.mjs";
+import { PostgresDatabase } from "./database.mjs";
 import { MediaProcessor } from "./media-processor.mjs";
 import { MonitoringService } from "./monitoring-service.mjs";
 import { MonitoringStore } from "./monitoring-store.mjs";
+import { PlaylistStore } from "./playlist-store.mjs";
 import { QueueStore } from "./queue-store.mjs";
+import { RealtimeHub } from "./realtime-hub.mjs";
 import { SettingsStore } from "./settings-store.mjs";
+import { StorageMonitor } from "./storage-monitor.mjs";
 import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
 import { EncryptedStreamPresetStore } from "./stream-preset-store.mjs";
@@ -87,6 +95,17 @@ function setCommonHeaders(request, response, allowedOrigins) {
   response.setHeader("X-Frame-Options", "DENY");
 }
 
+function mutationMetadata(method, pathname) {
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(method || "")) return null;
+  if (/^\/api\/uploads\/[^/]+\/chunks$/.test(pathname)) return null;
+  const segments = pathname.split("/").filter(Boolean);
+  return {
+    action: `${method} ${pathname.replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, ":id")}`,
+    targetType: segments[1] || "system",
+    targetId: segments.find((segment) => /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(segment)) || null,
+  };
+}
+
 export function normalizeServerError(error) {
   if (error instanceof ApiError) return error;
   if (["EACCES", "EPERM", "EROFS"].includes(error?.code)) {
@@ -119,10 +138,23 @@ export async function createMvpServer({
   youtube,
   monitoring,
   telegram,
+  database,
+  realtime,
+  audit,
+  playlists,
+  storage,
 } = {}) {
-  const videoStore = store ?? new VideoStore({ rootDir: dataDir });
-  const liveQueue = queue ?? new QueueStore({ rootDir: dataDir });
-  const settingsStore = settings ?? new SettingsStore({ rootDir: dataDir });
+  const databaseService = database ?? new PostgresDatabase();
+  await databaseService.init?.();
+  const stateRepository = databaseService?.configured ? databaseService : null;
+  const realtimeHub = realtime ?? new RealtimeHub();
+  await realtimeHub.init?.();
+  const auditStore = audit ?? new AuditStore({ rootDir: dataDir, database: databaseService });
+  await auditStore.init?.();
+  const videoStore = store ?? new VideoStore({ rootDir: dataDir, repository: stateRepository });
+  const liveQueue = queue ?? new QueueStore({ rootDir: dataDir, repository: stateRepository });
+  const settingsStore = settings ?? new SettingsStore({ rootDir: dataDir, repository: stateRepository });
+  const playlistStore = playlists ?? new PlaylistStore({ rootDir: dataDir, repository: stateRepository });
   const streamPresetStore =
     presets ??
     new EncryptedStreamPresetStore({
@@ -132,6 +164,7 @@ export async function createMvpServer({
   await videoStore.init();
   await liveQueue.init();
   await settingsStore.init();
+  await playlistStore.init();
   await streamPresetStore.init();
   const encryptedStateStore =
     stateStore ??
@@ -159,6 +192,19 @@ export async function createMvpServer({
       audioBitrate: process.env.MVP_AUDIO_BITRATE || "192k",
       preset: process.env.MEDIA_TRANSCODE_PRESET || "veryfast",
       keepOriginalUploads: process.env.MEDIA_KEEP_ORIGINAL_UPLOADS === "true",
+      onEvent: async (type, payload) => {
+        await Promise.all([
+          realtimeHub.publish(type, payload),
+          auditStore.append({
+            actor: "system",
+            action: type,
+            targetType: "videos",
+            targetId: payload?.videoId || null,
+            status: type.endsWith("FAILED") ? "FAILED" : "SUCCESS",
+            details: payload,
+          }),
+        ]);
+      },
     });
   const corsOrigins = allowedOrigins.length ? allowedOrigins : DEFAULT_ALLOWED_ORIGINS;
   const ownerAuth = auth ?? createOwnerAuth();
@@ -173,7 +219,7 @@ export async function createMvpServer({
       youtubeConfigured
         ? {
             store: new EncryptedYouTubeStore({ rootDir: dataDir }),
-            statsStore: new YouTubeStatsStore({ rootDir: dataDir }),
+            statsStore: new YouTubeStatsStore({ rootDir: dataDir, repository: stateRepository }),
           }
         : {},
     );
@@ -206,10 +252,14 @@ export async function createMvpServer({
     new MonitoringService({
       controller: streamController,
       youtube: youtubeIntegration,
-      store: new MonitoringStore({ rootDir: dataDir }),
+      store: new MonitoringStore({ rootDir: dataDir, repository: stateRepository }),
     });
   await monitoringService.init?.();
   monitoringService.start?.();
+  const storageMonitor = storage ?? new StorageMonitor({ path: dataDir });
+  await storageMonitor.snapshot().catch((error) => {
+    console.error("StreamLab storage status failed.", error);
+  });
   const captureMonitoring = async () => {
     try {
       await monitoringService.capture?.();
@@ -229,9 +279,19 @@ export async function createMvpServer({
     };
   };
 
+  const playlistsSnapshot = () =>
+    playlistStore.list().map((playlist) => ({
+      ...playlist,
+      items: playlist.items.map((item) => ({
+        ...item,
+        video: videoStore.getVideo(item.videoId),
+      })),
+    }));
+
   let streamStartInProgress = false;
   const deletingVideoIds = new Set();
   const streamEventClients = new Set();
+  const realtimeEventClients = new Set();
   const streamIsActive = () =>
     streamStartInProgress ||
     streamController.isActive?.() ||
@@ -248,14 +308,40 @@ export async function createMvpServer({
     }
 
     const url = new URL(request.url ?? "/", "http://localhost");
+    const mutation = mutationMetadata(request.method, url.pathname);
+    if (mutation) {
+      response.once("finish", () => {
+        const status = response.statusCode < 400 ? "SUCCESS" : "FAILED";
+        void auditStore.append({
+          ...mutation,
+          status,
+          details: { method: request.method, pathname: url.pathname, statusCode: response.statusCode },
+        }).catch((error) => console.error("StreamLab audit write failed.", error));
+        if (status === "SUCCESS") {
+          void realtimeHub.publish("STATE_CHANGED", {
+            resource: mutation.targetType,
+            action: mutation.action,
+            targetId: mutation.targetId,
+          }).catch((error) => console.error("StreamLab event publish failed.", error));
+        }
+      });
+    }
     try {
       if (request.method === "GET" && url.pathname === "/api/health") {
+        const [databaseHealth, realtimeHealth, storageStatus] = await Promise.all([
+          databaseService.health?.().catch(() => ({ configured: databaseService.configured, connected: false })),
+          realtimeHub.health?.().catch(() => realtimeHub.snapshot()),
+          storageMonitor.snapshot().catch(() => storageMonitor.last),
+        ]);
         json(response, 200, {
           ok: true,
           service: "streamlab-media",
           ffmpeg: streamController.checkFfmpeg(),
           processing: mediaProcessor.snapshot?.() ?? null,
           queue: { items: liveQueue.snapshot().items.length },
+          database: databaseHealth,
+          realtime: realtimeHealth,
+          storage: storageStatus,
         });
         return;
       }
@@ -297,8 +383,16 @@ export async function createMvpServer({
             state: url.searchParams.get("state"),
             error: url.searchParams.get("error"),
           });
+          await auditStore.append({ action: "YOUTUBE_OAUTH_CONNECTED", targetType: "youtube" });
+          await realtimeHub.publish("STATE_CHANGED", { resource: "youtube", action: "YOUTUBE_OAUTH_CONNECTED" });
           redirect(response, "/?youtube=connected");
         } catch (error) {
+          await auditStore.append({
+            action: "YOUTUBE_OAUTH_CONNECTED",
+            targetType: "youtube",
+            status: "FAILED",
+            details: { code: error?.code || "UNKNOWN" },
+          }).catch(() => {});
           if (!(error instanceof ApiError)) console.error(error);
           redirect(response, "/?youtube=error");
         }
@@ -331,8 +425,65 @@ export async function createMvpServer({
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/api/realtime/stream") {
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          Connection: "keep-alive",
+          "Cache-Control": "no-cache, no-transform",
+          "X-Accel-Buffering": "no",
+        });
+        response.write(`data: ${JSON.stringify({ type: "READY", occurredAt: new Date().toISOString() })}\n\n`);
+        const unsubscribe = realtimeHub.subscribe((event) => {
+          response.write(`data: ${JSON.stringify(event)}\n\n`);
+        });
+        const keepAlive = setInterval(() => response.write(": keepalive\n\n"), 20_000);
+        keepAlive.unref?.();
+        realtimeEventClients.add(response);
+        request.once("close", () => {
+          clearInterval(keepAlive);
+          unsubscribe();
+          realtimeEventClients.delete(response);
+        });
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/api/videos") {
         json(response, 200, { videos: videoStore.listVideos() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/uploads") {
+        json(response, 200, { uploads: videoStore.listActiveUploads() });
+        return;
+      }
+
+      const activeUploadMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)$/);
+      if (request.method === "DELETE" && activeUploadMatch) {
+        const upload = await videoStore.cancelUpload(activeUploadMatch[1]);
+        json(response, 200, { upload, uploads: videoStore.listActiveUploads() });
+        return;
+      }
+
+      const thumbnailMatch = url.pathname.match(/^\/api\/videos\/([^/]+)\/thumbnail$/);
+      if (request.method === "GET" && thumbnailMatch) {
+        response.setHeader("Content-Type", "image/jpeg");
+        response.setHeader("Cache-Control", "private, max-age=3600");
+        createReadStream(videoStore.getThumbnailPath(thumbnailMatch[1])).pipe(response);
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/storage/status") {
+        json(response, 200, { storage: await storageMonitor.snapshot() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/compression-profiles") {
+        json(response, 200, { profiles: listCompressionProfiles() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/audit") {
+        json(response, 200, { entries: await auditStore.list({ limit: url.searchParams.get("limit") }) });
         return;
       }
 
@@ -514,6 +665,7 @@ export async function createMvpServer({
             );
           }
           await liveQueue.removeVideo(videoId);
+          await playlistStore.removeVideo(videoId);
           if (settingsStore.snapshot().fallbackVideoId === videoId) {
             await settingsStore.updateStream({ fallbackVideoId: null });
           }
@@ -526,6 +678,67 @@ export async function createMvpServer({
       }
 
       if (request.method === "GET" && url.pathname === "/api/queue") {
+        json(response, 200, { queue: queueSnapshot() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/playlists") {
+        json(response, 200, { playlists: playlistsSnapshot() });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/playlists") {
+        const body = await readJson(request);
+        await playlistStore.create(body.name);
+        json(response, 201, { playlists: playlistsSnapshot() });
+        return;
+      }
+
+      const playlistMatch = url.pathname.match(/^\/api\/playlists\/([^/]+)$/);
+      if (request.method === "PATCH" && playlistMatch) {
+        const body = await readJson(request);
+        await playlistStore.rename(playlistMatch[1], body.name);
+        json(response, 200, { playlists: playlistsSnapshot() });
+        return;
+      }
+      if (request.method === "DELETE" && playlistMatch) {
+        await playlistStore.remove(playlistMatch[1]);
+        json(response, 200, { playlists: playlistsSnapshot() });
+        return;
+      }
+
+      const playlistItemsMatch = url.pathname.match(/^\/api\/playlists\/([^/]+)\/items$/);
+      if (request.method === "POST" && playlistItemsMatch) {
+        const body = await readJson(request);
+        videoStore.getReadyVideo(body.videoId);
+        await playlistStore.addItem(playlistItemsMatch[1], body.videoId);
+        json(response, 201, { playlists: playlistsSnapshot() });
+        return;
+      }
+
+      const playlistItemMatch = url.pathname.match(/^\/api\/playlists\/([^/]+)\/items\/([^/]+)$/);
+      if (request.method === "DELETE" && playlistItemMatch) {
+        await playlistStore.removeItem(playlistItemMatch[1], playlistItemMatch[2]);
+        json(response, 200, { playlists: playlistsSnapshot() });
+        return;
+      }
+
+      const playlistReorderMatch = url.pathname.match(/^\/api\/playlists\/([^/]+)\/reorder$/);
+      if (request.method === "POST" && playlistReorderMatch) {
+        const body = await readJson(request);
+        await playlistStore.reorder(playlistReorderMatch[1], body.itemIds);
+        json(response, 200, { playlists: playlistsSnapshot() });
+        return;
+      }
+
+      const playlistLoadMatch = url.pathname.match(/^\/api\/playlists\/([^/]+)\/load$/);
+      if (request.method === "POST" && playlistLoadMatch) {
+        if (streamIsActive()) {
+          throw new ApiError(409, "STREAM_ACTIVE", "Завантажити плейлист у чергу можна після зупинки ефіру.");
+        }
+        const playlist = playlistStore.require(playlistLoadMatch[1]);
+        for (const item of playlist.items) videoStore.getReadyVideo(item.videoId);
+        await liveQueue.replace(playlist.items.map((item) => item.videoId));
         json(response, 200, { queue: queueSnapshot() });
         return;
       }
@@ -576,7 +789,11 @@ export async function createMvpServer({
       }
 
       if (request.method === "POST" && url.pathname === "/api/uploads") {
-        const upload = await videoStore.createUpload(await readJson(request));
+        const body = await readJson(request);
+        const upload = await videoStore.createUpload({
+          ...body,
+          compressionProfile: body.compressionProfile || settingsStore.snapshot().compressionProfile,
+        });
         json(response, 201, { upload });
         return;
       }
@@ -671,6 +888,27 @@ export async function createMvpServer({
     }
   });
 
+  const webSocketServer = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (request, socket, head) => {
+    const url = new URL(request.url ?? "/", "http://localhost");
+    if (url.pathname !== "/api/events" || !ownerAuth.authenticate(request)) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    webSocketServer.handleUpgrade(request, socket, head, (client) => {
+      webSocketServer.emit("connection", client, request);
+    });
+  });
+  webSocketServer.on("connection", (client) => {
+    client.send(JSON.stringify({ type: "READY", occurredAt: new Date().toISOString() }));
+    const unsubscribe = realtimeHub.subscribe((event) => {
+      if (client.readyState === 1) client.send(JSON.stringify(event));
+    });
+    client.once("close", unsubscribe);
+    client.once("error", unsubscribe);
+  });
+
   return {
     server,
     store: videoStore,
@@ -682,6 +920,10 @@ export async function createMvpServer({
     youtube: youtubeIntegration,
     monitoring: monitoringService,
     telegram: telegramIntegration,
+    playlists: playlistStore,
+    audit: auditStore,
+    realtime: realtimeHub,
+    database: databaseService,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -699,6 +941,13 @@ export async function createMvpServer({
       else await streamController.stop();
       for (const response of streamEventClients) response.end();
       streamEventClients.clear();
+      for (const response of realtimeEventClients) response.end();
+      realtimeEventClients.clear();
+      for (const client of webSocketServer.clients) client.close();
+      webSocketServer.close();
+      await auditStore.close?.();
+      await realtimeHub.close?.();
+      await databaseService.close?.();
       await new Promise((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
       );

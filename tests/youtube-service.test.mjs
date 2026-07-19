@@ -127,13 +127,18 @@ test("connects YouTube, hides credentials and records live snapshots", async (t)
     state: authorizationUrl.searchParams.get("state"),
   });
   assert.equal(snapshot.connected, true);
-  assert.equal(snapshot.channel.title, "StreamLab Channel");
-  assert.equal(snapshot.channel.thumbnailUrl, "https://yt3.ggpht.com/channel-high");
-  assert.equal(snapshot.selected.id, "broadcast-1");
-  assert.equal(snapshot.stream.healthStatus, "good");
-  assert.equal(snapshot.metrics.viewers, 42);
-  assert.equal(snapshot.history.length, 1);
-  assert.equal(snapshot.quota.used, 4);
+  assert.equal(snapshot.channel, null);
+  assert.equal(snapshot.quota.used, 0);
+  assert.equal(calls.filter((call) => call.url.includes("googleapis.com/youtube")).length, 0);
+
+  const synchronized = await service.refreshAll();
+  assert.equal(synchronized.channel.title, "StreamLab Channel");
+  assert.equal(synchronized.channel.thumbnailUrl, "https://yt3.ggpht.com/channel-high");
+  assert.equal(synchronized.selected.id, "broadcast-1");
+  assert.equal(synchronized.stream.healthStatus, "good");
+  assert.equal(synchronized.metrics.viewers, 42);
+  assert.equal(synchronized.history.length, 1);
+  assert.equal(synchronized.quota.used, 4);
   assert.doesNotMatch(JSON.stringify(snapshot), /youtube-access-token|youtube-refresh-token|secret-stream-key/);
   assert.deepEqual(service.getSelectedIngestion(), {
     streamUrl: "rtmps://a.rtmps.youtube.com/live2",
@@ -147,7 +152,11 @@ test("connects YouTube, hides credentials and records live snapshots", async (t)
   assert.doesNotMatch(JSON.stringify(stats), /secret-stream-key/);
 
   currentTime += 61_000;
+  const callsBeforeDue = calls.length;
   await service.refreshDue();
+  assert.equal(calls.length, callsBeforeDue);
+  assert.equal(service.snapshot().history.length, 1);
+  await service.refreshAll();
   assert.equal(service.snapshot().history.length, 2);
   assert.ok(calls.some((call) => call.url.includes("/videos")));
 
@@ -223,6 +232,12 @@ test("keeps a successful OAuth connection when the first data refresh fails", as
   });
 
   assert.equal(snapshot.connected, true);
-  assert.equal(snapshot.channel.title, "Connected channel");
-  assert.equal(snapshot.lastError, "Некоректний запит списку трансляцій YouTube.");
+  assert.equal(snapshot.channel, null);
+  assert.equal(snapshot.lastError, null);
+  await assert.rejects(
+    service.refreshAll(),
+    (error) => error.code === "YOUTUBE_INVALID_FILTERS",
+  );
+  assert.equal(service.snapshot().channel.title, "Connected channel");
+  assert.equal(service.snapshot().lastError, "Некоректний запит списку трансляцій YouTube.");
 });

@@ -1,4 +1,39 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_DB: streamlab
+      POSTGRES_USER: streamlab
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streamlab -d streamlab"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
   caddy:
     image: caddy:2.11.4-alpine
     profiles:
@@ -47,6 +82,7 @@ services:
       MEDIA_TRANSCODE_VIDEO_BITRATE: ${MEDIA_TRANSCODE_VIDEO_BITRATE:-8M}
       MEDIA_TRANSCODE_PRESET: ${MEDIA_TRANSCODE_PRESET:-veryfast}
       MEDIA_KEEP_ORIGINAL_UPLOADS: ${MEDIA_KEEP_ORIGINAL_UPLOADS:-false}
+      MEDIA_COMPRESSION_PROFILE: ${MEDIA_COMPRESSION_PROFILE:-STANDARD}
       MVP_VIDEO_BITRATE: ${MVP_VIDEO_BITRATE:-8M}
       MVP_AUDIO_BITRATE: ${MVP_AUDIO_BITRATE:-192k}
       PLAYOUT_UDP_PORT: ${PLAYOUT_UDP_PORT:-23000}
@@ -64,8 +100,17 @@ services:
       STREAM_RECONNECT_BASE_MS: ${STREAM_RECONNECT_BASE_MS:-2000}
       STREAM_RECONNECT_MAX_MS: ${STREAM_RECONNECT_MAX_MS:-300000}
       STREAM_STABLE_RUN_MS: ${STREAM_STABLE_RUN_MS:-60000}
+      DATABASE_URL: postgresql://streamlab:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/streamlab
+      REDIS_URL: redis://redis:6379
+      STORAGE_WARNING_PERCENT: ${STORAGE_WARNING_PERCENT:-80}
+      STORAGE_CRITICAL_PERCENT: ${STORAGE_CRITICAL_PERCENT:-90}
     volumes:
       - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8788/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -99,3 +144,5 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  postgres_data:
+  redis_data:

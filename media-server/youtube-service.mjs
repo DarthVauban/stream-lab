@@ -9,13 +9,6 @@ const OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/youtube.readonly",
 ];
 
-const POLL_INTERVALS = {
-  channel: 10 * 60_000,
-  broadcasts: 2 * 60_000,
-  stream: 30_000,
-  metrics: 60_000,
-};
-
 function safeEqual(left, right) {
   const leftBuffer = Buffer.from(String(left ?? ""));
   const rightBuffer = Buffer.from(String(right ?? ""));
@@ -109,6 +102,13 @@ export class YouTubeService {
     await this.statsStore.init();
     const saved = this.store.read();
     if (saved.quota?.date === quotaDate(this.now())) this.quota = { ...saved.quota };
+    if (saved.runtimeCache) {
+      this.runtime = {
+        ...emptyRuntime(),
+        ...structuredClone(saved.runtimeCache),
+        history: [],
+      };
+    }
     this.runtime.history = this.statsStore.list({
       hours: 24,
       broadcastId: saved.selectedBroadcastId,
@@ -117,12 +117,7 @@ export class YouTubeService {
   }
 
   start() {
-    if (!this.configured || this.pollTimer) return;
-    this.pollTimer = setInterval(() => {
-      void this.refreshDue().catch(() => {});
-    }, 15_000);
-    this.pollTimer.unref?.();
-    if (this.store.read().tokens) void this.refreshAll().catch(() => {});
+    // YouTube data is intentionally synchronized only through the explicit refresh endpoint.
   }
 
   stop() {
@@ -160,6 +155,18 @@ export class YouTubeService {
 
   async persistQuota() {
     if (this.store) await this.store.setQuota(this.quota);
+  }
+
+  async persistRuntimeCache() {
+    await this.store?.setRuntimeCache?.({
+      channel: this.runtime.channel,
+      broadcasts: this.runtime.broadcasts,
+      selected: this.runtime.selected,
+      stream: this.runtime.stream,
+      metrics: this.runtime.metrics,
+      lastUpdatedAt: this.runtime.lastUpdatedAt,
+      lastError: this.runtime.lastError,
+    });
   }
 
   async beginOAuth() {
@@ -225,12 +232,8 @@ export class YouTubeService {
       tokenType: body.token_type || "Bearer",
     });
     this.runtime = emptyRuntime();
+    await this.store.setRuntimeCache(null);
     this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0 };
-    try {
-      await this.refreshAll();
-    } catch {
-      // OAuth itself succeeded. Keep the connection and show the API refresh error in the dashboard.
-    }
     return this.snapshot();
   }
 
@@ -478,6 +481,7 @@ export class YouTubeService {
         throw error;
       } finally {
         await this.persistQuota();
+        await this.persistRuntimeCache();
       }
       return this.snapshot();
     })().finally(() => {
@@ -496,19 +500,7 @@ export class YouTubeService {
   }
 
   refreshDue() {
-    if (!this.configured || !this.store.read().tokens) return Promise.resolve(this.snapshot());
-    const current = this.now();
-    const tasks = [];
-    const schedule = (key, task) => {
-      if (current - this.lastPoll[key] < POLL_INTERVALS[key]) return;
-      this.lastPoll[key] = current;
-      tasks.push(task);
-    };
-    schedule("channel", () => this.refreshChannel());
-    schedule("broadcasts", () => this.refreshBroadcasts());
-    schedule("stream", () => this.refreshStream());
-    schedule("metrics", () => this.refreshMetrics());
-    return tasks.length ? this.runRefresh(tasks) : Promise.resolve(this.snapshot());
+    return Promise.resolve(this.snapshot());
   }
 
   async selectBroadcast(broadcastId) {
@@ -516,7 +508,6 @@ export class YouTubeService {
     if (typeof broadcastId !== "string" || !broadcastId) {
       throw new ApiError(400, "YOUTUBE_BROADCAST_REQUIRED", "Оберіть трансляцію YouTube.");
     }
-    if (!this.runtime.broadcasts.some((item) => item.id === broadcastId)) await this.refreshBroadcasts();
     const selected = this.runtime.broadcasts.find((item) => item.id === broadcastId);
     if (!selected) {
       throw new ApiError(404, "YOUTUBE_BROADCAST_NOT_FOUND", "Трансляцію YouTube не знайдено.");
@@ -528,7 +519,9 @@ export class YouTubeService {
     this.ingestion = null;
     this.lastPoll.stream = 0;
     this.lastPoll.metrics = 0;
-    return this.runRefresh([() => this.refreshStream(), () => this.refreshMetrics()]);
+    this.runtime.lastUpdatedAt = null;
+    await this.persistRuntimeCache();
+    return this.snapshot();
   }
 
   getSelectedIngestion() {

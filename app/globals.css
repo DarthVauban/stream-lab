@@ -502,6 +502,42 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
 .footer-ok { color: var(--green); }
 .footer-muted { color: #66717e; }
 
+.realtime-state strong { color: #9da7b3; }
+.realtime-state--online strong { color: var(--green); }
+.compression-profile-field { margin-bottom: 14px; }
+.interrupted-uploads { display: grid; gap: 8px; margin: 12px 0; padding: 13px; border: 1px solid #3a3223; border-radius: 12px; background: rgba(91,67,25,.12); }
+.interrupted-uploads > strong { color: #e8bd65; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.interrupted-uploads > div { display: flex; justify-content: space-between; gap: 16px; padding-top: 8px; border-top: 1px solid rgba(232,189,101,.12); color: var(--muted); font-size: 10px; }
+.interrupted-uploads b, .interrupted-uploads small { display: block; }
+.interrupted-uploads b { color: var(--text); font-size: 11px; }
+.interrupted-uploads button { align-self: center; min-height: 28px; padding: 0 9px; border: 1px solid #5b3434; border-radius: 7px; background: rgba(91,35,35,.2); color: #f0a1a1; font-size: 9px; cursor: pointer; }
+.video-thumb--image { overflow: hidden; background: #090b0e; }
+.video-thumb--image img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.playlist-manager { display: grid; grid-template-columns: minmax(220px, .9fr) minmax(220px, 1fr) auto; gap: 12px; align-items: end; padding-bottom: 18px; border-bottom: 1px solid var(--border); }
+.playlist-manager .field { margin: 0; }
+.playlist-manager-actions { display: flex; gap: 7px; padding-bottom: 1px; }
+.playlist-manager-actions .button { min-height: 42px; padding-inline: 14px; }
+.playlist-workspace { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 16px; margin-top: 18px; }
+.playlist-column { min-width: 0; padding: 14px; border: 1px solid var(--border); border-radius: 14px; background: rgba(9,12,16,.42); }
+.playlist-item-list, .playlist-library-list { display: grid; gap: 7px; margin-bottom: 12px; max-height: 520px; overflow-y: auto; }
+.playlist-item, .playlist-library-item { display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid rgba(124,137,153,.14); border-radius: 10px; background: rgba(20,25,32,.72); }
+.playlist-item > span { color: var(--muted); font: 700 10px ui-monospace, monospace; }
+.playlist-item > div:nth-child(2), .playlist-library-item > div { min-width: 0; flex: 1; }
+.playlist-item strong, .playlist-item small, .playlist-library-item strong, .playlist-library-item small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.playlist-item strong, .playlist-library-item strong { font-size: 11px; }
+.playlist-item small, .playlist-library-item small { margin-top: 3px; color: var(--muted); font-size: 9px; }
+.playlist-item > div:last-child { display: flex; gap: 5px; }
+.playlist-item button, .playlist-library-item button { min-height: 30px; padding: 0 9px; border: 1px solid var(--border); border-radius: 7px; background: #171d24; color: var(--text); font-size: 9px; cursor: pointer; }
+.playlist-item button:disabled, .playlist-library-item button:disabled { opacity: .45; cursor: not-allowed; }
+.youtube-manual-sync { padding: 10px 12px; border: 1px solid rgba(90,214,145,.2); border-radius: 10px; background: rgba(90,214,145,.06); color: #a8b5ae; font-size: 10px; line-height: 1.55; }
+.audit-events { margin-top: 16px; }
+
+@media (max-width: 1100px) {
+  .playlist-manager { grid-template-columns: 1fr 1fr; }
+  .playlist-manager-actions { grid-column: 1 / -1; }
+  .playlist-workspace { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 900px) {
   .dashboard-shell { --sidebar-width: 76px; }
   .app-sidebar { padding-inline: 10px; }
@@ -578,6 +614,12 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
   .queue-summary { grid-template-columns: 1fr; }
   .queue-row { grid-template-columns: 18px 26px minmax(0, 1fr); align-items: start; }
   .queue-actions { grid-column: 3; flex-wrap: wrap; }
+  .playlist-manager { grid-template-columns: 1fr; }
+  .playlist-manager-actions { grid-column: auto; flex-wrap: wrap; }
+  .playlist-manager-actions .button { flex: 1; }
+  .interrupted-uploads > div { flex-direction: column; gap: 5px; }
+  .playlist-item { align-items: flex-start; flex-wrap: wrap; }
+  .playlist-item > div:last-child { width: 100%; padding-left: 24px; }
   footer { align-items: flex-start; flex-direction: column; justify-content: center; }
 }
 
