@@ -2,12 +2,22 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { ApiError } from "./api-error.mjs";
 
 const YOUTUBE_API_ROOT = "https://www.googleapis.com/youtube/v3";
+const YOUTUBE_ANALYTICS_ROOT = "https://youtubeanalytics.googleapis.com/v2";
 const OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const OAUTH_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
 const OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/youtube.readonly",
+  "https://www.googleapis.com/auth/yt-analytics.readonly",
 ];
+const DEFAULT_POLL_INTERVALS = Object.freeze({
+  metrics: 30_000,
+  stream: 45_000,
+  broadcasts: 60_000,
+  channel: 10 * 60_000,
+  analytics: 60 * 60_000,
+  dailyReport: 24 * 60 * 60_000,
+});
 
 function safeEqual(left, right) {
   const leftBuffer = Buffer.from(String(left ?? ""));
@@ -58,6 +68,8 @@ function emptyRuntime() {
     selected: null,
     stream: null,
     metrics: null,
+    analytics: null,
+    dailyReport: null,
     history: [],
     lastUpdatedAt: null,
     lastError: null,
@@ -74,6 +86,9 @@ export class YouTubeService {
     statsStore = null,
     fetchImpl = fetch,
     now = () => Date.now(),
+    onUpdate = () => {},
+    pollIntervals = {},
+    logger = console,
   } = {}) {
     this.clientId = typeof clientId === "string" ? clientId.trim() : "";
     this.clientSecret = typeof clientSecret === "string" ? clientSecret.trim() : "";
@@ -84,9 +99,12 @@ export class YouTubeService {
     this.statsStore = statsStore;
     this.fetchImpl = fetchImpl;
     this.now = now;
+    this.onUpdate = onUpdate;
+    this.pollIntervals = { ...DEFAULT_POLL_INTERVALS, ...pollIntervals };
+    this.logger = logger;
     this.runtime = emptyRuntime();
     this.quota = { date: quotaDate(this.now()), used: 0, updatedAt: null };
-    this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0 };
+    this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0, analytics: 0, dailyReport: 0 };
     this.refreshPromise = null;
     this.tokenRefreshPromise = null;
     this.pollTimer = null;
@@ -117,7 +135,12 @@ export class YouTubeService {
   }
 
   start() {
-    // YouTube data is intentionally synchronized only through the explicit refresh endpoint.
+    if (!this.configured || this.pollTimer) return;
+    void this.refreshDue().catch((error) => this.logger.error("StreamLab YouTube polling failed.", error));
+    this.pollTimer = setInterval(() => {
+      void this.refreshDue().catch((error) => this.logger.error("StreamLab YouTube polling failed.", error));
+    }, 5_000);
+    this.pollTimer.unref?.();
   }
 
   stop() {
@@ -164,6 +187,8 @@ export class YouTubeService {
       selected: this.runtime.selected,
       stream: this.runtime.stream,
       metrics: this.runtime.metrics,
+      analytics: this.runtime.analytics,
+      dailyReport: this.runtime.dailyReport,
       lastUpdatedAt: this.runtime.lastUpdatedAt,
       lastError: this.runtime.lastError,
     });
@@ -233,7 +258,7 @@ export class YouTubeService {
     });
     this.runtime = emptyRuntime();
     await this.store.setRuntimeCache(null);
-    this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0 };
+    this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0, analytics: 0, dailyReport: 0 };
     return this.snapshot();
   }
 
@@ -286,9 +311,9 @@ export class YouTubeService {
     return this.tokenRefreshPromise;
   }
 
-  async googleApi(resource, parameters, { retry = true, units = 1 } = {}) {
+  async googleApi(resource, parameters, { retry = true, units = 1, root = YOUTUBE_API_ROOT } = {}) {
     const token = await this.getAccessToken();
-    const url = new URL(`${YOUTUBE_API_ROOT}/${resource}`);
+    const url = new URL(`${root}/${resource}`);
     url.search = new URLSearchParams(
       Object.entries(parameters).filter(([, value]) => value !== null && value !== undefined),
     ).toString();
@@ -305,7 +330,7 @@ export class YouTubeService {
     }
     if (response.status === 401 && retry) {
       await this.getAccessToken({ force: true });
-      return this.googleApi(resource, parameters, { retry: false, units });
+      return this.googleApi(resource, parameters, { retry: false, units, root });
     }
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -468,14 +493,82 @@ export class YouTubeService {
     }
   }
 
-  async runRefresh(tasks) {
+  hasAnalyticsScope() {
+    const scope = this.store?.read().tokens?.scope || "";
+    return scope.split(/\s+/).includes("https://www.googleapis.com/auth/yt-analytics.readonly");
+  }
+
+  async refreshAnalytics() {
+    this.lastPoll.analytics = this.now();
+    if (!this.hasAnalyticsScope()) {
+      this.runtime.analytics = {
+        available: false,
+        reconnectRequired: true,
+        updatedAt: null,
+      };
+      return;
+    }
+    const endDate = new Date(this.now()).toISOString().slice(0, 10);
+    const startDate = new Date(this.now() - 24 * 60 * 60_000).toISOString().slice(0, 10);
+    const body = await this.googleApi("reports", {
+      ids: "channel==MINE",
+      startDate,
+      endDate,
+      metrics: "views,estimatedMinutesWatched,averageViewDuration,likes,subscribersGained,subscribersLost",
+    }, { root: YOUTUBE_ANALYTICS_ROOT });
+    const headers = (body.columnHeaders || []).map((header) => header.name);
+    const row = body.rows?.[0] || [];
+    const value = (name) => {
+      const index = headers.indexOf(name);
+      return index >= 0 ? Number(row[index]) || 0 : 0;
+    };
+    this.runtime.analytics = {
+      available: true,
+      reconnectRequired: false,
+      views: value("views"),
+      estimatedMinutesWatched: value("estimatedMinutesWatched"),
+      averageViewDurationSeconds: value("averageViewDuration"),
+      likes: value("likes"),
+      subscribersGained: value("subscribersGained"),
+      subscribersLost: value("subscribersLost"),
+      periodStart: startDate,
+      periodEnd: endDate,
+      updatedAt: new Date(this.now()).toISOString(),
+    };
+  }
+
+  async refreshDailyReport() {
+    this.lastPoll.dailyReport = this.now();
+    const broadcastId = this.store?.read().selectedBroadcastId || null;
+    const items = this.statsStore?.list({ hours: 24, limit: 10_080, broadcastId }) || [];
+    const first = items[0] || null;
+    const last = items.at(-1) || null;
+    this.runtime.dailyReport = {
+      generatedAt: new Date(this.now()).toISOString(),
+      broadcastId,
+      samples: items.length,
+      peakViewers: Math.max(0, ...items.map((item) => item.viewers || 0)),
+      viewsDelta: first && last ? Math.max(0, last.views - first.views) : 0,
+      likesDelta: first && last ? Math.max(0, last.likes - first.likes) : 0,
+    };
+  }
+
+  async runRefresh(tasks, { continueOnError = false } = {}) {
     if (this.refreshPromise) return this.refreshPromise;
     this.refreshPromise = (async () => {
       this.assertConnected();
+      const errors = [];
       try {
-        for (const task of tasks) await task();
+        for (const task of tasks) {
+          try {
+            await task();
+          } catch (error) {
+            errors.push(error);
+            if (!continueOnError) throw error;
+          }
+        }
         this.runtime.lastUpdatedAt = new Date(this.now()).toISOString();
-        this.runtime.lastError = null;
+        this.runtime.lastError = errors[0] instanceof Error ? errors[0].message : null;
       } catch (error) {
         this.runtime.lastError = error instanceof Error ? error.message : "Не вдалося оновити YouTube.";
         throw error;
@@ -483,7 +576,9 @@ export class YouTubeService {
         await this.persistQuota();
         await this.persistRuntimeCache();
       }
-      return this.snapshot();
+      const snapshot = this.snapshot();
+      await this.onUpdate(snapshot);
+      return snapshot;
     })().finally(() => {
       this.refreshPromise = null;
     });
@@ -496,11 +591,28 @@ export class YouTubeService {
       () => this.refreshBroadcasts(),
       () => this.refreshStream(),
       () => this.refreshMetrics(),
+      () => this.refreshAnalytics(),
+      () => this.refreshDailyReport(),
     ]);
   }
 
   refreshDue() {
-    return Promise.resolve(this.snapshot());
+    if (!this.configured || !this.store?.read().tokens) return Promise.resolve(this.snapshot());
+    const timestamp = this.now();
+    const tasks = [];
+    const schedule = (key, task) => {
+      if (timestamp - (this.lastPoll[key] || 0) < this.pollIntervals[key]) return;
+      this.lastPoll[key] = timestamp;
+      tasks.push(task);
+    };
+    schedule("broadcasts", () => this.refreshBroadcasts());
+    schedule("stream", () => this.refreshStream());
+    schedule("metrics", () => this.refreshMetrics());
+    schedule("channel", () => this.refreshChannel());
+    schedule("analytics", () => this.refreshAnalytics());
+    schedule("dailyReport", () => this.refreshDailyReport());
+    if (!tasks.length) return Promise.resolve(this.snapshot());
+    return this.runRefresh(tasks, { continueOnError: true });
   }
 
   async selectBroadcast(broadcastId) {
@@ -519,6 +631,7 @@ export class YouTubeService {
     this.ingestion = null;
     this.lastPoll.stream = 0;
     this.lastPoll.metrics = 0;
+    this.lastPoll.analytics = 0;
     this.runtime.lastUpdatedAt = null;
     await this.persistRuntimeCache();
     return this.snapshot();
@@ -581,11 +694,27 @@ export class YouTubeService {
           }
         : null,
       metrics: this.runtime.metrics ? { ...this.runtime.metrics } : null,
+      analytics: this.runtime.analytics ? { ...this.runtime.analytics } : null,
+      dailyReport: this.runtime.dailyReport ? { ...this.runtime.dailyReport } : null,
       history: this.runtime.history.map((item) => ({ ...item })),
       quota: {
         ...this.quota,
         limit: this.dailyQuota,
         remaining: Math.max(0, this.dailyQuota - this.quota.used),
+      },
+      polling: {
+        automatic: true,
+        metricsSeconds: Math.round(this.pollIntervals.metrics / 1_000),
+        streamSeconds: Math.round(this.pollIntervals.stream / 1_000),
+        broadcastSeconds: Math.round(this.pollIntervals.broadcasts / 1_000),
+        subscribersMinutes: Math.round(this.pollIntervals.channel / 60_000),
+        analyticsMinutes: Math.round(this.pollIntervals.analytics / 60_000),
+        dailyReportHours: Math.round(this.pollIntervals.dailyReport / 3_600_000),
+        estimatedDailyUnits:
+          Math.round(86_400_000 / this.pollIntervals.metrics) +
+          Math.round(86_400_000 / this.pollIntervals.stream) +
+          Math.round(86_400_000 / this.pollIntervals.broadcasts) +
+          Math.round(86_400_000 / this.pollIntervals.channel),
       },
       lastUpdatedAt: this.runtime.lastUpdatedAt,
       lastError: this.runtime.lastError,

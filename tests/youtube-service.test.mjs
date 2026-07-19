@@ -154,8 +154,9 @@ test("connects YouTube, hides credentials and records live snapshots", async (t)
   currentTime += 61_000;
   const callsBeforeDue = calls.length;
   await service.refreshDue();
-  assert.equal(calls.length, callsBeforeDue);
-  assert.equal(service.snapshot().history.length, 1);
+  assert.equal(calls.length, callsBeforeDue + 3);
+  assert.equal(service.snapshot().history.length, 2);
+  assert.equal(service.snapshot().polling.estimatedDailyUnits, 6_384);
   await service.refreshAll();
   assert.equal(service.snapshot().history.length, 2);
   assert.ok(calls.some((call) => call.url.includes("/videos")));

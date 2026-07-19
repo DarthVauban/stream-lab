@@ -170,6 +170,7 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
       onProgress(100);
     },
     thumbnailImpl: async ({ inputPath, outputPath }) => copyFile(inputPath, outputPath),
+    customThumbnailImpl: async ({ inputPath, outputPath }) => copyFile(inputPath, outputPath),
   });
   const app = await createMvpServer({
     dataDir,
@@ -296,6 +297,22 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(videos.videos[0].media.width, 1920);
   assert.equal(videos.videos[0].preparedSize, 6);
   assert.ok((await readdir(path.join(dataDir, "uploads"))).every((name) => !name.includes(".source.")));
+
+  const customThumbnailResponse = await fetch(`${baseUrl}/api/videos/${created.upload.id}/thumbnail`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "image/png",
+      Cookie: session.cookie,
+      "X-CSRF-Token": session.csrfToken,
+    },
+    body: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01]),
+  });
+  assert.equal(customThumbnailResponse.status, 200);
+  const thumbnailResponse = await fetch(`${baseUrl}/api/videos/${created.upload.id}/thumbnail`, {
+    headers: { Cookie: session.cookie },
+  });
+  assert.equal(thumbnailResponse.status, 200);
+  assert.equal(thumbnailResponse.headers.get("content-type"), "image/webp");
 
   const addQueueResponse = await fetch(`${baseUrl}/api/queue/items`, {
     method: "POST",
@@ -484,6 +501,22 @@ test("builds separate dynamic playout and configurable CBR uplink commands", () 
   assert.equal(playoutArgs[playoutArgs.indexOf("-c") + 1], "copy");
   assert.equal(playoutArgs[playoutArgs.indexOf("-output_ts_offset") + 1], "10.000");
   assert.equal(playoutArgs[playoutArgs.indexOf("-f") + 1], "mpegts");
+
+  const promoArgs = buildPlayoutFfmpegArgs({
+    inputPath: "C:/media/first.mp4",
+    outputUrl: "udp://127.0.0.1:23000?pkt_size=1316",
+    timestampOffsetSeconds: 10,
+    startSeconds: 5,
+    overlays: [{
+      filePath: "C:/media/promo.webp",
+      placement: { x: 100, y: 50, width: 400, height: 200, opacity: 0.8, zIndex: 1 },
+    }],
+  });
+  assert.equal(promoArgs[promoArgs.indexOf("-ss") + 1], "5.000");
+  assert.equal(promoArgs[promoArgs.indexOf("-output_ts_offset") + 1], "15.000");
+  assert.ok(promoArgs.includes("-filter_complex"));
+  assert.match(promoArgs[promoArgs.indexOf("-filter_complex") + 1], /overlay=100:50/);
+  assert.ok(promoArgs.includes("libx264"));
 });
 
 test("returns actionable storage errors without exposing filesystem details", () => {

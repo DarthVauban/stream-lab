@@ -475,6 +475,57 @@ export class VideoStore {
     await this.persist();
   }
 
+  async beginCustomThumbnail(id, buffer) {
+    const record = this.requireUpload(id);
+    if (record.status !== "READY" || !record.storedName) {
+      throw new ApiError(409, "VIDEO_NOT_READY", "Прев’ю можна змінити лише для готового відео.");
+    }
+    record.thumbnailStatus = "GENERATING";
+    record.thumbnailError = null;
+    record.thumbnailPendingPositionSeconds = null;
+    await writeFile(this.thumbnailUploadPath(record), buffer, { flag: "w" });
+    await this.persist();
+    return {
+      inputPath: this.thumbnailUploadPath(record),
+      outputPath: this.customTempThumbnailPath(record),
+    };
+  }
+
+  async completeCustomThumbnail(id) {
+    const record = this.requireUpload(id);
+    if (record.status !== "READY") {
+      throw new ApiError(409, "VIDEO_NOT_READY", "Прев’ю можна змінити лише для готового відео.");
+    }
+    const previousPath = record.thumbnailStoredName ? this.thumbnailPath(record) : null;
+    const targetName = `${record.id}.thumbnail.webp`;
+    const targetPath = path.join(this.uploadsDir, targetName);
+    if (previousPath) await rm(previousPath, { force: true }).catch(() => {});
+    await rm(targetPath, { force: true }).catch(() => {});
+    await rename(this.customTempThumbnailPath(record), targetPath);
+    await rm(this.thumbnailUploadPath(record), { force: true }).catch(() => {});
+    record.thumbnailStoredName = targetName;
+    record.thumbnailTargetName = targetName;
+    record.thumbnailPositionSeconds = null;
+    record.thumbnailPendingPositionSeconds = null;
+    record.thumbnailUpdatedAt = new Date().toISOString();
+    record.thumbnailStatus = "READY";
+    record.thumbnailError = null;
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  async failCustomThumbnail(id, message = "Не вдалося створити прев’ю.") {
+    const record = this.find(id);
+    if (!record) return;
+    await Promise.all([
+      rm(this.thumbnailUploadPath(record), { force: true }).catch(() => {}),
+      rm(this.customTempThumbnailPath(record), { force: true }).catch(() => {}),
+    ]);
+    record.thumbnailStatus = "FAILED";
+    record.thumbnailError = String(message).slice(0, 300);
+    await this.persist();
+  }
+
   getReadyVideo(id) {
     const record = this.find(id);
     if (!record || record.status !== "READY") {
@@ -506,6 +557,9 @@ export class VideoStore {
       record.thumbnailStoredName,
       record.thumbnailTargetName,
       `${record.id}.thumbnail.tmp.jpg`,
+      `${record.id}.thumbnail.upload.png`,
+      `${record.id}.thumbnail.custom.tmp.webp`,
+      `${record.id}.thumbnail.webp`,
     ].filter(Boolean));
     const uploadsRoot = `${path.resolve(this.uploadsDir)}${path.sep}`;
     return [...names].map((name) => {
@@ -588,6 +642,14 @@ export class VideoStore {
 
   tempThumbnailPath(record) {
     return path.join(this.uploadsDir, `${record.id}.thumbnail.tmp.jpg`);
+  }
+
+  thumbnailUploadPath(record) {
+    return path.join(this.uploadsDir, `${record.id}.thumbnail.upload.png`);
+  }
+
+  customTempThumbnailPath(record) {
+    return path.join(this.uploadsDir, `${record.id}.thumbnail.custom.tmp.webp`);
   }
 
   thumbnailPath(record) {

@@ -135,22 +135,75 @@ export class FfmpegProgressParser {
   }
 }
 
-export function buildPlayoutFfmpegArgs({ inputPath, outputUrl, timestampOffsetSeconds = 0 }) {
-  return [
+export function buildPlayoutFfmpegArgs({
+  inputPath,
+  outputUrl,
+  timestampOffsetSeconds = 0,
+  startSeconds = 0,
+  overlays = [],
+}) {
+  const safeStart = Math.max(0, Number(startSeconds) || 0);
+  const safeOverlays = (Array.isArray(overlays) ? overlays : [])
+    .filter((overlay) => overlay?.filePath && overlay?.placement)
+    .sort((left, right) => (left.placement.zIndex || 0) - (right.placement.zIndex || 0));
+  const args = [
     "-hide_banner",
     "-loglevel",
     "info",
     "-re",
+    ...(safeStart > 0 ? ["-ss", safeStart.toFixed(3)] : []),
     "-i",
     inputPath,
-    "-map",
-    "0:v:0",
-    "-map",
-    "0:a:0",
-    "-c",
-    "copy",
+  ];
+
+  for (const overlay of safeOverlays) args.push("-loop", "1", "-i", overlay.filePath);
+
+  if (safeOverlays.length) {
+    const filters = [];
+    let previous = "0:v";
+    safeOverlays.forEach((overlay, index) => {
+      const placement = overlay.placement;
+      const layer = `promo${index}`;
+      const output = `promoout${index}`;
+      const opacity = Math.min(1, Math.max(0.05, Number(placement.opacity) || 1));
+      filters.push(
+        `[${index + 1}:v]scale=${Math.round(placement.width)}:${Math.round(placement.height)},format=rgba,colorchannelmixer=aa=${opacity.toFixed(2)}[${layer}]`,
+      );
+      filters.push(
+        `[${previous}][${layer}]overlay=${Math.round(placement.x)}:${Math.round(placement.y)}:shortest=1:eof_action=pass[${output}]`,
+      );
+      previous = output;
+    });
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      `[${previous}]`,
+      "-map",
+      "0:a:0",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-tune",
+      "zerolatency",
+      "-crf",
+      "18",
+      "-pix_fmt",
+      "yuv420p",
+      "-r",
+      "30",
+      "-c:a",
+      "copy",
+      "-shortest",
+    );
+  } else {
+    args.push("-map", "0:v:0", "-map", "0:a:0", "-c", "copy");
+  }
+
+  args.push(
     "-output_ts_offset",
-    Math.max(0, timestampOffsetSeconds).toFixed(3),
+    Math.max(0, timestampOffsetSeconds + safeStart).toFixed(3),
     "-mpegts_flags",
     "+resend_headers",
     "-muxdelay",
@@ -162,7 +215,8 @@ export function buildPlayoutFfmpegArgs({ inputPath, outputUrl, timestampOffsetSe
     "-f",
     "mpegts",
     outputUrl,
-  ];
+  );
+  return args;
 }
 
 // Backwards-compatible export for integrations that still import the old helper.
@@ -230,6 +284,7 @@ export class StreamController {
     this.skipCompletion = null;
     this.getQueue = () => [];
     this.getFallback = () => null;
+    this.getOverlays = () => [];
     this.resolveVideo = null;
     this.reconnectTimer = null;
     this.playoutRetryTimer = null;
@@ -255,10 +310,11 @@ export class StreamController {
     };
   }
 
-  async init({ resolveVideo, getQueue, getFallback } = {}) {
+  async init({ resolveVideo, getQueue, getFallback, getOverlays } = {}) {
     this.resolveVideo = resolveVideo ?? this.resolveVideo;
     this.getQueue = getQueue ?? this.getQueue;
     this.getFallback = getFallback ?? this.getFallback;
+    this.getOverlays = getOverlays ?? this.getOverlays;
     if (!this.stateStore) return this.snapshot();
 
     let persisted;
@@ -586,17 +642,19 @@ export class StreamController {
     });
   }
 
-  async launchPlayout(item, { initial = false } = {}) {
+  async launchPlayout(item, { initial = false, resumeSeconds = 0 } = {}) {
     if (!this.desired || this.shuttingDown || !item) return this.snapshot();
     this.playoutRunId += 1;
     const runId = this.playoutRunId;
     this.currentItem = item;
-    this.currentStartedAtMs = this.now();
+    this.currentStartedAtMs = this.now() - Math.max(0, Number(resumeSeconds) || 0) * 1_000;
     this.skipRequested = false;
     const args = buildPlayoutFfmpegArgs({
       inputPath: item.filePath,
       outputUrl: this.udpOutputUrl,
       timestampOffsetSeconds: this.playoutClockSeconds,
+      startSeconds: resumeSeconds,
+      overlays: this.getOverlays?.() || [],
     });
     let child;
     try {
@@ -736,6 +794,21 @@ export class StreamController {
       completion,
       new Promise((resolve) => this.setTimeoutImpl(resolve, 5_000)),
     ]);
+    return this.snapshot();
+  }
+
+  async refreshPlayout() {
+    if (!this.desired || !this.currentItem || !this.playoutChild) return this.snapshot();
+    const currentDuration = durationMs(this.currentItem) / 1_000;
+    const positionSeconds = Math.min(
+      Math.max(0, currentDuration - 0.1),
+      Math.max(0, (this.now() - (this.currentStartedAtMs ?? this.now())) / 1_000),
+    );
+    const previousChild = this.playoutChild;
+    this.playoutRunId += 1;
+    this.playoutChild = null;
+    await this.stopChild(previousChild);
+    await this.launchPlayout(this.currentItem, { resumeSeconds: positionSeconds });
     return this.snapshot();
   }
 

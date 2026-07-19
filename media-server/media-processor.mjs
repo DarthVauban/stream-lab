@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { ApiError } from "./api-error.mjs";
 import { compressionProfile } from "./compression-profiles.mjs";
+import { convertImageToWebp } from "./image-processor.mjs";
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024 * 1024;
 const ALLOWED_PRESETS = new Set([
@@ -375,6 +376,7 @@ export class MediaProcessor {
     probeImpl = probeMedia,
     transcodeImpl = transcodeMedia,
     thumbnailImpl = generateThumbnail,
+    customThumbnailImpl = convertImageToWebp,
     onEvent = () => {},
     logger = console,
   } = {}) {
@@ -389,6 +391,7 @@ export class MediaProcessor {
     this.probeImpl = probeImpl;
     this.transcodeImpl = transcodeImpl;
     this.thumbnailImpl = thumbnailImpl;
+    this.customThumbnailImpl = customThumbnailImpl;
     this.onEvent = onEvent;
     this.logger = logger;
     this.queue = [];
@@ -437,6 +440,22 @@ export class MediaProcessor {
     return { videoId, positionSeconds: normalizedPosition };
   }
 
+  replaceThumbnail(videoId, buffer) {
+    if (this.shuttingDown) {
+      throw new ApiError(503, "PROCESSOR_STOPPING", "Медіапроцесор зупиняється.");
+    }
+    if (this.queued.has(videoId) || this.activeVideoId === videoId) {
+      throw new ApiError(409, "VIDEO_PROCESSING_BUSY", "Для цього відео вже виконується медіаоперація.");
+    }
+    this.store.getThumbnailBackfillPaths(videoId);
+    const operation = new Promise((resolve, reject) => {
+      this.queue.push({ videoId, customThumbnailBuffer: buffer, resolve, reject });
+      this.queued.add(videoId);
+      if (!this.drainPromise) this.drainPromise = Promise.resolve().then(() => this.drain());
+    });
+    return operation;
+  }
+
   async drain() {
     try {
       while (!this.shuttingDown && this.queue.length) {
@@ -445,10 +464,23 @@ export class MediaProcessor {
         this.queued.delete(videoId);
         this.activeVideoId = videoId;
         this.abortController = new AbortController();
-        if (task.thumbnailOnly) {
-          await this.processThumbnail(videoId, this.abortController.signal, task.positionSeconds);
+        try {
+          if (task.customThumbnailBuffer) {
+            const result = await this.processCustomThumbnail(
+              videoId,
+              task.customThumbnailBuffer,
+              this.abortController.signal,
+            );
+            task.resolve?.(result);
+          } else if (task.thumbnailOnly) {
+            await this.processThumbnail(videoId, this.abortController.signal, task.positionSeconds);
+          } else {
+            await this.processOne(videoId, this.abortController.signal);
+          }
+        } catch (error) {
+          task.reject?.(error);
+          if (!task.reject) throw error;
         }
-        else await this.processOne(videoId, this.abortController.signal);
         this.activeVideoId = null;
         this.abortController = null;
       }
@@ -544,6 +576,30 @@ export class MediaProcessor {
       const message = error instanceof Error ? error.message : "Не вдалося створити прев’ю.";
       await this.store.failThumbnail?.(videoId, message);
       await this.onEvent("VIDEO_THUMBNAIL_FAILED", { videoId, message });
+    }
+  }
+
+  async processCustomThumbnail(videoId, buffer, signal) {
+    try {
+      const paths = await this.store.beginCustomThumbnail(videoId, buffer);
+      await this.onEvent("VIDEO_THUMBNAIL_STARTED", { videoId, source: "UPLOAD" });
+      await this.customThumbnailImpl({
+        inputPath: paths.inputPath,
+        outputPath: paths.outputPath,
+        mode: "thumbnail",
+        ffmpegPath: this.ffmpegPath,
+        signal,
+      });
+      const video = await this.store.completeCustomThumbnail(videoId);
+      await this.onEvent("VIDEO_THUMBNAIL_READY", { videoId, source: "UPLOAD" });
+      return video;
+    } catch (error) {
+      if (this.shuttingDown && (signal.aborted || error?.name === "AbortError")) throw error;
+      this.logger.error(`Помилка завантаженого прев’ю відео ${videoId}:`, error);
+      const message = "Не вдалося конвертувати PNG-прев’ю у WebP.";
+      await this.store.failCustomThumbnail?.(videoId, message);
+      await this.onEvent("VIDEO_THUMBNAIL_FAILED", { videoId, source: "UPLOAD", message });
+      throw new ApiError(422, "THUMBNAIL_CONVERSION_FAILED", message);
     }
   }
 

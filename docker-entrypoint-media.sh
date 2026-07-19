@@ -4,12 +4,12 @@ set -eu
 data_dir="${MEDIA_DATA_DIR:-/app/data}"
 
 if [ "$(id -u)" = "0" ]; then
-  mkdir -p "$data_dir/uploads"
+  mkdir -p "$data_dir/uploads" "$data_dir/promo-assets"
 
   # Bind-mounted folders are often created as root on the server. Fix only the
   # writable metadata and partial uploads; completed videos can remain untouched.
-  chown node:node "$data_dir" "$data_dir/uploads"
-  chmod u+rwx "$data_dir" "$data_dir/uploads"
+  chown node:node "$data_dir" "$data_dir/uploads" "$data_dir/promo-assets"
+  chmod u+rwx "$data_dir" "$data_dir/uploads" "$data_dir/promo-assets"
 
   for item in \
     "$data_dir/videos.json" \
@@ -34,10 +34,18 @@ if [ "$(id -u)" = "0" ]; then
     "$data_dir/monitoring.json.tmp" \
     "$data_dir/telegram-bot.enc.json" \
     "$data_dir/telegram-bot.enc.json.tmp" \
+    "$data_dir/promos.json" \
+    "$data_dir/promos.json.tmp" \
     "$data_dir/uploads"/*.part \
     "$data_dir/uploads"/*.processing.tmp.mp4 \
     "$data_dir/uploads"/*.thumbnail.tmp.jpg \
-    "$data_dir/uploads"/*.thumbnail.jpg
+    "$data_dir/uploads"/*.thumbnail.jpg \
+    "$data_dir/uploads"/*.thumbnail.webp \
+    "$data_dir/uploads"/*.thumbnail.upload.png \
+    "$data_dir/uploads"/*.thumbnail.custom.tmp.webp \
+    "$data_dir/promo-assets"/*.webp \
+    "$data_dir/promo-assets"/*.tmp \
+    "$data_dir/promo-assets"/*.tmp.webp
   do
     if [ -e "$item" ]; then
       chown node:node "$item"

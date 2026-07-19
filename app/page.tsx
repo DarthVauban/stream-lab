@@ -4,6 +4,7 @@ import {
   ChangeEvent,
   DragEvent as ReactDragEvent,
   FormEvent,
+  PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
   useRef,
@@ -191,7 +192,7 @@ type AuthSession =
   | { authenticated: false }
   | { authenticated: true; owner: string; csrfToken: string; expiresAt: string };
 
-type WorkspaceTab = "library" | "playlists" | "queue" | "stream" | "monitoring" | "youtube" | "profile";
+type WorkspaceTab = "library" | "playlists" | "queue" | "stream" | "promos" | "monitoring" | "youtube" | "profile";
 type MonitoringRange = 1 | 24 | 168;
 type MonitoringHealthState = "STABLE" | "BUFFERING_RISK" | "CRITICAL" | "OFFLINE";
 
@@ -303,6 +304,25 @@ type YouTubeStatus = {
     actualStartAt: string | null;
     scheduledStartAt: string | null;
   } | null;
+  analytics: {
+    available: boolean;
+    reconnectRequired: boolean;
+    views?: number;
+    estimatedMinutesWatched?: number;
+    averageViewDurationSeconds?: number;
+    likes?: number;
+    subscribersGained?: number;
+    subscribersLost?: number;
+    updatedAt: string | null;
+  } | null;
+  dailyReport: {
+    generatedAt: string;
+    broadcastId: string | null;
+    samples: number;
+    peakViewers: number;
+    viewsDelta: number;
+    likesDelta: number;
+  } | null;
   history: Array<{
     capturedAt: string;
     broadcastId: string;
@@ -318,8 +338,86 @@ type YouTubeStatus = {
     remaining: number;
     updatedAt: string | null;
   };
+  polling: {
+    automatic: boolean;
+    metricsSeconds: number;
+    streamSeconds: number;
+    broadcastSeconds: number;
+    subscribersMinutes: number;
+    analyticsMinutes: number;
+    dailyReportHours: number;
+    estimatedDailyUnits: number;
+  };
   lastUpdatedAt: string | null;
   lastError: string | null;
+};
+
+type PromoPlacement = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  opacity: number;
+  zIndex: number;
+  zone: string;
+  animation: "none" | "fade" | "slide" | "scale" | "pop";
+};
+
+type PromoAsset = {
+  id: string;
+  name: string;
+  fileUrl: string;
+  sourceMimeType: string;
+  mimeType: "image/webp";
+  size: number;
+  width: number;
+  height: number;
+  tags: string[];
+  placement: PromoPlacement;
+  createdAt: string;
+  updatedAt: string | null;
+  impressions: number;
+  lastShownAt: string | null;
+};
+
+type PromoCampaign = {
+  id: string;
+  name: string;
+  assetId: string;
+  status: "DRAFT" | "SCHEDULED" | "ACTIVE" | "PAUSED" | "COMPLETED" | "ARCHIVED";
+  startAt: string | null;
+  endAt: string | null;
+  intervalMinutes: number;
+  durationSeconds: number;
+  daysOfWeek: number[];
+  timezone: string;
+  priority: number;
+  createdAt: string;
+  updatedAt: string | null;
+  lastShownAt: string | null;
+  impressions: number;
+};
+
+type PromoStatus = {
+  assets: PromoAsset[];
+  campaigns: PromoCampaign[];
+  impressions: Array<{
+    id: string;
+    assetId: string;
+    campaignId: string | null;
+    source: string;
+    startedAt: string;
+    durationSeconds: number;
+  }>;
+  active: {
+    assetId: string;
+    campaignId: string | null;
+    source: string;
+    startedAt: string;
+    endsAt: string;
+    durationSeconds: number;
+    asset: PromoAsset | null;
+  } | null;
 };
 
 type TelegramStatus = {
@@ -552,6 +650,18 @@ export default function Home() {
   const [youtubeAction, setYoutubeAction] = useState("");
   const [monitoring, setMonitoring] = useState<MonitoringStatus | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [promos, setPromos] = useState<PromoStatus | null>(null);
+  const [selectedPromoId, setSelectedPromoId] = useState("");
+  const [promoFile, setPromoFile] = useState<File | null>(null);
+  const [promoName, setPromoName] = useState("");
+  const [promoTags, setPromoTags] = useState("");
+  const [promoPlacementDraft, setPromoPlacementDraft] = useState<PromoPlacement | null>(null);
+  const [promoDuration, setPromoDuration] = useState(10);
+  const [promoAction, setPromoAction] = useState("");
+  const [campaignName, setCampaignName] = useState("");
+  const [campaignInterval, setCampaignInterval] = useState(30);
+  const [campaignDuration, setCampaignDuration] = useState(10);
+  const [campaignStartAt, setCampaignStartAt] = useState("");
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [monitoringRange, setMonitoringRange] = useState<MonitoringRange>(24);
   const [telegram, setTelegram] = useState<TelegramStatus | null>(null);
@@ -561,17 +671,17 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [failedChannelAvatarUrl, setFailedChannelAvatarUrl] = useState("");
-  const [thumbnailDrafts, setThumbnailDrafts] = useState<Record<string, number>>({});
   const [thumbnailAction, setThumbnailAction] = useState("");
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [now, setNow] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
+  const promoDragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [healthResult, videosResult, uploadsResult, streamResult, queueResult, playlistsResult, youtubeResult, systemResult] = await Promise.all([
+      const [healthResult, videosResult, uploadsResult, streamResult, queueResult, playlistsResult, youtubeResult, systemResult, promosResult] = await Promise.all([
         api<Health>("/api/health"),
         api<{ videos: Video[] }>("/api/videos"),
         api<{ uploads: Video[] }>("/api/uploads"),
@@ -580,6 +690,7 @@ export default function Home() {
         api<{ playlists: Playlist[] }>("/api/playlists"),
         api<{ youtube: YouTubeStatus }>("/api/youtube/status"),
         api<{ system: SystemStatus | null }>("/api/system/status"),
+        api<{ promos: PromoStatus }>("/api/promos"),
       ]);
       setHealth(healthResult);
       setVideos(videosResult.videos);
@@ -590,6 +701,11 @@ export default function Home() {
       setSelectedPlaylistId((current) => current || playlistsResult.playlists[0]?.id || "");
       setYoutube(youtubeResult.youtube);
       setSystemStatus(systemResult.system);
+      setPromos(promosResult.promos);
+      setSelectedPromoId((current) => current || promosResult.promos.assets[0]?.id || "");
+      setPromoPlacementDraft((current) => current || (promosResult.promos.assets[0]
+        ? { ...promosResult.promos.assets[0].placement }
+        : null));
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
         setAuthState("anonymous");
@@ -742,7 +858,7 @@ export default function Home() {
       setActiveTab("profile");
       setNotice(
         result === "connected"
-          ? { type: "success", text: "YouTube-канал підключено. Дані з’являться після ручної синхронізації." }
+          ? { type: "success", text: "YouTube-канал підключено. Автоматична синхронізація запуститься протягом кількох секунд." }
           : { type: "error", text: "Не вдалося підключити YouTube. Спробуйте ще раз." },
       );
     }, 0);
@@ -783,6 +899,7 @@ export default function Home() {
   }, [authState]);
 
   const active = ["LIVE", "STARTING", "DEGRADED", "RECONNECTING", "STOPPING"].includes(stream.status);
+  const selectedPromo = promos?.assets.find((asset) => asset.id === selectedPromoId) || null;
   const selectedPlaylist = playlists.find((playlist) => playlist.id === selectedPlaylistId) || null;
   const currentQueueIndex = stream.queueItemId
     ? queue.items.findIndex((item) => item.id === stream.queueItemId)
@@ -816,6 +933,7 @@ export default function Home() {
     playlists: { eyebrow: "Колекції", title: "Плейлисти", description: "Збережені набори відео для швидкого формування черги." },
     queue: { eyebrow: "Плейлист", title: "Черга трансляції", description: "Порядок безперервного відтворення в ефірі." },
     stream: { eyebrow: "Трансляція", title: "Керування ефіром", description: "Профіль сигналу, RTMPS-підключення та запуск." },
+    promos: { eyebrow: "Оформлення ефіру", title: "Промоматеріали", description: "Банери, позиціонування, ручний показ і кампанії за розкладом." },
     monitoring: { eyebrow: "Діагностика", title: "Моніторинг ефіру", description: "Якість сигналу, продуктивність і журнал подій." },
     youtube: { eyebrow: "Аналітика", title: "YouTube", description: "Активна трансляція, показники каналу та сигнал ingest." },
     profile: { eyebrow: "Обліковий запис", title: "Профіль та інтеграції", description: "Доступ власника, YouTube і Telegram-бот." },
@@ -830,6 +948,7 @@ export default function Home() {
     { id: "playlists", icon: "☷", label: "Плейлисти", description: "Збережені набори" },
     { id: "queue", icon: "≡", label: "Черга", description: "Порядок ефіру" },
     { id: "stream", icon: "▶", label: "Ефір", description: "Запуск і керування" },
+    { id: "promos", icon: "◇", label: "Промо", description: "Матеріали й кампанії" },
     { id: "monitoring", icon: "⌁", label: "Моніторинг", description: "Якість сигналу" },
     { id: "youtube", icon: "YT", label: "YouTube", description: "Канал і аналітика" },
   ];
@@ -1007,6 +1126,13 @@ export default function Home() {
       setYoutubeAction("");
       setMonitoring(null);
       setSystemStatus(null);
+      setPromos(null);
+      setSelectedPromoId("");
+      setPromoFile(null);
+      setPromoName("");
+      setPromoTags("");
+      setPromoPlacementDraft(null);
+      setPromoAction("");
       setAuditEntries([]);
       setMonitoringRange(24);
       setTelegram(null);
@@ -1015,7 +1141,6 @@ export default function Home() {
       setTelegramAction("");
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
-      setThumbnailDrafts({});
       setThumbnailAction("");
       setRealtimeConnected(false);
     }
@@ -1169,30 +1294,30 @@ export default function Home() {
     }
   }
 
-  async function updateVideoThumbnail(video: Video) {
-    if (thumbnailAction || video.status !== "READY" || !video.media?.durationSeconds) return;
-    const maxPosition = Math.max(0, video.media.durationSeconds - 0.05);
-    const suggestedPosition = Math.min(10, video.media.durationSeconds * 0.1, maxPosition);
-    const positionSeconds = Math.min(
-      maxPosition,
-      Math.max(0, thumbnailDrafts[video.id] ?? video.thumbnailPositionSeconds ?? suggestedPosition),
-    );
+  async function uploadVideoThumbnail(video: Video, file: File | null) {
+    if (!file || thumbnailAction || video.status !== "READY") return;
+    if (file.type !== "image/png" || !file.name.toLowerCase().endsWith(".png")) {
+      setNotice({ type: "error", text: "Для прев’ю потрібно вибрати PNG-зображення." });
+      return;
+    }
+    if (file.size <= 0 || file.size > 15 * 1024 * 1024) {
+      setNotice({ type: "error", text: "PNG-прев’ю має бути непорожнім і не перевищувати 15 МБ." });
+      return;
+    }
     setThumbnailAction(video.id);
     setNotice(null);
     try {
       const result = await api<{ video: Video }>(
         `/api/videos/${video.id}/thumbnail`,
         {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ positionSeconds }),
+          method: "PUT",
+          headers: { "Content-Type": "image/png" },
+          body: file,
         },
         csrfToken,
       );
-      setVideos((current) => current.map((item) => item.id === video.id
-        ? { ...result.video, thumbnailStatus: "GENERATING", thumbnailError: null }
-        : item));
-      setNotice({ type: "success", text: `Створення прев’ю з кадру ${formatMediaTime(positionSeconds * 1_000)} запущено.` });
+      setVideos((current) => current.map((item) => item.id === video.id ? result.video : item));
+      setNotice({ type: "success", text: "PNG-прев’ю конвертовано у WebP та збережено." });
     } catch (error) {
       setNotice({
         type: "error",
@@ -1686,6 +1811,210 @@ export default function Home() {
     });
   }
 
+  async function createPromoAsset() {
+    if (!promoFile || promoAction) return;
+    if (!["image/png", "image/jpeg", "image/webp"].includes(promoFile.type)) {
+      setNotice({ type: "error", text: "Для промо підтримуються PNG, JPG і WebP." });
+      return;
+    }
+    setPromoAction("upload");
+    setNotice(null);
+    try {
+      const parameters = new URLSearchParams({
+        name: promoName.trim() || promoFile.name.replace(/\.[^.]+$/, ""),
+        tags: promoTags,
+      });
+      const result = await api<{ asset: PromoAsset; promos: PromoStatus }>(
+        `/api/promo-assets?${parameters}`,
+        { method: "POST", headers: { "Content-Type": promoFile.type }, body: promoFile },
+        csrfToken,
+      );
+      setPromos(result.promos);
+      setSelectedPromoId(result.asset.id);
+      setPromoPlacementDraft({ ...result.asset.placement });
+      setPromoFile(null);
+      setPromoName("");
+      setPromoTags("");
+      setNotice({ type: "success", text: "Промоматеріал конвертовано у WebP і додано до бібліотеки." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося додати промоматеріал." });
+    } finally {
+      setPromoAction("");
+    }
+  }
+
+  function applyPromoZone(zone: string) {
+    if (!promoPlacementDraft) return;
+    const { width, height } = promoPlacementDraft;
+    const horizontal = zone.endsWith("left") ? 54 : zone.endsWith("right") ? 1_920 - width - 54 : (1_920 - width) / 2;
+    const vertical = zone.startsWith("top") ? 54 : zone.startsWith("bottom") ? 1_080 - height - 54 : (1_080 - height) / 2;
+    setPromoPlacementDraft({
+      ...promoPlacementDraft,
+      zone,
+      x: Math.max(0, Math.round(zone === "fullscreen" ? 0 : horizontal)),
+      y: Math.max(0, Math.round(zone === "fullscreen" ? 0 : vertical)),
+      ...(zone === "fullscreen" ? { width: 1_920, height: 1_080 } : {}),
+    });
+  }
+
+  function handlePromoPointerDown(event: ReactPointerEvent<HTMLImageElement>) {
+    if (!promoPlacementDraft) return;
+    const canvas = event.currentTarget.parentElement?.getBoundingClientRect();
+    if (!canvas) return;
+    const pointerX = ((event.clientX - canvas.left) / canvas.width) * 1_920;
+    const pointerY = ((event.clientY - canvas.top) / canvas.height) * 1_080;
+    promoDragRef.current = {
+      offsetX: pointerX - promoPlacementDraft.x,
+      offsetY: pointerY - promoPlacementDraft.y,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handlePromoPointerMove(event: ReactPointerEvent<HTMLImageElement>) {
+    if (!promoDragRef.current || !promoPlacementDraft) return;
+    const canvas = event.currentTarget.parentElement?.getBoundingClientRect();
+    if (!canvas) return;
+    const x = ((event.clientX - canvas.left) / canvas.width) * 1_920 - promoDragRef.current.offsetX;
+    const y = ((event.clientY - canvas.top) / canvas.height) * 1_080 - promoDragRef.current.offsetY;
+    setPromoPlacementDraft({
+      ...promoPlacementDraft,
+      zone: "custom",
+      x: Math.round(Math.min(1_920 - promoPlacementDraft.width, Math.max(0, x))),
+      y: Math.round(Math.min(1_080 - promoPlacementDraft.height, Math.max(0, y))),
+    });
+  }
+
+  function handlePromoPointerUp(event: ReactPointerEvent<HTMLImageElement>) {
+    promoDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  }
+
+  async function savePromoPlacement() {
+    if (!selectedPromo || !promoPlacementDraft || promoAction) return;
+    setPromoAction("save-placement");
+    try {
+      const result = await api<{ promos: PromoStatus }>(`/api/promo-assets/${selectedPromo.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ placement: promoPlacementDraft }),
+      }, csrfToken);
+      setPromos(result.promos);
+      setNotice({ type: "success", text: "Позицію промоматеріалу збережено." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося зберегти позицію." });
+    } finally {
+      setPromoAction("");
+    }
+  }
+
+  async function showPromoNow() {
+    if (!selectedPromo || promoAction) return;
+    setPromoAction("show");
+    try {
+      const result = await api<{ promos: PromoStatus }>(`/api/promo-assets/${selectedPromo.id}/show`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ durationSeconds: promoDuration }),
+      }, csrfToken);
+      setPromos(result.promos);
+      setNotice({ type: "success", text: "Промоматеріал показано в активному ефірі." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося показати промоматеріал." });
+    } finally {
+      setPromoAction("");
+    }
+  }
+
+  async function hidePromo() {
+    if (promoAction) return;
+    setPromoAction("hide");
+    try {
+      const result = await api<{ promos: PromoStatus }>("/api/promos/hide", { method: "POST" }, csrfToken);
+      setPromos(result.promos);
+      setNotice({ type: "success", text: "Промоматеріал приховано." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося приховати промоматеріал." });
+    } finally {
+      setPromoAction("");
+    }
+  }
+
+  async function deletePromoAsset() {
+    if (!selectedPromo || promoAction || !window.confirm(`Видалити промоматеріал «${selectedPromo.name}» із сервера?`)) return;
+    setPromoAction("delete");
+    try {
+      const result = await api<{ promos: PromoStatus }>(`/api/promo-assets/${selectedPromo.id}`, { method: "DELETE" }, csrfToken);
+      setPromos(result.promos);
+      const nextAsset = result.promos.assets[0] || null;
+      setSelectedPromoId(nextAsset?.id || "");
+      setPromoPlacementDraft(nextAsset ? { ...nextAsset.placement } : null);
+      setNotice({ type: "success", text: "Промоматеріал видалено із сервера." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося видалити промоматеріал." });
+    } finally {
+      setPromoAction("");
+    }
+  }
+
+  async function createPromoCampaign() {
+    if (!selectedPromo || !campaignName.trim() || promoAction) return;
+    setPromoAction("create-campaign");
+    try {
+      const result = await api<{ promos: PromoStatus }>("/api/promo-campaigns", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: campaignName.trim(),
+          assetId: selectedPromo.id,
+          status: campaignStartAt ? "SCHEDULED" : "ACTIVE",
+          startAt: campaignStartAt ? new Date(campaignStartAt).toISOString() : null,
+          intervalMinutes: campaignInterval,
+          durationSeconds: campaignDuration,
+          timezone: "Europe/Kyiv",
+          daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
+        }),
+      }, csrfToken);
+      setPromos(result.promos);
+      setCampaignName("");
+      setCampaignStartAt("");
+      setNotice({ type: "success", text: "Промокампанію створено." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося створити кампанію." });
+    } finally {
+      setPromoAction("");
+    }
+  }
+
+  async function setCampaignStatus(campaign: PromoCampaign, status: PromoCampaign["status"]) {
+    if (promoAction) return;
+    setPromoAction(`campaign:${campaign.id}`);
+    try {
+      const result = await api<{ promos: PromoStatus }>(`/api/promo-campaigns/${campaign.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      }, csrfToken);
+      setPromos(result.promos);
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося змінити кампанію." });
+    } finally {
+      setPromoAction("");
+    }
+  }
+
+  async function deletePromoCampaign(campaign: PromoCampaign) {
+    if (promoAction || !window.confirm(`Видалити кампанію «${campaign.name}»?`)) return;
+    setPromoAction(`campaign:${campaign.id}`);
+    try {
+      const result = await api<{ promos: PromoStatus }>(`/api/promo-campaigns/${campaign.id}`, { method: "DELETE" }, csrfToken);
+      setPromos(result.promos);
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося видалити кампанію." });
+    } finally {
+      setPromoAction("");
+    }
+  }
+
   async function refreshYouTube() {
     if (youtubeAction) return;
     setYoutubeAction("refresh");
@@ -1698,7 +2027,7 @@ export default function Home() {
       );
       setYoutube(result.youtube);
       setFailedChannelAvatarUrl("");
-      setNotice({ type: "success", text: "Дані YouTube синхронізовано вручну." });
+      setNotice({ type: "success", text: "Дані YouTube оновлено поза автоматичним графіком." });
     } catch (error) {
       setNotice({
         type: "error",
@@ -1724,7 +2053,7 @@ export default function Home() {
         csrfToken,
       );
       setYoutube(result.youtube);
-      setNotice({ type: "success", text: "Трансляцію вибрано. Натисніть «Синхронізувати», щоб отримати її сигнал і статистику." });
+      setNotice({ type: "success", text: "Трансляцію вибрано. Сигнал і статистика оновляться автоматично." });
     } catch (error) {
       setNotice({
         type: "error",
@@ -1861,6 +2190,9 @@ export default function Home() {
               {item.id === "playlists" && <span className="sidebar-nav-value">{playlists.length}</span>}
               {item.id === "queue" && <span className="sidebar-nav-value">{queue.items.length}</span>}
               {item.id === "stream" && <span className={`sidebar-state-dot sidebar-state-dot--${stream.status.toLowerCase()}`} aria-hidden="true" />}
+              {item.id === "promos" && (promos?.active
+                ? <span className="sidebar-state-dot sidebar-state-dot--live" aria-hidden="true" />
+                : <span className="sidebar-nav-value">{promos?.assets.length || 0}</span>)}
               {item.id === "monitoring" && <span className={`sidebar-state-dot sidebar-state-dot--${(monitoring?.status || "OFFLINE").toLowerCase()}`} aria-hidden="true" />}
               {item.id === "youtube" && <span className={`sidebar-state-dot ${youtube?.connected ? "sidebar-state-dot--live" : ""}`} aria-hidden="true" />}
             </button>
@@ -2046,17 +2378,6 @@ export default function Home() {
               videos.map((video) => {
                 const ready = video.status === "READY";
                 const processing = ["ANALYZING", "PROCESSING"].includes(video.status);
-                const durationSeconds = video.media?.durationSeconds ?? 0;
-                const thumbnailMax = Math.max(0, durationSeconds - 0.05);
-                const thumbnailPosition = Math.min(
-                  thumbnailMax,
-                  Math.max(
-                    0,
-                    thumbnailDrafts[video.id]
-                      ?? video.thumbnailPositionSeconds
-                      ?? Math.min(10, durationSeconds * 0.1),
-                  ),
-                );
                 return (
                   <div
                     className={`video-row video-row--${video.status.toLowerCase()}`}
@@ -2126,34 +2447,24 @@ export default function Home() {
                         </button>
                       </div>
                     )}
-                    {ready && durationSeconds > 0 && (
-                      <div className="video-thumbnail-editor">
+                    {ready && (
+                      <div className="video-thumbnail-upload">
                         <div className="video-thumbnail-copy">
-                          <span>Кадр для прев’ю</span>
-                          <strong>{formatMediaTime(thumbnailPosition * 1_000)} / {formatMediaTime(durationSeconds * 1_000)}</strong>
+                          <span>Власне прев’ю</span>
+                          <strong>PNG → компактний WebP 16:9</strong>
                         </div>
-                        <input
-                          type="range"
-                          min={0}
-                          max={thumbnailMax}
-                          step={0.1}
-                          value={thumbnailPosition}
-                          onChange={(event) => setThumbnailDrafts((current) => ({
-                            ...current,
-                            [video.id]: Number(event.target.value),
-                          }))}
-                          aria-label={`Момент кадру для ${video.name}`}
-                          disabled={video.thumbnailStatus === "GENERATING" || thumbnailAction === video.id}
-                        />
-                        <button
-                          type="button"
-                          onClick={() => updateVideoThumbnail(video)}
-                          disabled={video.thumbnailStatus === "GENERATING" || Boolean(thumbnailAction)}
-                        >
-                          {video.thumbnailStatus === "GENERATING" || thumbnailAction === video.id
-                            ? "Створюємо…"
-                            : video.thumbnailUrl ? "Оновити кадр" : "Встановити кадр"}
-                        </button>
+                        <label className="video-thumbnail-button" aria-disabled={Boolean(thumbnailAction)}>
+                          {thumbnailAction === video.id ? "Конвертуємо…" : video.thumbnailUrl ? "Замінити PNG" : "Завантажити PNG"}
+                          <input
+                            type="file"
+                            accept="image/png,.png"
+                            disabled={Boolean(thumbnailAction)}
+                            onChange={(event) => {
+                              void uploadVideoThumbnail(video, event.target.files?.[0] || null);
+                              event.currentTarget.value = "";
+                            }}
+                          />
+                        </label>
                         {video.thumbnailError && (
                           <p role="alert">{video.thumbnailError}</p>
                         )}
@@ -2417,6 +2728,173 @@ export default function Home() {
               <summary>Останні повідомлення FFmpeg</summary>
               <pre>{stream.logs.slice(-8).join("\n")}</pre>
             </details>
+          )}
+        </section>
+        )}
+
+        {activeTab === "promos" && (
+        <section id="workspace-promos" className="panel promo-panel" aria-labelledby="promo-title">
+          <div className="panel-heading">
+            <div>
+              <span className="section-icon" aria-hidden="true">◇</span>
+              <h2 id="promo-title">Промоматеріали та кампанії</h2>
+            </div>
+            <span className={`promo-live-state ${promos?.active ? "promo-live-state--active" : ""}`}>
+              {promos?.active ? "промо в ефірі" : "промо неактивне"}
+            </span>
+          </div>
+
+          {!promos ? (
+            <div className="monitoring-empty">Завантажуємо промоматеріали…</div>
+          ) : (
+            <div className="promo-workspace">
+              <div className="promo-library-column">
+                <div className="promo-upload-card">
+                  <div className="promo-card-heading">
+                    <div><span>Бібліотека</span><strong>Новий матеріал</strong></div>
+                    <span>{promos.assets.length}</span>
+                  </div>
+                  <label className="promo-file-picker">
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp"
+                      onChange={(event) => setPromoFile(event.target.files?.[0] || null)}
+                      disabled={Boolean(promoAction)}
+                    />
+                    <span aria-hidden="true">＋</span>
+                    <div>
+                      <strong>{promoFile?.name || "Оберіть PNG, JPG або WebP"}</strong>
+                      <small>{promoFile ? humanSize(promoFile.size) : "Матеріал буде нормалізовано у WebP"}</small>
+                    </div>
+                  </label>
+                  <label className="field promo-small-field">
+                    <span>Назва</span>
+                    <input value={promoName} onChange={(event) => setPromoName(event.target.value)} placeholder="Наприклад, QR Instagram" />
+                  </label>
+                  <label className="field promo-small-field">
+                    <span>Теги через кому</span>
+                    <input value={promoTags} onChange={(event) => setPromoTags(event.target.value)} placeholder="qr, social, right" />
+                  </label>
+                  <button className="button button--primary button--full" type="button" onClick={createPromoAsset} disabled={!promoFile || Boolean(promoAction)}>
+                    {promoAction === "upload" ? "Конвертуємо…" : "Додати до бібліотеки"}
+                  </button>
+                </div>
+
+                <div className="promo-asset-list">
+                  {promos.assets.length === 0 ? (
+                    <div className="empty-state">Додайте перший банер або QR-код.</div>
+                  ) : promos.assets.map((asset) => (
+                    <button
+                      type="button"
+                      className={selectedPromoId === asset.id ? "promo-asset-card promo-asset-card--active" : "promo-asset-card"}
+                      key={asset.id}
+                      onClick={() => {
+                        setSelectedPromoId(asset.id);
+                        setPromoPlacementDraft({ ...asset.placement });
+                      }}
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={asset.fileUrl} alt="" loading="lazy" />
+                      <span><strong>{asset.name}</strong><small>{asset.width}×{asset.height} · {humanSize(asset.size)}</small></span>
+                      <b>{asset.impressions}</b>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="promo-editor-column">
+                {!selectedPromo || !promoPlacementDraft ? (
+                  <div className="promo-editor-empty">Оберіть матеріал у бібліотеці для позиціонування.</div>
+                ) : (
+                  <>
+                    <div className="promo-editor-toolbar">
+                      <div><span>Візуальний редактор 1920×1080</span><strong>{selectedPromo.name}</strong></div>
+                      <button type="button" onClick={deletePromoAsset} disabled={Boolean(promoAction)}>Видалити</button>
+                    </div>
+                    <div className="promo-canvas" aria-label="Попередній перегляд розміщення промоматеріалу">
+                      <div className="promo-safe-area" aria-hidden="true" />
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={selectedPromo.fileUrl}
+                        alt={`Розміщення ${selectedPromo.name}`}
+                        style={{
+                          left: `${(promoPlacementDraft.x / 1_920) * 100}%`,
+                          top: `${(promoPlacementDraft.y / 1_080) * 100}%`,
+                          width: `${(promoPlacementDraft.width / 1_920) * 100}%`,
+                          height: `${(promoPlacementDraft.height / 1_080) * 100}%`,
+                          opacity: promoPlacementDraft.opacity,
+                          zIndex: promoPlacementDraft.zIndex + 1,
+                        }}
+                        onPointerDown={handlePromoPointerDown}
+                        onPointerMove={handlePromoPointerMove}
+                        onPointerUp={handlePromoPointerUp}
+                        onPointerCancel={handlePromoPointerUp}
+                      />
+                    </div>
+
+                    <div className="promo-zone-picker" aria-label="Готові зони">
+                      {["top-left", "top-center", "top-right", "center", "bottom-left", "bottom-center", "bottom-right", "fullscreen"].map((zone) => (
+                        <button key={zone} type="button" className={promoPlacementDraft.zone === zone ? "promo-zone--active" : ""} onClick={() => applyPromoZone(zone)}>
+                          {zone.replace("top", "верх").replace("bottom", "низ").replace("center", "центр").replace("left", "ліво").replace("right", "право").replace("fullscreen", "на весь екран")}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="promo-controls-grid">
+                      <label><span>X</span><input type="number" min={0} max={1_920 - promoPlacementDraft.width} value={promoPlacementDraft.x} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, x: Number(event.target.value), zone: "custom" })} /></label>
+                      <label><span>Y</span><input type="number" min={0} max={1_080 - promoPlacementDraft.height} value={promoPlacementDraft.y} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, y: Number(event.target.value), zone: "custom" })} /></label>
+                      <label><span>Ширина</span><input type="number" min={32} max={1_920} value={promoPlacementDraft.width} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, width: Number(event.target.value), zone: "custom" })} /></label>
+                      <label><span>Висота</span><input type="number" min={32} max={1_080} value={promoPlacementDraft.height} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, height: Number(event.target.value), zone: "custom" })} /></label>
+                      <label className="promo-opacity-control"><span>Прозорість · {Math.round(promoPlacementDraft.opacity * 100)}%</span><input type="range" min={0.05} max={1} step={0.05} value={promoPlacementDraft.opacity} onChange={(event) => setPromoPlacementDraft({ ...promoPlacementDraft, opacity: Number(event.target.value) })} /></label>
+                    </div>
+
+                    <div className="promo-editor-actions">
+                      <button className="button button--quiet" type="button" onClick={savePromoPlacement} disabled={Boolean(promoAction)}>
+                        {promoAction === "save-placement" ? "Зберігаємо…" : "Зберегти позицію"}
+                      </button>
+                      <label><span>Показувати</span><input type="number" min={1} max={3_600} value={promoDuration} onChange={(event) => setPromoDuration(Number(event.target.value))} /><small>с</small></label>
+                      {promos.active ? (
+                        <button className="button button--danger" type="button" onClick={hidePromo} disabled={Boolean(promoAction)}>Приховати</button>
+                      ) : (
+                        <button className="button button--primary" type="button" onClick={showPromoNow} disabled={!active || Boolean(promoAction)}>Показати зараз</button>
+                      )}
+                    </div>
+                    {!active && <p className="promo-stream-note">Ручний показ стане доступним після запуску ефіру.</p>}
+                  </>
+                )}
+              </div>
+
+              <div className="promo-campaigns">
+                <div className="promo-card-heading">
+                  <div><span>Автоматизація</span><strong>Промокампанії</strong></div>
+                  <span>{promos.campaigns.length}</span>
+                </div>
+                <div className="promo-campaign-form">
+                  <label className="field"><span>Назва кампанії</span><input value={campaignName} onChange={(event) => setCampaignName(event.target.value)} placeholder="QR кожні 30 хвилин" /></label>
+                  <label className="field"><span>Інтервал, хв</span><input type="number" min={1} max={1_440} value={campaignInterval} onChange={(event) => setCampaignInterval(Number(event.target.value))} /></label>
+                  <label className="field"><span>Тривалість, с</span><input type="number" min={1} max={3_600} value={campaignDuration} onChange={(event) => setCampaignDuration(Number(event.target.value))} /></label>
+                  <label className="field"><span>Початок (необов’язково)</span><input type="datetime-local" value={campaignStartAt} onChange={(event) => setCampaignStartAt(event.target.value)} /></label>
+                  <button className="button button--primary" type="button" onClick={createPromoCampaign} disabled={!selectedPromo || !campaignName.trim() || Boolean(promoAction)}>Створити кампанію</button>
+                </div>
+                <div className="promo-campaign-list">
+                  {promos.campaigns.length === 0 ? (
+                    <div className="empty-state">Створіть кампанію для показу матеріалу за інтервалом.</div>
+                  ) : promos.campaigns.map((campaign) => {
+                    const campaignAsset = promos.assets.find((asset) => asset.id === campaign.assetId);
+                    const running = ["ACTIVE", "SCHEDULED"].includes(campaign.status);
+                    return (
+                      <div className="promo-campaign-row" key={campaign.id}>
+                        <span className={`promo-campaign-status promo-campaign-status--${campaign.status.toLowerCase()}`} />
+                        <div><strong>{campaign.name}</strong><small>{campaignAsset?.name || "Матеріал видалено"} · кожні {campaign.intervalMinutes} хв · {campaign.durationSeconds} с</small></div>
+                        <span><b>{campaign.impressions}</b><small>показів</small></span>
+                        <button type="button" onClick={() => setCampaignStatus(campaign, running ? "PAUSED" : "ACTIVE")} disabled={Boolean(promoAction)}>{running ? "Пауза" : "Запустити"}</button>
+                        <button className="promo-campaign-delete" type="button" onClick={() => deletePromoCampaign(campaign)} disabled={Boolean(promoAction)}>×</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
           )}
         </section>
         )}
@@ -2748,13 +3226,15 @@ export default function Home() {
                 </div>
                 <div className="youtube-toolbar-actions">
                   <button type="button" onClick={refreshYouTube} disabled={Boolean(youtubeAction)}>
-                    {youtubeAction === "refresh" ? "Синхронізуємо…" : "Синхронізувати з YouTube"}
+                    {youtubeAction === "refresh" ? "Синхронізуємо…" : "Оновити зараз"}
                   </button>
                 </div>
               </div>
 
               <div className="youtube-manual-sync" role="note">
-                Автоматичні запити вимкнено. Канал, ефіри, сигнал і статистика оновлюються лише цією кнопкою, щоб берегти API-квоту.
+                Автосинхронізація активна: метрики — кожні {youtube.polling.metricsSeconds} с, сигнал — {youtube.polling.streamSeconds} с,
+                статус ефіру — {youtube.polling.broadcastSeconds} с, підписники — {youtube.polling.subscribersMinutes} хв,
+                Analytics — {youtube.polling.analyticsMinutes} хв. Орієнтовно {youtube.polling.estimatedDailyUnits.toLocaleString("uk-UA")} одиниць квоти на добу.
                 {youtube.lastUpdatedAt && <span> Остання синхронізація: {new Date(youtube.lastUpdatedAt).toLocaleString("uk-UA")}.</span>}
               </div>
 
@@ -2838,7 +3318,20 @@ export default function Home() {
                   <div className="youtube-quota-track" aria-hidden="true">
                     <span style={{ width: `${Math.min(100, (youtube.quota.used / youtube.quota.limit) * 100)}%` }} />
                   </div>
-                  <p>Квота витрачається лише під час ручної синхронізації та OAuth-операцій.</p>
+                  <p>Polling розподілено так, щоб залишатися нижче стандартного ліміту 10 000 одиниць на добу.</p>
+                </div>
+
+                <div className="youtube-quota-card youtube-analytics-card">
+                  <div className="youtube-card-heading">
+                    <div>
+                      <span>YouTube Analytics</span>
+                      <strong>{youtube.analytics?.available ? `${Math.round(youtube.analytics.estimatedMinutesWatched || 0).toLocaleString("uk-UA")} хв перегляду` : "Очікує доступу"}</strong>
+                    </div>
+                    <span>{youtube.analytics?.updatedAt ? formatEventTime(youtube.analytics.updatedAt) : `кожні ${youtube.polling.analyticsMinutes} хв`}</span>
+                  </div>
+                  <p>{youtube.analytics?.reconnectRequired
+                    ? "Щоб увімкнути Analytics, один раз перепідключіть YouTube у профілі для нового read-only дозволу."
+                    : `Середній перегляд: ${formatMediaTime((youtube.analytics?.averageViewDurationSeconds || 0) * 1_000)}.`}</p>
                 </div>
               </div>
 

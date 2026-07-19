@@ -117,6 +117,7 @@ test("restores pending processing and supports retry after a failure", async (t)
       thumbnailPositions.push(positionSeconds ?? null);
       await copyFile(inputPath, outputPath);
     },
+    customThumbnailImpl: async ({ inputPath, outputPath }) => copyFile(inputPath, outputPath),
     logger: { error() {} },
   });
   t.after(async () => processor.shutdown());
@@ -140,4 +141,9 @@ test("restores pending processing and supports retry after a failure", async (t)
   assert.equal(updated.thumbnailPositionSeconds, 5.2);
   assert.match(updated.thumbnailUrl, /\/thumbnail\?v=/);
   assert.deepEqual(thumbnailPositions, [null, 5.2]);
+
+  const custom = await processor.replaceThumbnail(upload.id, Buffer.from("custom-png"));
+  assert.equal(custom.thumbnailStatus, "READY");
+  assert.equal(custom.thumbnailPositionSeconds, null);
+  assert.match(store.getThumbnailPath(upload.id), /\.thumbnail\.webp$/);
 });

@@ -8,10 +8,13 @@ import { AuditStore } from "./audit-store.mjs";
 import { createOwnerAuth } from "./auth.mjs";
 import { listCompressionProfiles } from "./compression-profiles.mjs";
 import { PostgresDatabase } from "./database.mjs";
+import { readImageBody } from "./image-processor.mjs";
 import { MediaProcessor } from "./media-processor.mjs";
 import { MonitoringService } from "./monitoring-service.mjs";
 import { MonitoringStore } from "./monitoring-store.mjs";
 import { PlaylistStore } from "./playlist-store.mjs";
+import { PromoService } from "./promo-service.mjs";
+import { PromoStore } from "./promo-store.mjs";
 import { QueueStore } from "./queue-store.mjs";
 import { RealtimeHub } from "./realtime-hub.mjs";
 import { SettingsStore } from "./settings-store.mjs";
@@ -143,6 +146,7 @@ export async function createMvpServer({
   realtime,
   audit,
   playlists,
+  promos,
   storage,
   system,
 } = {}) {
@@ -184,6 +188,27 @@ export async function createMvpServer({
       audioBitrate: process.env.MVP_AUDIO_BITRATE || "192k",
       stateStore: encryptedStateStore,
     });
+  const promoIntegration =
+    promos ??
+    new PromoService({
+      store: new PromoStore({ rootDir: dataDir, repository: stateRepository }),
+      ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
+      ffprobePath: process.env.FFPROBE_PATH || "ffprobe",
+      isStreamActive: () => Boolean(streamController.isActive?.()),
+      onOverlayChange: () => streamController.refreshPlayout?.(),
+      onEvent: async (type, payload) => {
+        await Promise.all([
+          realtimeHub.publish(type, payload),
+          auditStore.append({
+            actor: "system",
+            action: type,
+            targetType: "promos",
+            targetId: payload?.assetId || payload?.campaignId || null,
+            details: payload,
+          }),
+        ]);
+      },
+    });
   const mediaProcessor =
     processor ??
     new MediaProcessor({
@@ -222,6 +247,7 @@ export async function createMvpServer({
         ? {
             store: new EncryptedYouTubeStore({ rootDir: dataDir }),
             statsStore: new YouTubeStatsStore({ rootDir: dataDir, repository: stateRepository }),
+            onUpdate: (snapshot) => realtimeHub.publish("YOUTUBE_UPDATED", snapshot),
           }
         : {},
     );
@@ -231,6 +257,7 @@ export async function createMvpServer({
       store: new EncryptedTelegramStore({ rootDir: dataDir }),
     });
   await encryptedStateStore?.init();
+  await promoIntegration.init?.();
   await streamController.init?.({
     resolveVideo: (videoId) => videoStore.getReadyVideo(videoId),
     getQueue: () =>
@@ -244,7 +271,9 @@ export async function createMvpServer({
         ? { ...videoStore.getReadyVideo(fallbackVideoId), isFallback: true }
         : null;
     },
+    getOverlays: () => promoIntegration.activeOverlay?.() || [],
   });
+  promoIntegration.start?.();
   await mediaProcessor.init?.();
   await youtubeIntegration.init?.();
   youtubeIntegration.start?.();
@@ -475,9 +504,20 @@ export async function createMvpServer({
 
       const thumbnailMatch = url.pathname.match(/^\/api\/videos\/([^/]+)\/thumbnail$/);
       if (request.method === "GET" && thumbnailMatch) {
-        response.setHeader("Content-Type", "image/jpeg");
+        const thumbnailPath = videoStore.getThumbnailPath(thumbnailMatch[1]);
+        response.setHeader("Content-Type", path.extname(thumbnailPath).toLowerCase() === ".webp" ? "image/webp" : "image/jpeg");
         response.setHeader("Cache-Control", "private, max-age=3600");
-        createReadStream(videoStore.getThumbnailPath(thumbnailMatch[1])).pipe(response);
+        createReadStream(thumbnailPath).pipe(response);
+        return;
+      }
+
+      if (request.method === "PUT" && thumbnailMatch) {
+        const { buffer } = await readImageBody(request, {
+          maxBytes: 15 * 1024 * 1024,
+          allowedTypes: ["image/png"],
+        });
+        const video = await mediaProcessor.replaceThumbnail(thumbnailMatch[1], buffer);
+        json(response, 200, { video });
         return;
       }
 
@@ -488,6 +528,81 @@ export async function createMvpServer({
           body.positionSeconds,
         );
         json(response, 202, { operation, video: videoStore.getVideo(thumbnailMatch[1]) });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/promos") {
+        json(response, 200, { promos: promoIntegration.snapshot() });
+        return;
+      }
+
+      const promoFileMatch = url.pathname.match(/^\/api\/promo-assets\/([^/]+)\/file$/);
+      if (request.method === "GET" && promoFileMatch) {
+        const asset = promoIntegration.store.requireAsset(promoFileMatch[1]);
+        response.setHeader("Content-Type", "image/webp");
+        response.setHeader("Cache-Control", "private, max-age=3600");
+        createReadStream(promoIntegration.store.assetPath(asset)).pipe(response);
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/promo-assets") {
+        const image = await readImageBody(request, { maxBytes: 20 * 1024 * 1024 });
+        const asset = await promoIntegration.createAsset({
+          name: url.searchParams.get("name") || "Промоматеріал",
+          tags: url.searchParams.get("tags") || "",
+          buffer: image.buffer,
+          sourceMimeType: image.mimeType,
+        });
+        json(response, 201, { asset, promos: promoIntegration.snapshot() });
+        return;
+      }
+
+      const promoAssetMatch = url.pathname.match(/^\/api\/promo-assets\/([^/]+)$/);
+      if (request.method === "PATCH" && promoAssetMatch) {
+        const body = await readJson(request);
+        const asset = await promoIntegration.updateAsset(promoAssetMatch[1], body);
+        json(response, 200, { asset, promos: promoIntegration.snapshot() });
+        return;
+      }
+      if (request.method === "DELETE" && promoAssetMatch) {
+        await promoIntegration.deleteAsset(promoAssetMatch[1]);
+        json(response, 200, { promos: promoIntegration.snapshot() });
+        return;
+      }
+
+      const promoShowMatch = url.pathname.match(/^\/api\/promo-assets\/([^/]+)\/show$/);
+      if (request.method === "POST" && promoShowMatch) {
+        const body = await readJson(request, 8 * 1024);
+        const promosSnapshot = await promoIntegration.show(promoShowMatch[1], {
+          durationSeconds: body.durationSeconds,
+          source: "SPA",
+        });
+        json(response, 200, { promos: promosSnapshot });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/promos/hide") {
+        json(response, 200, { promos: await promoIntegration.hide({ source: "SPA" }) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/promo-campaigns") {
+        const body = await readJson(request);
+        const campaign = await promoIntegration.createCampaign(body);
+        json(response, 201, { campaign, promos: promoIntegration.snapshot() });
+        return;
+      }
+
+      const promoCampaignMatch = url.pathname.match(/^\/api\/promo-campaigns\/([^/]+)$/);
+      if (request.method === "PATCH" && promoCampaignMatch) {
+        const body = await readJson(request);
+        const campaign = await promoIntegration.updateCampaign(promoCampaignMatch[1], body);
+        json(response, 200, { campaign, promos: promoIntegration.snapshot() });
+        return;
+      }
+      if (request.method === "DELETE" && promoCampaignMatch) {
+        await promoIntegration.removeCampaign(promoCampaignMatch[1]);
+        json(response, 200, { promos: promoIntegration.snapshot() });
         return;
       }
 
@@ -945,6 +1060,7 @@ export async function createMvpServer({
     monitoring: monitoringService,
     telegram: telegramIntegration,
     playlists: playlistStore,
+    promos: promoIntegration,
     audit: auditStore,
     realtime: realtimeHub,
     database: databaseService,
@@ -961,6 +1077,7 @@ export async function createMvpServer({
     async close() {
       await systemMonitor.stop?.();
       await monitoringService.stop?.();
+      await promoIntegration.stop?.();
       youtubeIntegration.stop?.();
       await mediaProcessor.shutdown?.();
       if (streamController.shutdown) await streamController.shutdown();
