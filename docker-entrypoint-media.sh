@@ -14,6 +14,8 @@ if [ "$(id -u)" = "0" ]; then
   for item in \
     "$data_dir/videos.json" \
     "$data_dir/videos.json.tmp" \
+    "$data_dir/queue.json" \
+    "$data_dir/queue.json.tmp" \
     "$data_dir/stream-state.enc.json" \
     "$data_dir/stream-state.enc.json.tmp" \
     "$data_dir/uploads"/*.part \

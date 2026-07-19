@@ -178,6 +178,26 @@ test("uploads a video in chunks and starts the selected stream", async (t) => {
   assert.equal(videos.videos[0].preparedSize, 6);
   assert.ok((await readdir(path.join(dataDir, "uploads"))).every((name) => !name.includes(".source.")));
 
+  const addQueueResponse = await fetch(`${baseUrl}/api/queue/items`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: session.cookie,
+      "X-CSRF-Token": session.csrfToken,
+    },
+    body: JSON.stringify({ videoId: created.upload.id }),
+  });
+  assert.equal(addQueueResponse.status, 201);
+  const queueBody = await addQueueResponse.json();
+  assert.equal(queueBody.queue.items.length, 1);
+  assert.equal(queueBody.queue.items[0].video.name, "demo.mp4");
+
+  const queueResponse = await fetch(`${baseUrl}/api/queue`, {
+    headers: { Cookie: session.cookie },
+  });
+  assert.equal(queueResponse.status, 200);
+  assert.equal((await queueResponse.json()).queue.mode, "LOOP_ALL");
+
   const startResponse = await fetch(`${baseUrl}/api/stream/start`, {
     method: "POST",
     headers: {

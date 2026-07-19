@@ -314,6 +314,11 @@ export class VideoStore {
     return { ...publicRecord(record), filePath: this.videoPath(record) };
   }
 
+  getVideo(id) {
+    const record = this.find(id);
+    return record ? publicRecord(record) : null;
+  }
+
   partialPath(record) {
     return path.join(this.uploadsDir, `${record.id}.part`);
   }

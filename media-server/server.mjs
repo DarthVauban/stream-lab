@@ -4,6 +4,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { ApiError } from "./api-error.mjs";
 import { createOwnerAuth } from "./auth.mjs";
 import { MediaProcessor } from "./media-processor.mjs";
+import { QueueStore } from "./queue-store.mjs";
 import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
 import { EncryptedStreamStateStore } from "./stream-state-store.mjs";
@@ -65,7 +66,7 @@ function setCommonHeaders(request, response, allowedOrigins) {
     response.setHeader("Access-Control-Allow-Origin", origin);
     response.setHeader("Vary", "Origin");
   }
-  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type,X-CSRF-Token");
   response.setHeader("Access-Control-Allow-Credentials", "true");
   response.setHeader("Cache-Control", "no-store");
@@ -99,8 +100,10 @@ export async function createMvpServer({
   auth,
   stateStore,
   processor,
+  queue,
 } = {}) {
   const videoStore = store ?? new VideoStore({ rootDir: dataDir });
+  const liveQueue = queue ?? new QueueStore({ rootDir: dataDir });
   const encryptedStateStore =
     stateStore ??
     (controller
@@ -131,11 +134,23 @@ export async function createMvpServer({
   const corsOrigins = allowedOrigins.length ? allowedOrigins : DEFAULT_ALLOWED_ORIGINS;
   const ownerAuth = auth ?? createOwnerAuth();
   await videoStore.init();
+  await liveQueue.init();
   await encryptedStateStore?.init();
   await streamController.init?.({
     resolveVideo: (videoId) => videoStore.getReadyVideo(videoId),
   });
   await mediaProcessor.init?.();
+
+  const queueSnapshot = () => {
+    const snapshot = liveQueue.snapshot();
+    return {
+      ...snapshot,
+      items: snapshot.items.map((item) => ({
+        ...item,
+        video: videoStore.getVideo(item.videoId),
+      })),
+    };
+  };
 
   const server = createServer(async (request, response) => {
     setCommonHeaders(request, response, corsOrigins);
@@ -153,6 +168,7 @@ export async function createMvpServer({
           service: "streamlab-media",
           ffmpeg: streamController.checkFfmpeg(),
           processing: mediaProcessor.snapshot?.() ?? null,
+          queue: { items: liveQueue.snapshot().items.length },
         });
         return;
       }
@@ -193,6 +209,40 @@ export async function createMvpServer({
 
       if (request.method === "GET" && url.pathname === "/api/videos") {
         json(response, 200, { videos: videoStore.listVideos() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/queue") {
+        json(response, 200, { queue: queueSnapshot() });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/queue/items") {
+        const body = await readJson(request);
+        videoStore.getReadyVideo(body.videoId);
+        await liveQueue.add(body.videoId);
+        json(response, 201, { queue: queueSnapshot() });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/queue/reorder") {
+        const body = await readJson(request);
+        await liveQueue.reorder(body.itemIds);
+        json(response, 200, { queue: queueSnapshot() });
+        return;
+      }
+
+      const queueItemMatch = url.pathname.match(/^\/api\/queue\/items\/([^/]+)$/);
+      if (request.method === "DELETE" && queueItemMatch) {
+        await liveQueue.remove(queueItemMatch[1]);
+        json(response, 200, { queue: queueSnapshot() });
+        return;
+      }
+
+      const playNextMatch = url.pathname.match(/^\/api\/queue\/items\/([^/]+)\/play-next$/);
+      if (request.method === "POST" && playNextMatch) {
+        await liveQueue.moveNext(playNextMatch[1]);
+        json(response, 200, { queue: queueSnapshot() });
         return;
       }
 
@@ -268,6 +318,7 @@ export async function createMvpServer({
     store: videoStore,
     controller: streamController,
     processor: mediaProcessor,
+    queue: liveQueue,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);

@@ -58,6 +58,22 @@ type Health = {
   ok: boolean;
   ffmpeg: { available: boolean; version: string | null; message: string | null };
   processing: { activeVideoId: string | null; queued: number; lastError: string | null } | null;
+  queue: { items: number };
+};
+
+type QueueItem = {
+  id: string;
+  videoId: string;
+  position: number;
+  addedAt: string;
+  video: Video | null;
+};
+
+type QueueState = {
+  mode: "LOOP_ALL";
+  version: number;
+  updatedAt: string | null;
+  items: QueueItem[];
 };
 
 type AuthSession =
@@ -159,6 +175,13 @@ const emptyStream: StreamStatus = {
   logs: [],
 };
 
+const emptyQueue: QueueState = {
+  mode: "LOOP_ALL",
+  version: 0,
+  updatedAt: null,
+  items: [],
+};
+
 export default function Home() {
   const [authState, setAuthState] = useState<"loading" | "anonymous" | "authenticated">("loading");
   const [owner, setOwner] = useState("");
@@ -170,12 +193,15 @@ export default function Home() {
   const [health, setHealth] = useState<Health | null>(null);
   const [videos, setVideos] = useState<Video[]>([]);
   const [stream, setStream] = useState<StreamStatus>(emptyStream);
+  const [queue, setQueue] = useState<QueueState>(emptyQueue);
   const [selectedVideoId, setSelectedVideoId] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [processingAction, setProcessingAction] = useState("");
+  const [queueAction, setQueueAction] = useState("");
+  const [draggedQueueItemId, setDraggedQueueItemId] = useState("");
   const [streamUrl, setStreamUrl] = useState("rtmps://a.rtmps.youtube.com/live2");
   const [streamKey, setStreamKey] = useState("");
   const [streamAction, setStreamAction] = useState(false);
@@ -186,14 +212,16 @@ export default function Home() {
 
   const refresh = useCallback(async () => {
     try {
-      const [healthResult, videosResult, streamResult] = await Promise.all([
+      const [healthResult, videosResult, streamResult, queueResult] = await Promise.all([
         api<Health>("/api/health"),
         api<{ videos: Video[] }>("/api/videos"),
         api<{ stream: StreamStatus }>("/api/stream/status"),
+        api<{ queue: QueueState }>("/api/queue"),
       ]);
       setHealth(healthResult);
       setVideos(videosResult.videos);
       setStream(streamResult.stream);
+      setQueue(queueResult.queue);
       setSelectedVideoId((current) => {
         const readyVideos = videosResult.videos.filter((video) => video.status === "READY");
         if (current && readyVideos.some((video) => video.id === current)) return current;
@@ -247,6 +275,12 @@ export default function Home() {
     () => videos.find((video) => video.id === selectedVideoId) ?? null,
     [selectedVideoId, videos],
   );
+  const currentQueueIndex = stream.videoId
+    ? queue.items.findIndex((item) => item.videoId === stream.videoId)
+    : -1;
+  const nextQueueItem = queue.items.length > 0
+    ? queue.items[currentQueueIndex >= 0 ? (currentQueueIndex + 1) % queue.items.length : 0]
+    : null;
   const readyToStart = Boolean(
     selectedVideo?.status === "READY" && streamUrl.trim() && streamKey.trim() && health?.ffmpeg.available,
   );
@@ -283,6 +317,7 @@ export default function Home() {
       setCsrfToken("");
       setVideos([]);
       setStream(emptyStream);
+      setQueue(emptyQueue);
     }
   }
 
@@ -419,6 +454,125 @@ export default function Home() {
     } finally {
       setProcessingAction("");
     }
+  }
+
+  async function addVideoToQueue(videoId: string) {
+    if (queueAction) return;
+    setQueueAction(`add:${videoId}`);
+    setNotice(null);
+    try {
+      const result = await api<{ queue: QueueState }>("/api/queue/items", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoId }),
+      }, csrfToken);
+      setQueue(result.queue);
+      setNotice({ type: "success", text: "Відео додано до черги трансляції." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося додати відео до черги.",
+      });
+    } finally {
+      setQueueAction("");
+    }
+  }
+
+  async function removeQueueItem(itemId: string) {
+    if (queueAction) return;
+    setQueueAction(`remove:${itemId}`);
+    setNotice(null);
+    try {
+      const result = await api<{ queue: QueueState }>(`/api/queue/items/${itemId}`, {
+        method: "DELETE",
+      }, csrfToken);
+      setQueue(result.queue);
+      setNotice({ type: "success", text: "Відео прибрано з черги." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося змінити чергу.",
+      });
+    } finally {
+      setQueueAction("");
+    }
+  }
+
+  async function playQueueItemNext(itemId: string) {
+    if (queueAction) return;
+    setQueueAction(`next:${itemId}`);
+    setNotice(null);
+    try {
+      const result = await api<{ queue: QueueState }>(`/api/queue/items/${itemId}/play-next`, {
+        method: "POST",
+      }, csrfToken);
+      setQueue(result.queue);
+      setNotice({ type: "success", text: "Відео переміщено на початок черги." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося змінити чергу.",
+      });
+    } finally {
+      setQueueAction("");
+    }
+  }
+
+  async function saveQueueOrder(items: QueueItem[]) {
+    if (queueAction) return;
+    const previous = queue;
+    const optimisticItems = items.map((item, position) => ({ ...item, position }));
+    setQueue({ ...queue, items: optimisticItems });
+    setQueueAction("reorder");
+    try {
+      const result = await api<{ queue: QueueState }>("/api/queue/reorder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ itemIds: optimisticItems.map((item) => item.id) }),
+      }, csrfToken);
+      setQueue(result.queue);
+    } catch (error) {
+      setQueue(previous);
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося зберегти порядок черги.",
+      });
+    } finally {
+      setQueueAction("");
+      setDraggedQueueItemId("");
+    }
+  }
+
+  function moveQueueItem(itemId: string, direction: -1 | 1) {
+    if (queueAction) return;
+    const currentIndex = queue.items.findIndex((item) => item.id === itemId);
+    const targetIndex = currentIndex + direction;
+    if (currentIndex < 0 || targetIndex < 0 || targetIndex >= queue.items.length) return;
+    const items = [...queue.items];
+    [items[currentIndex], items[targetIndex]] = [items[targetIndex], items[currentIndex]];
+    void saveQueueOrder(items);
+  }
+
+  function handleQueueDragStart(event: ReactDragEvent<HTMLDivElement>, itemId: string) {
+    setDraggedQueueItemId(itemId);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", itemId);
+  }
+
+  function handleQueueDrop(event: ReactDragEvent<HTMLDivElement>, targetItemId: string) {
+    event.preventDefault();
+    const sourceItemId = draggedQueueItemId || event.dataTransfer.getData("text/plain");
+    if (!sourceItemId || sourceItemId === targetItemId || queueAction) return;
+
+    const sourceItem = queue.items.find((item) => item.id === sourceItemId);
+    if (!sourceItem) return;
+    const items = queue.items.filter((item) => item.id !== sourceItemId);
+    const targetIndex = items.findIndex((item) => item.id === targetItemId);
+    if (targetIndex < 0) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const insertAfter = event.clientY > bounds.top + bounds.height / 2;
+    items.splice(targetIndex + (insertAfter ? 1 : 0), 0, sourceItem);
+    void saveQueueOrder(items);
   }
 
   async function startStream(event: FormEvent) {
@@ -718,6 +872,16 @@ export default function Home() {
                         </button>
                       </div>
                     )}
+                    {ready && (
+                      <button
+                        className="video-add-queue"
+                        type="button"
+                        onClick={() => addVideoToQueue(video.id)}
+                        disabled={Boolean(queueAction)}
+                      >
+                        {queueAction === `add:${video.id}` ? "Додаємо…" : "+ До черги"}
+                      </button>
+                    )}
                   </div>
                 );
               })
@@ -815,6 +979,107 @@ export default function Home() {
               <pre>{stream.logs.slice(-8).join("\n")}</pre>
             </details>
           )}
+        </section>
+
+        <section className="panel queue-panel" aria-labelledby="queue-title">
+          <div className="panel-heading">
+            <div>
+              <span className="step-number">03</span>
+              <h2 id="queue-title">Черга трансляції</h2>
+            </div>
+            <span className="panel-kicker">{queue.items.length} · LOOP</span>
+          </div>
+
+          <div className="queue-summary">
+            <div>
+              <span>Зараз</span>
+              <strong>{stream.videoName || "Ефір не запущено"}</strong>
+            </div>
+            <div>
+              <span>Наступне</span>
+              <strong>{nextQueueItem?.video?.name || "Черга порожня"}</strong>
+            </div>
+            <div>
+              <span>Режим</span>
+              <strong>Циклічно</strong>
+            </div>
+          </div>
+
+          {queue.items.length === 0 ? (
+            <div className="queue-empty">
+              Черга порожня. Додайте готові відео кнопкою «До черги» в бібліотеці.
+            </div>
+          ) : (
+            <div className="queue-list">
+              {queue.items.map((item, index) => (
+                <div
+                  className={`queue-row ${draggedQueueItemId === item.id ? "queue-row--dragging" : ""} ${stream.videoId === item.videoId ? "queue-row--current" : ""}`}
+                  key={item.id}
+                  draggable={!queueAction}
+                  onDragStart={(event) => handleQueueDragStart(event, item.id)}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = "move";
+                  }}
+                  onDrop={(event) => handleQueueDrop(event, item.id)}
+                  onDragEnd={() => setDraggedQueueItemId("")}
+                  aria-grabbed={draggedQueueItemId === item.id}
+                >
+                  <span className="queue-grip" aria-hidden="true">⋮⋮</span>
+                  <span className="queue-position">{String(index + 1).padStart(2, "0")}</span>
+                  <span className="queue-copy">
+                    <strong>{item.video?.name || "Відео недоступне"}</strong>
+                    <span>
+                      {item.video ? videoMeta(item.video) : "Файл видалено з бібліотеки"}
+                      {stream.videoId === item.videoId ? " · зараз в ефірі" : ""}
+                    </span>
+                  </span>
+                  <div className="queue-actions">
+                    <button
+                      type="button"
+                      title="Перемістити вище"
+                      aria-label={`Перемістити ${item.video?.name || "відео"} вище`}
+                      onClick={() => moveQueueItem(item.id, -1)}
+                      disabled={index === 0 || Boolean(queueAction)}
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      title="Перемістити нижче"
+                      aria-label={`Перемістити ${item.video?.name || "відео"} нижче`}
+                      onClick={() => moveQueueItem(item.id, 1)}
+                      disabled={index === queue.items.length - 1 || Boolean(queueAction)}
+                    >
+                      ↓
+                    </button>
+                    <button
+                      className="queue-next"
+                      type="button"
+                      onClick={() => playQueueItemNext(item.id)}
+                      disabled={index === 0 || Boolean(queueAction)}
+                    >
+                      {queueAction === `next:${item.id}` ? "Зберігаємо…" : "Наступним"}
+                    </button>
+                    <button
+                      className="queue-remove"
+                      type="button"
+                      title="Прибрати з черги"
+                      aria-label={`Прибрати ${item.video?.name || "відео"} з черги`}
+                      onClick={() => removeQueueItem(item.id)}
+                      disabled={Boolean(queueAction)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <p className="queue-note">
+            Порядок уже зберігається після перезапуску сервісу. Автоматичне безшовне перемикання відео підключимо наступним кроком.
+          </p>
         </section>
       </div>
 
