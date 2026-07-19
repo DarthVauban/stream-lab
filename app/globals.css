@@ -419,6 +419,39 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .monitoring-range button { min-height: 30px; padding: 0 11px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font-size: 10px; font-weight: 730; }
 .monitoring-range button:not(.monitoring-range--active):hover { color: #d4dbe2; }
 .monitoring-range .monitoring-range--active { background: #242b34; color: var(--green); }
+.soak-card { display: grid; gap: 12px; margin-bottom: 16px; padding: 16px; border: 1px solid var(--border); border-radius: 15px; background: linear-gradient(145deg, rgba(134,183,255,.035), rgba(0,0,0,.14)); }
+.soak-card--running { border-color: rgba(134,183,255,.25); }
+.soak-card--passed { border-color: rgba(121,242,164,.28); background: linear-gradient(145deg, rgba(121,242,164,.05), rgba(0,0,0,.14)); }
+.soak-card--failed, .soak-card--cancelled { border-color: rgba(255,93,99,.24); }
+.soak-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.soak-card-heading span, .soak-card-heading strong { display: block; }
+.soak-card-heading > div > span { color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.soak-card-heading strong { margin-top: 4px; font-size: 14px; }
+.soak-status { padding: 6px 9px; border-radius: 8px; background: #202731; color: #9aa6b3; font-size: 8px; font-weight: 750; letter-spacing: .06em; text-transform: uppercase; }
+.soak-card--running .soak-status { background: rgba(134,183,255,.09); color: #9fc3ff; }
+.soak-card--passed .soak-status { background: rgba(121,242,164,.09); color: var(--green); }
+.soak-card--failed .soak-status, .soak-card--cancelled .soak-status { background: rgba(255,93,99,.09); color: #ff8d91; }
+.soak-progress { height: 5px; overflow: hidden; border-radius: 99px; background: #242b34; }
+.soak-progress i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #6d9de8, #86b7ff); transition: width .5s linear; }
+.soak-card--passed .soak-progress i { background: var(--green); }
+.soak-card--failed .soak-progress i, .soak-card--cancelled .soak-progress i { background: var(--red); }
+.soak-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+.soak-summary > div { min-width: 0; padding: 10px 11px; border: 1px solid rgba(255,255,255,.055); border-radius: 10px; background: rgba(0,0,0,.13); }
+.soak-summary span, .soak-summary strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.soak-summary span { color: var(--muted); font-size: 8px; text-transform: uppercase; }
+.soak-summary strong { margin-top: 5px; font: 700 11px ui-monospace, monospace; }
+.soak-coverage { display: flex; flex-wrap: wrap; gap: 6px; }
+.soak-coverage > span { display: inline-flex; align-items: center; gap: 6px; padding: 7px 9px; border: 1px solid rgba(255,255,255,.06); border-radius: 8px; color: #7c8793; font-size: 9px; }
+.soak-coverage > span i { width: 12px; color: #68737f; font-style: normal; text-align: center; }
+.soak-coverage .soak-check--passed { border-color: rgba(121,242,164,.2); background: rgba(121,242,164,.04); color: #b9c9c0; }
+.soak-coverage .soak-check--passed i { color: var(--green); }
+.soak-description, .soak-result { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.soak-result { padding: 9px 11px; border-radius: 9px; }
+.soak-result--passed { background: rgba(121,242,164,.055); color: var(--green); }
+.soak-result--failed { background: rgba(255,93,99,.055); color: #ff8d91; }
+.soak-actions { display: flex; align-items: center; gap: 10px; }
+.soak-actions .button { min-height: 36px; padding: 0 12px; font-size: 9px; }
+.soak-actions small { color: #77828e; font-size: 8px; line-height: 1.4; }
 .monitoring-empty { min-height: 240px; display: grid; place-items: center; border: 1px dashed var(--border-bright); border-radius: 15px; color: var(--muted); font-size: 12px; }
 .monitoring-dashboard { display: grid; gap: 16px; }
 .system-monitoring-empty { min-height: 90px; display: grid; place-items: center; margin-bottom: 16px; border: 1px dashed var(--border-bright); border-radius: 15px; color: var(--muted); font-size: 11px; }
@@ -762,6 +795,9 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
   .monitoring-status-card { grid-template-columns: auto minmax(0, 1fr); }
   .monitoring-status-card > time { grid-column: 2; }
   .monitoring-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .soak-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .soak-card-heading, .soak-actions { align-items: flex-start; flex-direction: column; }
+  .soak-actions .button { width: 100%; }
   .system-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .system-monitoring-heading { align-items: flex-start; }
   .monitoring-event { grid-template-columns: auto minmax(0, 1fr); }

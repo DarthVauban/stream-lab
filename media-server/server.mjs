@@ -18,6 +18,7 @@ import { PromoStore } from "./promo-store.mjs";
 import { QueueStore } from "./queue-store.mjs";
 import { RealtimeHub } from "./realtime-hub.mjs";
 import { SettingsStore } from "./settings-store.mjs";
+import { SoakTestService } from "./soak-test-service.mjs";
 import { StorageMonitor } from "./storage-monitor.mjs";
 import { SystemMonitor } from "./system-monitor.mjs";
 import { VideoStore } from "./store.mjs";
@@ -150,6 +151,7 @@ export async function createMvpServer({
   promos,
   storage,
   system,
+  soak,
 } = {}) {
   const databaseService = database ?? new PostgresDatabase();
   await databaseService.init?.();
@@ -415,6 +417,25 @@ export async function createMvpServer({
     executeControl: executeTelegramControl,
   });
   await telegramIntegration.init?.();
+  const soakTest = soak ?? new SoakTestService({
+    rootDir: dataDir,
+    getSnapshot: async () => {
+      const [databaseHealth, realtimeHealth] = await Promise.all([
+        databaseService.health?.().catch(() => ({ configured: databaseService.configured, connected: false })),
+        realtimeHub.health?.().catch(() => realtimeHub.snapshot()),
+      ]);
+      return {
+        stream: streamController.snapshot(),
+        system: systemMonitor.snapshot?.() ?? null,
+        database: databaseHealth,
+        realtime: realtimeHealth,
+        monitoring: monitoringService.snapshot({ hours: 168 }),
+        promos: promoIntegration.snapshot?.() ?? null,
+        telegram: telegramIntegration.snapshot?.() ?? null,
+      };
+    },
+  });
+  await soakTest.init?.();
 
   const deletingVideoIds = new Set();
   const streamEventClients = new Set();
@@ -600,9 +621,16 @@ export async function createMvpServer({
           "Cache-Control": "no-cache, no-transform",
           "X-Accel-Buffering": "no",
         });
-        response.write(`data: ${JSON.stringify({ type: "READY", occurredAt: new Date().toISOString() })}\n\n`);
+        const lastEventId = String(request.headers["last-event-id"] || url.searchParams.get("lastEventId") || "");
+        const replay = realtimeHub.replaySince?.(lastEventId) ?? [];
+        response.write(`data: ${JSON.stringify({ type: "READY", occurredAt: new Date().toISOString(), resetRequired: replay === null })}\n\n`);
+        if (Array.isArray(replay)) {
+          for (const event of replay) {
+            response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
+          }
+        }
         const unsubscribe = realtimeHub.subscribe((event) => {
-          response.write(`data: ${JSON.stringify(event)}\n\n`);
+          response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
         });
         const keepAlive = setInterval(() => response.write(": keepalive\n\n"), 20_000);
         keepAlive.unref?.();
@@ -775,6 +803,28 @@ export async function createMvpServer({
         json(response, 200, {
           monitoring: monitoringService.snapshot({ hours: url.searchParams.get("hours") }),
         });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/hardening/soak-test") {
+        json(response, 200, { soakTest: soakTest.snapshot() });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/hardening/soak-test") {
+        const body = await readJson(request, 16 * 1024);
+        const soakSnapshot = await soakTest.start({
+          durationHours: body.durationHours ?? 72,
+        });
+        await realtimeHub.publish("SOAK_TEST_UPDATED", soakSnapshot);
+        json(response, 201, { soakTest: soakSnapshot });
+        return;
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/api/hardening/soak-test") {
+        const soakSnapshot = await soakTest.cancel();
+        await realtimeHub.publish("SOAK_TEST_UPDATED", soakSnapshot);
+        json(response, 200, { soakTest: soakSnapshot });
         return;
       }
 
@@ -1156,8 +1206,14 @@ export async function createMvpServer({
       webSocketServer.emit("connection", client, request);
     });
   });
-  webSocketServer.on("connection", (client) => {
-    client.send(JSON.stringify({ type: "READY", occurredAt: new Date().toISOString() }));
+  webSocketServer.on("connection", (client, request) => {
+    const url = new URL(request.url ?? "/", "http://localhost");
+    const lastEventId = url.searchParams.get("lastEventId") || "";
+    const replay = realtimeHub.replaySince?.(lastEventId) ?? [];
+    client.send(JSON.stringify({ type: "READY", occurredAt: new Date().toISOString(), resetRequired: replay === null }));
+    if (Array.isArray(replay)) {
+      for (const event of replay) client.send(JSON.stringify(event));
+    }
     const unsubscribe = realtimeHub.subscribe((event) => {
       if (client.readyState === 1) client.send(JSON.stringify(event));
     });
@@ -1182,6 +1238,7 @@ export async function createMvpServer({
     realtime: realtimeHub,
     database: databaseService,
     system: systemMonitor,
+    soak: soakTest,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -1193,6 +1250,7 @@ export async function createMvpServer({
     },
     async close() {
       await systemMonitor.stop?.();
+      await soakTest.close?.();
       await monitoringService.stop?.();
       await promoIntegration.stop?.();
       youtubeIntegration.stop?.();

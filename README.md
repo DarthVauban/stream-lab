@@ -139,6 +139,10 @@ header; повторні Telegram update не виконуються двічі.
 також задати через `TELEGRAM_WEBHOOK_URL`, `TELEGRAM_ALLOWED_USER_IDS` і
 `TELEGRAM_ALLOWED_CHAT_IDS`, але після першого підключення вони редагуються у профілі.
 
+Після `/start` бот додає постійну кнопкову клавіатуру: статистика, поточне відео,
+черга, сервер, стан трансляції, оновлення та захищене керування доступні без ручного
+введення команд із `/`. Команди BotFather залишаються як альтернативний спосіб.
+
 ## Моніторинг якості
 
 Вкладка «Моніторинг» показує машинозчитуваний прогрес постійного FFmpeg uplink:
@@ -185,8 +189,8 @@ docker compose --profile production up -d --wait
 ```
 
 Панель буде доступна за `https://stream.mt-panel.sbs`. Caddy автоматично отримує
-й поновлює TLS-сертифікат та перенаправляє HTTP на HTTPS. Для першого випуску порт
-`3000` залишається резервним; його потрібно закрити після перевірки доменного доступу.
+й поновлює TLS-сертифікат та перенаправляє HTTP на HTTPS. Резервний порт `3000`
+прив’язаний лише до `127.0.0.1`, тому з інтернету недоступний.
 
 DNS-запис `A` повинен вказувати на той самий сервер, де працює Docker Compose,
 а TCP-порти `80` і `443` мають бути відкриті у firewall VPS та операційної системи.
@@ -288,10 +292,112 @@ OWNER-сесію та CSRF-токен. Сесія підписана,
 оригінал, підготовлену копію і тимчасові файли. Відео активного ефіру або файл,
 який ще обробляється, видалити неможливо.
 
+## Production hardening
+
+### Резервне копіювання і відновлення
+
+Production-профіль запускає `backup-scheduler`: перша копія створюється після
+старту, наступні — кожні 24 години. Кожен backup містить PostgreSQL dump, медіа,
+прев’ю, промо, зашифровані інтеграції та стан відновлення ефіру. Незавершені
+upload/temp-файли не копіюються. Архів і dump перевіряються через SHA-256,
+`pg_restore --list` та читання tar; типово зберігаються останні 14 днів у
+`stream-lab/backups/`.
+
+Керування на сервері:
+
+```bash
+# створити додаткову копію зараз
+docker compose --profile maintenance run --rm backup create
+
+# показати доступні копії та повторно перевірити потрібну
+docker compose --profile maintenance run --rm backup list
+docker compose --profile maintenance run --rm backup verify streamlab-20260720T120000Z
+
+# контрольоване відновлення: зупиняє web/media/backup, створює safety-copy,
+# відновлює БД і data, потім запускає production та чекає healthcheck
+sh scripts/restore-backup.sh streamlab-20260720T120000Z
+```
+
+Restore навмисно не запускається без `STREAMLAB_RESTORE_CONFIRMED=YES`; обгортка
+встановлює його лише після зупинки сервісів. Перед перезаписом автоматично
+створюється `pre-restore-*` safety-copy. Для аварії всього VPS каталог `backups/`
+потрібно додатково синхронізувати на інший сервер або object storage.
+
+Інтервал і ротація задаються `BACKUP_INTERVAL_SECONDS` та
+`BACKUP_RETENTION_DAYS`.
+
+### Reconnect-сценарії
+
+Uplink, playout/fallback, відновлення зашифрованого стану після рестарту та replay
+пропущених realtime-подій перевіряються окремим набором:
+
+```bash
+npm run test:reconnect
+```
+
+Браузер повторно відкриває WebSocket з exponential backoff до 30 секунд. Поки
+WebSocket недоступний, працює SSE; `lastEventId` дозволяє дограти пропущені події,
+а якщо курсор уже не зберігся, SPA одразу завантажує новий snapshot.
+
+### Security-аудит
+
+Локальний аудит перевіряє відсутність tracked secrets, обов’язкові environment
+secrets, Docker privilege hardening, закриті внутрішні порти, backup/restore guards,
+Secure cookie та security headers. Він також є обов’язковим кроком GitHub Actions.
+
+```bash
+npm run audit:security
+npm run audit:security -- --url https://stream.mt-panel.sbs --report reports/security-production.json
+npm run audit:dependencies
+```
+
+Production URL додає живу перевірку HTTPS, health endpoint, HSTS, CSP,
+Permissions-Policy, Referrer-Policy, X-Content-Type-Options і X-Frame-Options.
+
+### Load test
+
+Load test виконує лише безпечні GET-запити. Без облікових даних перевіряється
+`/api/health`; із `LOAD_TEST_USERNAME` і `LOAD_TEST_PASSWORD` — також бібліотека,
+черга, стрім, системні метрики, моніторинг і сховище. Пароль не передається в
+аргументах командного рядка й не потрапляє до звіту.
+
+```bash
+export LOAD_TEST_URL='https://stream.mt-panel.sbs'
+export LOAD_TEST_USERNAME='owner'
+read -s -p 'OWNER password: ' LOAD_TEST_PASSWORD; export LOAD_TEST_PASSWORD; echo
+npm run test:load -- --duration 300 --concurrency 20 --max-p95 500 --report reports/load-production.json
+unset LOAD_TEST_PASSWORD
+```
+
+Тест проходить, якщо error rate не перевищує 1%, а p95 базових API — 500 мс.
+
+### Обов’язковий 72-годинний soak test
+
+На екрані «Моніторинг» запустіть тест кнопкою «Запустити 72 години» після старту
+ефіру. Стан записується у `data/soak-test.json`, тому deployment або restart
+медіасервера не обнуляє прогрес. Щохвилини локально перевіряються доступність
+ефіру, PostgreSQL і Redis, RSS/heap, накопичення temp-файлів та покриття сценаріїв;
+жодних додаткових YouTube API-запитів тест не робить.
+
+До завершення одного прогону потрібно побачити в картці п’ять зелених пунктів:
+
+1. звичайний перехід між відео;
+2. роботу fallback;
+3. втрату й успішне відновлення RTMPS;
+4. показ промоматеріалу;
+5. будь-яку дозволену Telegram-команду.
+
+Прохід вимагає щонайменше 99,5% здорових samples, не більше 30% сталого приросту
+RSS, не більше 512 МБ приросту temp-файлів і всі п’ять сценаріїв. Лише фінальний
+статус «Пройдено» після фактичних 72 годин закриває приймальний пункт ТЗ; короткі
+unit/integration-тести не підміняють цей прогін.
+
 ## Перевірка
 
 ```powershell
 npm test
+npm run lint
+npm run audit:security
 npm run build
 ```
 

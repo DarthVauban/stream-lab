@@ -32,6 +32,8 @@ if [ "$(id -u)" = "0" ]; then
     "$data_dir/youtube-stats.json.tmp" \
     "$data_dir/monitoring.json" \
     "$data_dir/monitoring.json.tmp" \
+    "$data_dir/soak-test.json" \
+    "$data_dir/soak-test.json.tmp" \
     "$data_dir/telegram-bot.enc.json" \
     "$data_dir/telegram-bot.enc.json.tmp" \
     "$data_dir/promos.json" \

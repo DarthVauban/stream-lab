@@ -104,7 +104,8 @@ test("registers an encrypted Telegram webhook and protects control confirmations
   const reply = calls.find((call) => call.method === "sendMessage");
   assert.equal(reply.body.chat_id, "111");
   assert.match(reply.body.text, /одноразовим підтвердженням/);
-  assert.equal(reply.body.reply_markup.inline_keyboard.length, 4);
+  assert.equal(reply.body.reply_markup.keyboard.length, 4);
+  assert.equal(reply.body.reply_markup.is_persistent, true);
 
   const callCount = calls.length;
   const duplicate = await service.handleWebhook(connection.webhook.secret, update);
@@ -231,6 +232,13 @@ test("registers an encrypted Telegram webhook and protects control confirmations
   });
   assert.equal(expired.confirmationExpired, true);
   assert.equal(controls.length, 2);
+
+  const persistentButton = await service.handleWebhook(connection.webhook.secret, {
+    update_id: 12,
+    message: { message_id: 12, from: { id: 111 }, chat: { id: 111 }, text: "📊 Статистика зараз" },
+  });
+  assert.equal(persistentButton.command, "stats_now");
+  assert.match(calls.filter((call) => call.method === "sendMessage").at(-1).body.text, /12/);
 
   const notificationsBefore = calls.filter((call) => call.method === "sendMessage").length;
   await service.notifyMonitoringEvent({

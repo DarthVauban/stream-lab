@@ -43,4 +43,6 @@ next-env.d.ts
 /dist/
 /outputs/
 /work/
+/backups/
+/reports/
 *.tsbuildinfo

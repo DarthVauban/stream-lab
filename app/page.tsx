@@ -449,6 +449,55 @@ type TelegramStatus = {
   } | null;
 };
 
+type SoakTestRun = {
+  id: string;
+  status: "RUNNING" | "PASSED" | "FAILED" | "CANCELLED";
+  startedAt: string;
+  endsAt: string;
+  completedAt: string | null;
+  durationHours: number;
+  latest: {
+    capturedAt: string;
+    healthy: boolean;
+    streamStatus: string;
+    processRssBytes: number;
+    tempFiles: number;
+    tempBytes: number;
+  } | null;
+  coverage: {
+    videoTransitions: number;
+    fallbackObserved: boolean;
+    reconnectAttempts: number;
+    reconnectRecoveries: number;
+    promoImpressions: number;
+    telegramCommands: number;
+  };
+  counters: {
+    total: number;
+    healthy: number;
+    unhealthy: number;
+  };
+  result: {
+    passed: boolean;
+    availabilityPercent?: number;
+    rssGrowthPercent?: number;
+    tempGrowthBytes?: number;
+    checks: Array<{ id: string; passed: boolean; value: unknown; expected: unknown }>;
+  } | null;
+};
+
+type SoakTestStatus = {
+  current: SoakTestRun | null;
+  history: SoakTestRun[];
+  requiredDurationHours: number;
+  sampleIntervalMs: number;
+  thresholds: {
+    availabilityPercent: number;
+    maxRssGrowthPercent: number;
+    maxTempGrowthBytes: number;
+  };
+};
+
 class ApiRequestError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
@@ -706,6 +755,8 @@ export default function Home() {
     serverWarnings: true,
   });
   const [telegramAction, setTelegramAction] = useState("");
+  const [soakTest, setSoakTest] = useState<SoakTestStatus | null>(null);
+  const [soakTestAction, setSoakTestAction] = useState("");
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [failedChannelAvatarUrl, setFailedChannelAvatarUrl] = useState("");
@@ -756,12 +807,14 @@ export default function Home() {
 
   const refreshMonitoring = useCallback(async (hours: MonitoringRange) => {
     try {
-      const [result, auditResult] = await Promise.all([
+      const [result, auditResult, soakResult] = await Promise.all([
         api<{ monitoring: MonitoringStatus }>(`/api/monitoring/status?hours=${hours}`),
         api<{ entries: AuditEntry[] }>("/api/audit?limit=40"),
+        api<{ soakTest: SoakTestStatus }>("/api/hardening/soak-test"),
       ]);
       setMonitoring(result.monitoring);
       setAuditEntries(auditResult.entries);
+      setSoakTest(soakResult.soakTest);
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
         setAuthState("anonymous");
@@ -838,12 +891,20 @@ export default function Home() {
   useEffect(() => {
     if (authState !== "authenticated") return;
     let refreshTimer = 0;
+    let reconnectTimer = 0;
     let fallback: EventSource | null = null;
+    let socket: WebSocket | null = null;
+    let reconnectAttempt = 0;
+    let lastEventId = "";
     let closed = false;
     const handleMessage = (data: string) => {
       try {
-        const payload = JSON.parse(data) as { type?: string; payload?: unknown };
-        if (payload.type === "READY") return;
+        const payload = JSON.parse(data) as { id?: string; type?: string; payload?: unknown; resetRequired?: boolean };
+        if (payload.id) lastEventId = payload.id;
+        if (payload.type === "READY") {
+          if (payload.resetRequired) void refresh();
+          return;
+        }
         if (payload.type === "SYSTEM_METRICS" && payload.payload) {
           setSystemStatus(payload.payload as SystemStatus);
           return;
@@ -856,33 +917,53 @@ export default function Home() {
     };
     const startFallback = () => {
       if (closed || fallback) return;
-      fallback = new EventSource("/api/realtime/stream");
+      const cursor = lastEventId ? `?lastEventId=${encodeURIComponent(lastEventId)}` : "";
+      fallback = new EventSource(`/api/realtime/stream${cursor}`);
       fallback.onopen = () => setRealtimeConnected(true);
       fallback.onerror = () => setRealtimeConnected(false);
-      fallback.onmessage = (event) => handleMessage(event.data);
+      fallback.onmessage = (event) => {
+        if (event.lastEventId) lastEventId = event.lastEventId;
+        handleMessage(event.data);
+      };
     };
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${window.location.host}/api/events`);
-    const fallbackTimer = window.setTimeout(() => {
-      if (socket.readyState !== WebSocket.OPEN) startFallback();
-    }, 1_500);
-    socket.onopen = () => {
-      window.clearTimeout(fallbackTimer);
-      fallback?.close();
-      fallback = null;
-      setRealtimeConnected(true);
+    const connectSocket = () => {
+      if (closed) return;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const cursor = lastEventId ? `?lastEventId=${encodeURIComponent(lastEventId)}` : "";
+      const currentSocket = new WebSocket(`${protocol}//${window.location.host}/api/events${cursor}`);
+      socket = currentSocket;
+      const fallbackTimer = window.setTimeout(() => {
+        if (currentSocket.readyState !== WebSocket.OPEN) startFallback();
+      }, 1_500);
+      currentSocket.onopen = () => {
+        window.clearTimeout(fallbackTimer);
+        reconnectAttempt = 0;
+        fallback?.close();
+        fallback = null;
+        setRealtimeConnected(true);
+        void refresh();
+      };
+      currentSocket.onmessage = (event) => handleMessage(String(event.data));
+      currentSocket.onerror = () => {
+        startFallback();
+        currentSocket.close();
+      };
+      currentSocket.onclose = () => {
+        window.clearTimeout(fallbackTimer);
+        if (closed || socket !== currentSocket) return;
+        setRealtimeConnected(false);
+        startFallback();
+        const delay = Math.min(30_000, 1_000 * 2 ** Math.min(reconnectAttempt, 5)) + Math.round(Math.random() * 250);
+        reconnectAttempt += 1;
+        reconnectTimer = window.setTimeout(connectSocket, delay);
+      };
     };
-    socket.onmessage = (event) => handleMessage(String(event.data));
-    socket.onerror = () => startFallback();
-    socket.onclose = () => {
-      setRealtimeConnected(false);
-      startFallback();
-    };
+    connectSocket();
     return () => {
       closed = true;
       window.clearTimeout(refreshTimer);
-      window.clearTimeout(fallbackTimer);
-      socket.close();
+      window.clearTimeout(reconnectTimer);
+      socket?.close();
       fallback?.close();
       setRealtimeConnected(false);
     };
@@ -941,6 +1022,11 @@ export default function Home() {
   }, [authState]);
 
   const active = ["LIVE", "STARTING", "DEGRADED", "RECONNECTING", "STOPPING"].includes(stream.status);
+  const soakRun = soakTest?.current ?? null;
+  const soakProgress = soakRun
+    ? Math.min(100, Math.max(0, ((now - Date.parse(soakRun.startedAt)) / Math.max(1, Date.parse(soakRun.endsAt) - Date.parse(soakRun.startedAt))) * 100))
+    : 0;
+  const soakRemainingMs = soakRun?.status === "RUNNING" ? Math.max(0, Date.parse(soakRun.endsAt) - now) : 0;
   const selectedPromo = promos?.assets.find((asset) => asset.id === selectedPromoId) || null;
   const monitoringChartHistory = sampleChartHistory(monitoring?.history ?? []);
   const selectedPlaylist = playlists.find((playlist) => playlist.id === selectedPlaylistId) || null;
@@ -1191,6 +1277,8 @@ export default function Home() {
         serverWarnings: true,
       });
       setTelegramAction("");
+      setSoakTest(null);
+      setSoakTestAction("");
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
       setThumbnailAction("");
@@ -1936,6 +2024,49 @@ export default function Home() {
       });
     } finally {
       setTelegramAction("");
+    }
+  }
+
+  async function startSoakTest() {
+    if (soakTestAction) return;
+    if (!window.confirm("Запустити обов’язковий 72-годинний soak test? Протягом тесту ефір має залишатися активним; також потрібно перевірити fallback, RTMPS-reconnect, промо та Telegram-команду.")) return;
+    setSoakTestAction("start");
+    setNotice(null);
+    try {
+      const result = await api<{ soakTest: SoakTestStatus }>(
+        "/api/hardening/soak-test",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ durationHours: 72 }),
+        },
+        csrfToken,
+      );
+      setSoakTest(result.soakTest);
+      setNotice({ type: "success", text: "72-годинний soak test запущено. Прогрес зберігається навіть після рестарту сервісу." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося запустити soak test." });
+    } finally {
+      setSoakTestAction("");
+    }
+  }
+
+  async function cancelSoakTest() {
+    if (soakTestAction || !window.confirm("Скасувати поточний soak test? Незавершений прогін не може вважатися приймальним.")) return;
+    setSoakTestAction("cancel");
+    setNotice(null);
+    try {
+      const result = await api<{ soakTest: SoakTestStatus }>(
+        "/api/hardening/soak-test",
+        { method: "DELETE" },
+        csrfToken,
+      );
+      setSoakTest(result.soakTest);
+      setNotice({ type: "success", text: "Soak test скасовано." });
+    } catch (error) {
+      setNotice({ type: "error", text: error instanceof Error ? error.message : "Не вдалося скасувати soak test." });
+    } finally {
+      setSoakTestAction("");
     }
   }
 
@@ -3144,6 +3275,74 @@ export default function Home() {
                   {hours === 1 ? "1 год" : hours === 24 ? "24 год" : "7 днів"}
                 </button>
               ))}
+            </div>
+          </div>
+
+          <div className={`soak-card soak-card--${(soakRun?.status || "idle").toLowerCase()}`}>
+            <div className="soak-card-heading">
+              <div>
+                <span>Production hardening</span>
+                <strong>72-годинний soak test</strong>
+              </div>
+              <span className="soak-status">
+                {soakRun?.status === "RUNNING"
+                  ? "Виконується"
+                  : soakRun?.status === "PASSED"
+                    ? "Пройдено"
+                    : soakRun?.status === "FAILED"
+                      ? "Не пройдено"
+                      : soakRun?.status === "CANCELLED"
+                        ? "Скасовано"
+                        : "Не запускався"}
+              </span>
+            </div>
+            {soakRun ? (
+              <>
+                <div className="soak-progress" aria-label={`Прогрес soak test ${soakProgress.toFixed(1)}%`}>
+                  <i style={{ width: `${soakProgress}%` }} />
+                </div>
+                <div className="soak-summary">
+                  <div><span>Прогрес</span><strong>{soakProgress.toFixed(1)}%</strong></div>
+                  <div><span>Залишилось</span><strong>{soakRun.status === "RUNNING" ? formatMediaTime(soakRemainingMs) : "—"}</strong></div>
+                  <div><span>Доступність</span><strong>{soakRun.counters.total ? `${((soakRun.counters.healthy / soakRun.counters.total) * 100).toFixed(2)}%` : "—"}</strong></div>
+                  <div><span>Знімків</span><strong>{soakRun.counters.total.toLocaleString("uk-UA")}</strong></div>
+                </div>
+                <div className="soak-coverage" aria-label="Сценарії приймального тесту">
+                  {[
+                    ["Переходи відео", soakRun.coverage.videoTransitions > 0],
+                    ["Fallback", soakRun.coverage.fallbackObserved],
+                    ["RTMPS reconnect", soakRun.coverage.reconnectRecoveries > 0],
+                    ["Показ промо", soakRun.coverage.promoImpressions > 0],
+                    ["Telegram-команда", soakRun.coverage.telegramCommands > 0],
+                  ].map(([label, passed]) => (
+                    <span className={passed ? "soak-check--passed" : ""} key={String(label)}>
+                      <i aria-hidden="true">{passed ? "✓" : "○"}</i>{label}
+                    </span>
+                  ))}
+                </div>
+                {soakRun.result && (
+                  <p className={soakRun.result.passed ? "soak-result soak-result--passed" : "soak-result soak-result--failed"}>
+                    {soakRun.result.passed
+                      ? `Тест пройдено: доступність ${soakRun.result.availabilityPercent?.toFixed(2)}%, приріст RSS ${soakRun.result.rssGrowthPercent?.toFixed(1)}%.`
+                      : `Тест не пройдено: ${soakRun.result.checks.filter((check) => !check.passed).length} перевірок потребують уваги.`}
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="soak-description">Запускайте після старту ефіру. StreamLab щохвилини контролює доступність, пам’ять, temp-файли, PostgreSQL, Redis і обов’язкові сценарії з ТЗ; стан переживає рестарти.</p>
+            )}
+            <div className="soak-actions">
+              {soakRun?.status === "RUNNING" ? (
+                <button className="button button--danger" type="button" onClick={cancelSoakTest} disabled={Boolean(soakTestAction)}>
+                  {soakTestAction === "cancel" ? "Скасовуємо…" : "Скасувати тест"}
+                </button>
+              ) : (
+                <button className="button button--primary" type="button" onClick={startSoakTest} disabled={!active || Boolean(soakTestAction)}>
+                  {soakTestAction === "start" ? "Запускаємо…" : "Запустити 72 години"}
+                </button>
+              )}
+              {!active && soakRun?.status !== "RUNNING" && <small>Спочатку запустіть трансляцію.</small>}
+              {soakRun?.status === "RUNNING" && <small>До завершення виконайте всі п’ять сценаріїв, позначених вище.</small>}
             </div>
           </div>
 

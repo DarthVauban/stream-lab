@@ -108,6 +108,9 @@ services:
       STORAGE_WARNING_PERCENT: ${STORAGE_WARNING_PERCENT:-80}
       STORAGE_CRITICAL_PERCENT: ${STORAGE_CRITICAL_PERCENT:-90}
       SYSTEM_MONITOR_INTERVAL_MS: ${SYSTEM_MONITOR_INTERVAL_MS:-2000}
+      SOAK_TEST_SAMPLE_INTERVAL_MS: ${SOAK_TEST_SAMPLE_INTERVAL_MS:-60000}
+      SOAK_TEST_MAX_RSS_GROWTH_PERCENT: ${SOAK_TEST_MAX_RSS_GROWTH_PERCENT:-30}
+      SOAK_TEST_MAX_TEMP_GROWTH_BYTES: ${SOAK_TEST_MAX_TEMP_GROWTH_BYTES:-536870912}
     volumes:
       - ./data:/app/data
     depends_on:
@@ -134,7 +137,7 @@ services:
     environment:
       MEDIA_INTERNAL_API_URL: http://media-server:8788
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       media-server:
         condition: service_healthy
@@ -144,6 +147,55 @@ services:
       timeout: 5s
       retries: 6
       start_period: 15s
+
+  backup-scheduler:
+    image: postgres:17-alpine
+    profiles:
+      - production
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: streamlab
+      POSTGRES_USER: streamlab
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+    volumes:
+      - ./data:/source-data:ro
+      - ./backups:/backups
+      - ./scripts/backup-entrypoint.sh:/opt/streamlab/backup-entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/opt/streamlab/backup-entrypoint.sh"]
+    command: ["schedule"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backup:
+    image: postgres:17-alpine
+    profiles:
+      - maintenance
+    restart: "no"
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: streamlab
+      POSTGRES_USER: streamlab
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ./data:/source-data
+      - ./backups:/backups
+      - ./scripts/backup-entrypoint.sh:/opt/streamlab/backup-entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/opt/streamlab/backup-entrypoint.sh"]
+    command: ["help"]
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   caddy_data:

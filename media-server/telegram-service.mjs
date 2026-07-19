@@ -110,26 +110,41 @@ function normalizeNotificationSettings(value, fallback = {}) {
 
 function menuMarkup() {
   return {
-    inline_keyboard: [
+    keyboard: [
       [
-        { text: "📊 Статистика зараз", callback_data: "stats_now" },
-        { text: "📈 За 24 години", callback_data: "stats_24h" },
+        { text: "📊 Статистика зараз" },
+        { text: "📈 За 24 години" },
       ],
       [
-        { text: "🎵 Зараз грає", callback_data: "now_playing" },
-        { text: "📋 Поточна черга", callback_data: "queue" },
+        { text: "🎵 Зараз грає" },
+        { text: "📋 Поточна черга" },
       ],
       [
-        { text: "🖥 Стан сервера", callback_data: "server" },
-        { text: "🔴 Стан трансляції", callback_data: "stream" },
+        { text: "🖥 Стан сервера" },
+        { text: "🔴 Стан трансляції" },
       ],
       [
-        { text: "🎛 Керування ефіром", callback_data: "control" },
-        { text: "🔄 Оновити", callback_data: "refresh" },
+        { text: "🎛 Керування ефіром" },
+        { text: "🔄 Оновити" },
       ],
     ],
+    is_persistent: true,
+    resize_keyboard: true,
+    one_time_keyboard: false,
+    input_field_placeholder: "Оберіть дію StreamLab",
   };
 }
+
+const BUTTON_COMMANDS = new Map([
+  ["📊 статистика зараз", "stats_now"],
+  ["📈 за 24 години", "stats_24h"],
+  ["🎵 зараз грає", "now_playing"],
+  ["📋 поточна черга", "queue"],
+  ["🖥 стан сервера", "server"],
+  ["🔴 стан трансляції", "stream"],
+  ["🎛 керування ефіром", "control"],
+  ["🔄 оновити", "refresh"],
+]);
 
 function controlMarkup(snapshot) {
   const active = ACTIVE_STREAM_STATUSES.has(snapshot.stream?.status);
@@ -170,7 +185,9 @@ function confirmationMarkup(nonce) {
 
 function resolveCommand(value, fromCallback = false) {
   if (fromCallback) return String(value || "menu");
-  const token = String(value || "").trim().split(/\s+/, 1)[0].toLowerCase().replace(/@[^\s]+$/, "");
+  const normalized = String(value || "").trim().toLowerCase();
+  if (BUTTON_COMMANDS.has(normalized)) return BUTTON_COMMANDS.get(normalized);
+  const token = normalized.split(/\s+/, 1)[0].replace(/@[^\s]+$/, "");
   return {
     "/start": "menu",
     "/menu": "menu",
