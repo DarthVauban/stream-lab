@@ -349,7 +349,10 @@ export class YouTubeService {
       id: channel.id,
       title: channel.snippet?.title || "YouTube-канал",
       thumbnailUrl:
-        channel.snippet?.thumbnails?.default?.url || channel.snippet?.thumbnails?.medium?.url || null,
+        channel.snippet?.thumbnails?.high?.url ||
+        channel.snippet?.thumbnails?.medium?.url ||
+        channel.snippet?.thumbnails?.default?.url ||
+        null,
       subscribers: channel.statistics?.hiddenSubscriberCount
         ? null
         : integer(channel.statistics?.subscriberCount),

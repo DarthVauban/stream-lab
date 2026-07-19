@@ -27,7 +27,13 @@ function googleFixtureFetch(calls) {
         items: [
           {
             id: "channel-1",
-            snippet: { title: "StreamLab Channel" },
+            snippet: {
+              title: "StreamLab Channel",
+              thumbnails: {
+                default: { url: "https://yt3.ggpht.com/channel-default" },
+                high: { url: "https://yt3.ggpht.com/channel-high" },
+              },
+            },
             statistics: { subscriberCount: "1200", viewCount: "45000", videoCount: "31" },
           },
         ],
@@ -122,6 +128,7 @@ test("connects YouTube, hides credentials and records live snapshots", async (t)
   });
   assert.equal(snapshot.connected, true);
   assert.equal(snapshot.channel.title, "StreamLab Channel");
+  assert.equal(snapshot.channel.thumbnailUrl, "https://yt3.ggpht.com/channel-high");
   assert.equal(snapshot.selected.id, "broadcast-1");
   assert.equal(snapshot.stream.healthStatus, "good");
   assert.equal(snapshot.metrics.viewers, 42);

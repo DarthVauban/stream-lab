@@ -107,6 +107,8 @@ type AuthSession =
   | { authenticated: false }
   | { authenticated: true; owner: string; csrfToken: string; expiresAt: string };
 
+type WorkspaceTab = "library" | "queue" | "stream" | "youtube";
+
 type YouTubeBroadcast = {
   id: string;
   title: string;
@@ -351,6 +353,8 @@ export default function Home() {
   const [streamAction, setStreamAction] = useState(false);
   const [youtube, setYoutube] = useState<YouTubeStatus | null>(null);
   const [youtubeAction, setYoutubeAction] = useState("");
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
+  const [failedChannelAvatarUrl, setFailedChannelAvatarUrl] = useState("");
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [now, setNow] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -432,6 +436,7 @@ export default function Home() {
     const result = new URLSearchParams(window.location.search).get("youtube");
     if (!result) return;
     const notification = window.setTimeout(() => {
+      setActiveTab("youtube");
       setNotice(
         result === "connected"
           ? { type: "success", text: "YouTube-канал підключено." }
@@ -536,6 +541,8 @@ export default function Home() {
       setStreamKeyVisible(false);
       setYoutube(null);
       setYoutubeAction("");
+      setActiveTab("stream");
+      setFailedChannelAvatarUrl("");
     }
   }
 
@@ -1082,6 +1089,7 @@ export default function Home() {
         csrfToken,
       );
       setYoutube(result.youtube);
+      setFailedChannelAvatarUrl("");
       setNotice({ type: "success", text: "YouTube-канал відключено, доступ відкликано." });
     } catch (error) {
       setNotice({
@@ -1104,6 +1112,7 @@ export default function Home() {
         csrfToken,
       );
       setYoutube(result.youtube);
+      setFailedChannelAvatarUrl("");
       setNotice({ type: "success", text: "Дані YouTube оновлено." });
     } catch (error) {
       setNotice({
@@ -1160,6 +1169,7 @@ export default function Home() {
       setStreamUrl(details.preset.streamUrl);
       setStreamKey(details.preset.streamKey);
       setStreamKeyVisible(false);
+      setActiveTab("stream");
       setNotice({
         type: "success",
         text: "RTMPS-пресет YouTube створено й підставлено у форму запуску.",
@@ -1296,8 +1306,62 @@ export default function Home() {
         </div>
       )}
 
-      <div className="workspace-grid">
-        <section className="panel upload-panel" aria-labelledby="upload-title">
+      <nav className="workspace-tabs" role="tablist" aria-label="Розділи StreamLab">
+        <button
+          className={activeTab === "library" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "library"}
+          aria-controls="workspace-library"
+          onClick={() => setActiveTab("library")}
+        >
+          <span className="workspace-tab-number">01</span>
+          <span className="workspace-tab-copy"><strong>Бібліотека</strong><small>Файли та завантаження</small></span>
+          <span className="workspace-tab-value">{videos.length}</span>
+        </button>
+        <button
+          className={activeTab === "queue" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "queue"}
+          aria-controls="workspace-queue"
+          onClick={() => setActiveTab("queue")}
+        >
+          <span className="workspace-tab-number">02</span>
+          <span className="workspace-tab-copy"><strong>Черга</strong><small>Порядок відтворення</small></span>
+          <span className="workspace-tab-value">{queue.items.length}</span>
+        </button>
+        <button
+          className={activeTab === "stream" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "stream"}
+          aria-controls="workspace-stream"
+          onClick={() => setActiveTab("stream")}
+        >
+          <span className="workspace-tab-number">03</span>
+          <span className="workspace-tab-copy"><strong>Ефір</strong><small>Запуск і керування</small></span>
+          <span className={`workspace-tab-state workspace-tab-state--${stream.status.toLowerCase()}`}>
+            {statusLabel(stream.status)}
+          </span>
+        </button>
+        <button
+          className={activeTab === "youtube" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "youtube"}
+          aria-controls="workspace-youtube"
+          onClick={() => setActiveTab("youtube")}
+        >
+          <span className="workspace-tab-number">04</span>
+          <span className="workspace-tab-copy"><strong>YouTube</strong><small>Канал і аналітика</small></span>
+          <span className={`workspace-tab-dot ${youtube?.connected ? "workspace-tab-dot--active" : ""}`} aria-label={youtube?.connected ? "Канал підключено" : "Канал не підключено"} />
+        </button>
+      </nav>
+
+      <div className="workspace-grid workspace-grid--tabs">
+        {activeTab === "library" && (
+        <section id="workspace-library" className="panel upload-panel" role="tabpanel" aria-labelledby="upload-title">
           <div className="panel-heading">
             <div>
               <span className="step-number">01</span>
@@ -1444,11 +1508,13 @@ export default function Home() {
             )}
           </div>
         </section>
+        )}
 
-        <section className="panel stream-panel" aria-labelledby="stream-title">
+        {activeTab === "stream" && (
+        <section id="workspace-stream" className="panel stream-panel" role="tabpanel" aria-labelledby="stream-title">
           <div className="panel-heading">
             <div>
-              <span className="step-number">02</span>
+              <span className="step-number">03</span>
               <h2 id="stream-title">Запуск ефіру</h2>
             </div>
             <span className="panel-kicker">RTMPS</span>
@@ -1681,11 +1747,13 @@ export default function Home() {
             </details>
           )}
         </section>
+        )}
 
-        <section className="panel youtube-panel" aria-labelledby="youtube-title">
+        {activeTab === "youtube" && (
+        <section id="workspace-youtube" className="panel youtube-panel" role="tabpanel" aria-labelledby="youtube-title">
           <div className="panel-heading">
             <div>
-              <span className="step-number">03</span>
+              <span className="step-number">04</span>
               <h2 id="youtube-title">YouTube</h2>
             </div>
             <span className={`youtube-connection ${youtube?.connected ? "youtube-connection--active" : ""}`}>
@@ -1720,8 +1788,22 @@ export default function Home() {
             <div className="youtube-dashboard">
               <div className="youtube-toolbar">
                 <div className="youtube-channel">
-                  <span className="youtube-avatar" aria-hidden="true">
+                  <span
+                    className="youtube-avatar"
+                    role="img"
+                    aria-label={`Аватар каналу ${youtube.channel?.title || "YouTube"}`}
+                  >
                     {(youtube.channel?.title || "Y").slice(0, 1).toUpperCase()}
+                    {youtube.channel?.thumbnailUrl && failedChannelAvatarUrl !== youtube.channel.thumbnailUrl && (
+                      // The URL is returned by the authenticated YouTube API and can use changing Google hosts.
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={youtube.channel.thumbnailUrl}
+                        alt=""
+                        referrerPolicy="no-referrer"
+                        onError={() => setFailedChannelAvatarUrl(youtube.channel?.thumbnailUrl || "")}
+                      />
+                    )}
                   </span>
                   <div>
                     <span>Підключений канал</span>
@@ -1843,11 +1925,13 @@ export default function Home() {
             </div>
           )}
         </section>
+        )}
 
-        <section className="panel queue-panel" aria-labelledby="queue-title">
+        {activeTab === "queue" && (
+        <section id="workspace-queue" className="panel queue-panel" role="tabpanel" aria-labelledby="queue-title">
           <div className="panel-heading">
             <div>
-              <span className="step-number">04</span>
+              <span className="step-number">02</span>
               <h2 id="queue-title">Черга трансляції</h2>
             </div>
             <span className="panel-kicker">{queue.items.length} · LOOP</span>
@@ -1951,6 +2035,7 @@ export default function Home() {
               : "Перетягніть відео у потрібне місце. Після останнього елемента черга автоматично почнеться з першого."}
           </p>
         </section>
+        )}
       </div>
 
       <footer>
