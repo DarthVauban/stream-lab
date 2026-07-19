@@ -1,21 +1,23 @@
 import { spawn, spawnSync } from "node:child_process";
+import { rename, rm, writeFile } from "node:fs/promises";
 import { ApiError } from "./api-error.mjs";
 
 export function buildFfmpegArgs({
   inputPath,
+  playlistPath,
   target,
   videoBitrate = "10M",
   audioBitrate = "128k",
 }) {
+  const inputArgs = playlistPath
+    ? ["-stream_loop", "-1", "-f", "concat", "-safe", "0", "-i", playlistPath]
+    : ["-stream_loop", "-1", "-i", inputPath];
   return [
     "-hide_banner",
     "-loglevel",
     "info",
     "-re",
-    "-stream_loop",
-    "-1",
-    "-i",
-    inputPath,
+    ...inputArgs,
     "-vf",
     "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
     "-r",
@@ -56,6 +58,21 @@ export function buildFfmpegArgs({
   ];
 }
 
+function escapeConcatPath(filePath) {
+  return filePath.replace(/'/g, "'\\''");
+}
+
+export function buildConcatPlaylist(videos) {
+  if (!Array.isArray(videos) || videos.length === 0) {
+    throw new ApiError(409, "QUEUE_EMPTY", "Додайте хоча б одне готове відео до черги.");
+  }
+  return [
+    "ffconcat version 1.0",
+    ...videos.map((video) => `file '${escapeConcatPath(video.filePath)}'`),
+    "",
+  ].join("\n");
+}
+
 function redact(text, secrets) {
   return secrets.reduce(
     (result, secret) => (secret ? result.split(secret).join("[REDACTED]") : result),
@@ -68,6 +85,7 @@ export class StreamController {
     ffmpegPath = "ffmpeg",
     videoBitrate = "10M",
     audioBitrate = "128k",
+    playlistPath = null,
     spawnImpl = spawn,
     spawnSyncImpl = spawnSync,
     stateStore = null,
@@ -81,6 +99,7 @@ export class StreamController {
     this.ffmpegPath = ffmpegPath;
     this.videoBitrate = videoBitrate;
     this.audioBitrate = audioBitrate;
+    this.playlistPath = playlistPath;
     this.spawnImpl = spawnImpl;
     this.spawnSyncImpl = spawnSyncImpl;
     this.stateStore = stateStore;
@@ -133,8 +152,14 @@ export class StreamController {
     if (!persisted) return this.snapshot();
 
     try {
-      const video = resolveVideo(persisted.videoId);
-      this.desired = { ...persisted, video };
+      const videoIds = persisted.videoIds ?? [persisted.videoId];
+      const videos = videoIds.map((videoId, index) => ({
+        ...resolveVideo(videoId),
+        queueItemId: persisted.queueItemIds?.[index] ?? null,
+      }));
+      const video = videos[0];
+      await this.preparePlaylist(videos);
+      this.desired = { ...persisted, video, videos };
       this.secrets = [persisted.target, persisted.streamKey];
       this.state = {
         status: "RECONNECTING",
@@ -184,14 +209,55 @@ export class StreamController {
   }
 
   snapshot() {
+    const currentVideo = this.currentPlaylistVideo();
     return {
       ...this.state,
+      videoId: currentVideo?.id ?? this.state.videoId,
+      videoName: currentVideo?.name ?? this.state.videoName,
+      queueItemId: currentVideo?.queueItemId ?? null,
+      playlistLength: this.desired?.videos?.length ?? 0,
       pid: this.child?.pid ?? null,
       logs: [...this.logs],
     };
   }
 
-  async start({ video, target, streamKey }) {
+  currentPlaylistVideo() {
+    const videos = this.desired?.videos;
+    if (!videos?.length) return null;
+    if (!this.currentAttemptStartedAt) return videos[0];
+    const durations = videos.map((video) => Number(video.media?.durationSeconds));
+    if (durations.some((duration) => !Number.isFinite(duration) || duration <= 0)) return videos[0];
+    const cycleDuration = durations.reduce((sum, duration) => sum + duration, 0);
+    let offset = Math.max(0, (this.now() - this.currentAttemptStartedAt) / 1000) % cycleDuration;
+    for (let index = 0; index < videos.length; index += 1) {
+      if (offset < durations[index]) return videos[index];
+      offset -= durations[index];
+    }
+    return videos[0];
+  }
+
+  usesVideo(videoId) {
+    return Boolean(this.desired?.videos?.some((video) => video.id === videoId));
+  }
+
+  async preparePlaylist(videos) {
+    if (!this.playlistPath) {
+      if (videos.length === 1) return null;
+      throw new Error("Не налаштовано файл плейлиста FFmpeg.");
+    }
+    const tempPath = `${this.playlistPath}.tmp`;
+    await writeFile(tempPath, buildConcatPlaylist(videos), "utf8");
+    await rename(tempPath, this.playlistPath);
+    return this.playlistPath;
+  }
+
+  async cleanupPlaylist() {
+    if (!this.playlistPath) return;
+    await rm(`${this.playlistPath}.tmp`, { force: true }).catch(() => {});
+    await rm(this.playlistPath, { force: true }).catch(() => {});
+  }
+
+  async start({ video, videos, target, streamKey }) {
     if (this.child || this.desired || this.reconnectTimer) {
       throw new ApiError(409, "STREAM_ALREADY_RUNNING", "Трансляція вже запущена.");
     }
@@ -201,15 +267,35 @@ export class StreamController {
       throw new ApiError(503, "FFMPEG_UNAVAILABLE", ffmpeg.message);
     }
 
+    const playlist = videos ?? (video ? [video] : []);
+    buildConcatPlaylist(playlist);
+    const firstVideo = playlist[0];
     const startedAt = new Date(this.now()).toISOString();
-    const desired = { video, videoId: video.id, target, streamKey, startedAt };
+    const desired = {
+      video: firstVideo,
+      videos: playlist,
+      videoId: firstVideo.id,
+      target,
+      streamKey,
+      startedAt,
+    };
     try {
-      await this.stateStore?.saveActive({ videoId: video.id, target, streamKey, startedAt });
+      await this.preparePlaylist(playlist);
+      const queueItemIds = playlist.map((item) => item.queueItemId).filter(Boolean);
+      await this.stateStore?.saveActive({
+        videoId: firstVideo.id,
+        videoIds: playlist.map((item) => item.id),
+        ...(queueItemIds.length === playlist.length ? { queueItemIds } : {}),
+        target,
+        streamKey,
+        startedAt,
+      });
     } catch {
+      await this.cleanupPlaylist();
       throw new ApiError(
         500,
         "STREAM_STATE_PERSIST_FAILED",
-        "Не вдалося безпечно зберегти конфігурацію для автоматичного відновлення.",
+        "Не вдалося підготувати плейлист або безпечно зберегти конфігурацію ефіру.",
       );
     }
 
@@ -219,8 +305,8 @@ export class StreamController {
     this.logs = [];
     this.state = {
       status: "STARTING",
-      videoId: video.id,
-      videoName: video.name,
+      videoId: firstVideo.id,
+      videoName: firstVideo.name,
       startedAt,
       stoppedAt: null,
       lastError: null,
@@ -237,6 +323,7 @@ export class StreamController {
       this.desired = null;
       this.secrets = [];
       await this.stateStore?.clear().catch(() => {});
+      await this.cleanupPlaylist();
       this.state.status = "ERROR";
       this.state.autoResumeEnabled = false;
       this.state.lastError = "Не вдалося запустити FFmpeg.";
@@ -264,6 +351,7 @@ export class StreamController {
 
     const args = buildFfmpegArgs({
       inputPath: video.filePath,
+      playlistPath: this.playlistPath,
       target,
       videoBitrate: this.videoBitrate,
       audioBitrate: this.audioBitrate,
@@ -405,6 +493,7 @@ export class StreamController {
       this.state.status = "STOPPED";
       this.state.stoppedAt = new Date(this.now()).toISOString();
       this.state.lastError = null;
+      await this.cleanupPlaylist();
       return this.snapshot();
     }
 
@@ -416,6 +505,7 @@ export class StreamController {
       child.kill("SIGKILL");
       await killed;
     }
+    await this.cleanupPlaylist();
     return this.snapshot();
   }
 

@@ -118,6 +118,7 @@ export async function createMvpServer({
       ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
       videoBitrate: process.env.MVP_VIDEO_BITRATE || "10M",
       audioBitrate: process.env.MVP_AUDIO_BITRATE || "128k",
+      playlistPath: path.join(dataDir, "stream-playlist.ffconcat"),
       stateStore: encryptedStateStore,
     });
   const mediaProcessor =
@@ -150,6 +151,21 @@ export async function createMvpServer({
         video: videoStore.getVideo(item.videoId),
       })),
     };
+  };
+
+  let streamStartInProgress = false;
+  const deletingVideoIds = new Set();
+  const streamIsActive = () => streamStartInProgress || ["LIVE", "STARTING", "RECONNECTING", "STOPPING"]
+    .includes(streamController.snapshot().status);
+
+  const assertQueueEditable = () => {
+    if (streamIsActive()) {
+      throw new ApiError(
+        409,
+        "QUEUE_LOCKED",
+        "Зупиніть трансляцію, щоб змінити чергу.",
+      );
+    }
   };
 
   const server = createServer(async (request, response) => {
@@ -212,13 +228,54 @@ export async function createMvpServer({
         return;
       }
 
+      const deleteVideoMatch = url.pathname.match(/^\/api\/videos\/([^/]+)$/);
+      if (request.method === "DELETE" && deleteVideoMatch) {
+        const videoId = deleteVideoMatch[1];
+        if (deletingVideoIds.has(videoId)) {
+          throw new ApiError(409, "VIDEO_DELETE_IN_PROGRESS", "Відео вже видаляється.");
+        }
+        deletingVideoIds.add(videoId);
+        try {
+          const video = videoStore.getVideo(videoId);
+          if (!video) throw new ApiError(404, "UPLOAD_NOT_FOUND", "Відео не знайдено.");
+          if (["UPLOADING", "ANALYZING", "PROCESSING"].includes(video.status)) {
+            throw new ApiError(
+              409,
+              "VIDEO_BUSY",
+              "Дочекайтеся завершення завантаження або обробки відео.",
+            );
+          }
+          const stream = streamController.snapshot();
+          if (
+            streamIsActive() &&
+            (streamStartInProgress || streamController.usesVideo?.(videoId) || stream.videoId === videoId)
+          ) {
+            throw new ApiError(
+              409,
+              "VIDEO_IN_USE",
+              "Це відео використовується в ефірі. Спочатку зупиніть трансляцію.",
+            );
+          }
+          await liveQueue.removeVideo(videoId);
+          const deletedVideo = await videoStore.deleteVideo(videoId);
+          json(response, 200, { video: deletedVideo, queue: queueSnapshot() });
+        } finally {
+          deletingVideoIds.delete(videoId);
+        }
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/api/queue") {
         json(response, 200, { queue: queueSnapshot() });
         return;
       }
 
       if (request.method === "POST" && url.pathname === "/api/queue/items") {
+        assertQueueEditable();
         const body = await readJson(request);
+        if (deletingVideoIds.has(body.videoId)) {
+          throw new ApiError(409, "VIDEO_DELETE_IN_PROGRESS", "Відео вже видаляється.");
+        }
         videoStore.getReadyVideo(body.videoId);
         await liveQueue.add(body.videoId);
         json(response, 201, { queue: queueSnapshot() });
@@ -226,6 +283,7 @@ export async function createMvpServer({
       }
 
       if (request.method === "POST" && url.pathname === "/api/queue/reorder") {
+        assertQueueEditable();
         const body = await readJson(request);
         await liveQueue.reorder(body.itemIds);
         json(response, 200, { queue: queueSnapshot() });
@@ -234,6 +292,7 @@ export async function createMvpServer({
 
       const queueItemMatch = url.pathname.match(/^\/api\/queue\/items\/([^/]+)$/);
       if (request.method === "DELETE" && queueItemMatch) {
+        assertQueueEditable();
         await liveQueue.remove(queueItemMatch[1]);
         json(response, 200, { queue: queueSnapshot() });
         return;
@@ -241,6 +300,7 @@ export async function createMvpServer({
 
       const playNextMatch = url.pathname.match(/^\/api\/queue\/items\/([^/]+)\/play-next$/);
       if (request.method === "POST" && playNextMatch) {
+        assertQueueEditable();
         await liveQueue.moveNext(playNextMatch[1]);
         json(response, 200, { queue: queueSnapshot() });
         return;
@@ -270,6 +330,9 @@ export async function createMvpServer({
 
       const retryProcessingMatch = url.pathname.match(/^\/api\/videos\/([^/]+)\/process$/);
       if (request.method === "POST" && retryProcessingMatch) {
+        if (deletingVideoIds.has(retryProcessingMatch[1])) {
+          throw new ApiError(409, "VIDEO_DELETE_IN_PROGRESS", "Відео вже видаляється.");
+        }
         const video = await videoStore.retryProcessing(retryProcessingMatch[1]);
         mediaProcessor.enqueue(video.id);
         json(response, 202, { video });
@@ -282,15 +345,29 @@ export async function createMvpServer({
       }
 
       if (request.method === "POST" && url.pathname === "/api/stream/start") {
+        if (streamStartInProgress) {
+          throw new ApiError(409, "STREAM_ALREADY_RUNNING", "Трансляція вже запускається.");
+        }
         const body = await readJson(request);
-        const video = videoStore.getReadyVideo(body.videoId);
+        const videos = liveQueue.snapshot().items.map((item) => ({
+          ...videoStore.getReadyVideo(item.videoId),
+          queueItemId: item.id,
+        }));
+        if (videos.length === 0) {
+          throw new ApiError(409, "QUEUE_EMPTY", "Додайте хоча б одне готове відео до черги.");
+        }
         const target = buildTarget(body.streamUrl, body.streamKey);
-        const stream = await streamController.start({
-          video,
-          target,
-          streamKey: body.streamKey.trim(),
-        });
-        json(response, 202, { stream });
+        streamStartInProgress = true;
+        try {
+          const stream = await streamController.start({
+            videos,
+            target,
+            streamKey: body.streamKey.trim(),
+          });
+          json(response, 202, { stream });
+        } finally {
+          streamStartInProgress = false;
+        }
         return;
       }
 

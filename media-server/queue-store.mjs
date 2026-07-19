@@ -117,6 +117,14 @@ export class QueueStore {
     });
   }
 
+  removeVideo(videoId) {
+    return this.mutate(() => {
+      const previousLength = this.items.length;
+      this.items = this.items.filter((item) => item.videoId !== videoId);
+      return previousLength - this.items.length;
+    });
+  }
+
   moveNext(itemId) {
     return this.mutate(() => {
       const index = this.items.findIndex((item) => item.id === itemId);

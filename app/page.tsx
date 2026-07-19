@@ -6,7 +6,6 @@ import {
   FormEvent,
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
@@ -43,6 +42,8 @@ type StreamStatus = {
   status: "STOPPED" | "STARTING" | "LIVE" | "RECONNECTING" | "STOPPING" | "ERROR";
   videoId: string | null;
   videoName: string | null;
+  queueItemId: string | null;
+  playlistLength: number;
   startedAt: string | null;
   stoppedAt: string | null;
   lastError: string | null;
@@ -164,6 +165,8 @@ const emptyStream: StreamStatus = {
   status: "STOPPED",
   videoId: null,
   videoName: null,
+  queueItemId: null,
+  playlistLength: 0,
   startedAt: null,
   stoppedAt: null,
   lastError: null,
@@ -194,7 +197,6 @@ export default function Home() {
   const [videos, setVideos] = useState<Video[]>([]);
   const [stream, setStream] = useState<StreamStatus>(emptyStream);
   const [queue, setQueue] = useState<QueueState>(emptyQueue);
-  const [selectedVideoId, setSelectedVideoId] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
@@ -202,6 +204,8 @@ export default function Home() {
   const [processingAction, setProcessingAction] = useState("");
   const [queueAction, setQueueAction] = useState("");
   const [draggedQueueItemId, setDraggedQueueItemId] = useState("");
+  const [queueDropTarget, setQueueDropTarget] = useState<{ itemId: string; edge: "before" | "after" } | null>(null);
+  const [deletingVideoId, setDeletingVideoId] = useState("");
   const [streamUrl, setStreamUrl] = useState("rtmps://a.rtmps.youtube.com/live2");
   const [streamKey, setStreamKey] = useState("");
   const [streamAction, setStreamAction] = useState(false);
@@ -222,11 +226,6 @@ export default function Home() {
       setVideos(videosResult.videos);
       setStream(streamResult.stream);
       setQueue(queueResult.queue);
-      setSelectedVideoId((current) => {
-        const readyVideos = videosResult.videos.filter((video) => video.status === "READY");
-        if (current && readyVideos.some((video) => video.id === current)) return current;
-        return readyVideos[0]?.id || "";
-      });
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
         setAuthState("anonymous");
@@ -271,18 +270,16 @@ export default function Home() {
   }, [authState, refresh]);
 
   const active = ["LIVE", "STARTING", "RECONNECTING", "STOPPING"].includes(stream.status);
-  const selectedVideo = useMemo(
-    () => videos.find((video) => video.id === selectedVideoId) ?? null,
-    [selectedVideoId, videos],
-  );
-  const currentQueueIndex = stream.videoId
-    ? queue.items.findIndex((item) => item.videoId === stream.videoId)
+  const currentQueueIndex = stream.queueItemId
+    ? queue.items.findIndex((item) => item.id === stream.queueItemId)
+    : stream.videoId
+      ? queue.items.findIndex((item) => item.videoId === stream.videoId)
     : -1;
   const nextQueueItem = queue.items.length > 0
     ? queue.items[currentQueueIndex >= 0 ? (currentQueueIndex + 1) % queue.items.length : 0]
     : null;
   const readyToStart = Boolean(
-    selectedVideo?.status === "READY" && streamUrl.trim() && streamKey.trim() && health?.ffmpeg.available,
+    queue.items.length > 0 && streamUrl.trim() && streamKey.trim() && health?.ffmpeg.available,
   );
 
   async function login(event: FormEvent) {
@@ -413,7 +410,6 @@ export default function Home() {
         { method: "POST" },
         csrfToken,
       );
-      if (completed.video.status === "READY") setSelectedVideoId(completed.video.id);
       setSelectedFile(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
       setUploadProgress(100);
@@ -453,6 +449,32 @@ export default function Home() {
       });
     } finally {
       setProcessingAction("");
+    }
+  }
+
+  async function deleteVideo(video: Video) {
+    if (deletingVideoId) return;
+    const confirmed = window.confirm(
+      `Видалити «${video.name}»? Файл буде повністю стерто із сервера без можливості відновлення.`,
+    );
+    if (!confirmed) return;
+
+    setDeletingVideoId(video.id);
+    setNotice(null);
+    try {
+      const result = await api<{ video: Video; queue: QueueState }>(`/api/videos/${video.id}`, {
+        method: "DELETE",
+      }, csrfToken);
+      setVideos((current) => current.filter((item) => item.id !== video.id));
+      setQueue(result.queue);
+      setNotice({ type: "success", text: "Відео повністю видалено із сервера." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося видалити відео.",
+      });
+    } finally {
+      setDeletingVideoId("");
     }
   }
 
@@ -540,6 +562,7 @@ export default function Home() {
     } finally {
       setQueueAction("");
       setDraggedQueueItemId("");
+      setQueueDropTarget(null);
     }
   }
 
@@ -555,14 +578,34 @@ export default function Home() {
 
   function handleQueueDragStart(event: ReactDragEvent<HTMLDivElement>, itemId: string) {
     setDraggedQueueItemId(itemId);
+    setQueueDropTarget(null);
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("text/plain", itemId);
+  }
+
+  function handleQueueDragOver(event: ReactDragEvent<HTMLDivElement>, targetItemId: string) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    if (!draggedQueueItemId || draggedQueueItemId === targetItemId || queueAction || active) {
+      setQueueDropTarget(null);
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const edge = event.clientY > bounds.top + bounds.height / 2 ? "after" : "before";
+    setQueueDropTarget((current) => (
+      current?.itemId === targetItemId && current.edge === edge
+        ? current
+        : { itemId: targetItemId, edge }
+    ));
   }
 
   function handleQueueDrop(event: ReactDragEvent<HTMLDivElement>, targetItemId: string) {
     event.preventDefault();
     const sourceItemId = draggedQueueItemId || event.dataTransfer.getData("text/plain");
-    if (!sourceItemId || sourceItemId === targetItemId || queueAction) return;
+    if (!sourceItemId || sourceItemId === targetItemId || queueAction || active) {
+      setQueueDropTarget(null);
+      return;
+    }
 
     const sourceItem = queue.items.find((item) => item.id === sourceItemId);
     if (!sourceItem) return;
@@ -570,7 +613,9 @@ export default function Home() {
     const targetIndex = items.findIndex((item) => item.id === targetItemId);
     if (targetIndex < 0) return;
     const bounds = event.currentTarget.getBoundingClientRect();
-    const insertAfter = event.clientY > bounds.top + bounds.height / 2;
+    const insertAfter = queueDropTarget?.itemId === targetItemId
+      ? queueDropTarget.edge === "after"
+      : event.clientY > bounds.top + bounds.height / 2;
     items.splice(targetIndex + (insertAfter ? 1 : 0), 0, sourceItem);
     void saveQueueOrder(items);
   }
@@ -584,7 +629,7 @@ export default function Home() {
       const result = await api<{ stream: StreamStatus }>("/api/stream/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ videoId: selectedVideoId, streamUrl, streamKey }),
+        body: JSON.stringify({ streamUrl, streamKey }),
       }, csrfToken);
       setStream(result.stream);
       setStreamKey("");
@@ -821,18 +866,10 @@ export default function Home() {
                 const processing = ["ANALYZING", "PROCESSING"].includes(video.status);
                 return (
                   <div
-                    className={`video-row video-row--${video.status.toLowerCase()} ${selectedVideoId === video.id ? "video-row--selected" : ""}`}
+                    className={`video-row video-row--${video.status.toLowerCase()}`}
                     key={video.id}
                   >
-                    <label className="video-row-main">
-                      <input
-                        type="radio"
-                        name="selected-video"
-                        value={video.id}
-                        checked={selectedVideoId === video.id}
-                        onChange={() => setSelectedVideoId(video.id)}
-                        disabled={active || !ready}
-                      />
+                    <div className="video-row-main">
                       <span className="video-thumb" aria-hidden="true">
                         {video.status === "FAILED" ? "!" : ready ? "▶" : "…"}
                       </span>
@@ -840,14 +877,31 @@ export default function Home() {
                         <strong>{video.name}</strong>
                         <span>{videoMeta(video)} · {videoStatusLabel(video)}</span>
                       </span>
-                      {ready ? (
-                        <span className="radio-mark" aria-hidden="true" />
-                      ) : (
+                      <div className="video-library-actions">
+                        {ready ? (
+                          <button
+                            className="video-add-queue"
+                            type="button"
+                            onClick={() => addVideoToQueue(video.id)}
+                            disabled={active || Boolean(queueAction) || Boolean(deletingVideoId)}
+                          >
+                            {queueAction === `add:${video.id}` ? "Додаємо…" : "+ До черги"}
+                          </button>
+                        ) : (
                         <span className={`video-status video-status--${video.status.toLowerCase()}`}>
                           {video.status === "FAILED" ? "FAILED" : "PROCESSING"}
                         </span>
-                      )}
-                    </label>
+                        )}
+                        <button
+                          className="video-delete"
+                          type="button"
+                          onClick={() => deleteVideo(video)}
+                          disabled={active || processing || Boolean(deletingVideoId)}
+                        >
+                          {deletingVideoId === video.id ? "Видаляємо…" : "Видалити"}
+                        </button>
+                      </div>
+                    </div>
                     {processing && (
                       <div
                         className="video-processing-track"
@@ -871,16 +925,6 @@ export default function Home() {
                           {processingAction === video.id ? "Запускаємо…" : "Повторити"}
                         </button>
                       </div>
-                    )}
-                    {ready && (
-                      <button
-                        className="video-add-queue"
-                        type="button"
-                        onClick={() => addVideoToQueue(video.id)}
-                        disabled={Boolean(queueAction)}
-                      >
-                        {queueAction === `add:${video.id}` ? "Додаємо…" : "+ До черги"}
-                      </button>
                     )}
                   </div>
                 );
@@ -956,7 +1000,7 @@ export default function Home() {
             </div>
             <div className="now-playing">
               <span>Зараз транслюється</span>
-              <strong>{stream.videoName || selectedVideo?.name || "Відео ще не вибрано"}</strong>
+              <strong>{stream.videoName || queue.items[0]?.video?.name || "Черга ще порожня"}</strong>
             </div>
             {stream.status === "RECONNECTING" && (
               <div className="reconnect-info" role="status">
@@ -1013,16 +1057,16 @@ export default function Home() {
             <div className="queue-list">
               {queue.items.map((item, index) => (
                 <div
-                  className={`queue-row ${draggedQueueItemId === item.id ? "queue-row--dragging" : ""} ${stream.videoId === item.videoId ? "queue-row--current" : ""}`}
+                  className={`queue-row ${active ? "queue-row--locked" : ""} ${draggedQueueItemId === item.id ? "queue-row--dragging" : ""} ${(stream.queueItemId ? stream.queueItemId === item.id : stream.videoId === item.videoId) ? "queue-row--current" : ""} ${queueDropTarget?.itemId === item.id ? `queue-row--drop-${queueDropTarget.edge}` : ""}`}
                   key={item.id}
-                  draggable={!queueAction}
+                  draggable={!queueAction && !active}
                   onDragStart={(event) => handleQueueDragStart(event, item.id)}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    event.dataTransfer.dropEffect = "move";
-                  }}
+                  onDragOver={(event) => handleQueueDragOver(event, item.id)}
                   onDrop={(event) => handleQueueDrop(event, item.id)}
-                  onDragEnd={() => setDraggedQueueItemId("")}
+                  onDragEnd={() => {
+                    setDraggedQueueItemId("");
+                    setQueueDropTarget(null);
+                  }}
                   aria-grabbed={draggedQueueItemId === item.id}
                 >
                   <span className="queue-grip" aria-hidden="true">⋮⋮</span>
@@ -1031,7 +1075,7 @@ export default function Home() {
                     <strong>{item.video?.name || "Відео недоступне"}</strong>
                     <span>
                       {item.video ? videoMeta(item.video) : "Файл видалено з бібліотеки"}
-                      {stream.videoId === item.videoId ? " · зараз в ефірі" : ""}
+                      {(stream.queueItemId ? stream.queueItemId === item.id : stream.videoId === item.videoId) ? " · зараз в ефірі" : ""}
                     </span>
                   </span>
                   <div className="queue-actions">
@@ -1040,7 +1084,7 @@ export default function Home() {
                       title="Перемістити вище"
                       aria-label={`Перемістити ${item.video?.name || "відео"} вище`}
                       onClick={() => moveQueueItem(item.id, -1)}
-                      disabled={index === 0 || Boolean(queueAction)}
+                      disabled={active || index === 0 || Boolean(queueAction)}
                     >
                       ↑
                     </button>
@@ -1049,7 +1093,7 @@ export default function Home() {
                       title="Перемістити нижче"
                       aria-label={`Перемістити ${item.video?.name || "відео"} нижче`}
                       onClick={() => moveQueueItem(item.id, 1)}
-                      disabled={index === queue.items.length - 1 || Boolean(queueAction)}
+                      disabled={active || index === queue.items.length - 1 || Boolean(queueAction)}
                     >
                       ↓
                     </button>
@@ -1057,7 +1101,7 @@ export default function Home() {
                       className="queue-next"
                       type="button"
                       onClick={() => playQueueItemNext(item.id)}
-                      disabled={index === 0 || Boolean(queueAction)}
+                      disabled={active || index === 0 || Boolean(queueAction)}
                     >
                       {queueAction === `next:${item.id}` ? "Зберігаємо…" : "Наступним"}
                     </button>
@@ -1067,7 +1111,7 @@ export default function Home() {
                       title="Прибрати з черги"
                       aria-label={`Прибрати ${item.video?.name || "відео"} з черги`}
                       onClick={() => removeQueueItem(item.id)}
-                      disabled={Boolean(queueAction)}
+                      disabled={active || Boolean(queueAction)}
                     >
                       ×
                     </button>
@@ -1078,7 +1122,9 @@ export default function Home() {
           )}
 
           <p className="queue-note">
-            Порядок уже зберігається після перезапуску сервісу. Автоматичне безшовне перемикання відео підключимо наступним кроком.
+            {active
+              ? "Черга зараз відтворюється циклічно. Зупиніть ефір, щоб змінити її порядок або склад."
+              : "Перетягніть відео у потрібне місце. Після останнього елемента черга автоматично почнеться з першого."}
           </p>
         </section>
       </div>

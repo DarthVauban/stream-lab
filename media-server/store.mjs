@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, open, readFile, rename, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -51,6 +51,7 @@ export class VideoStore {
   constructor({ rootDir, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES }) {
     this.rootDir = rootDir;
     this.uploadsDir = path.join(rootDir, "uploads");
+    this.trashDir = path.join(this.uploadsDir, ".trash");
     this.catalogPath = path.join(rootDir, "videos.json");
     this.maxUploadBytes = maxUploadBytes;
     this.records = [];
@@ -67,6 +68,31 @@ export class VideoStore {
       if (error?.code !== "ENOENT") throw error;
       this.records = [];
       await this.persist();
+    }
+    await this.recoverTrash();
+  }
+
+  async recoverTrash() {
+    await mkdir(this.trashDir, { recursive: true });
+    const transactions = await readdir(this.trashDir, { withFileTypes: true });
+    for (const transaction of transactions) {
+      const transactionPath = path.join(this.trashDir, transaction.name);
+      if (!transaction.isDirectory()) {
+        await rm(transactionPath, { force: true });
+        continue;
+      }
+      const recordStillExists = this.records.some((record) => record.id === transaction.name);
+      if (recordStillExists) {
+        const files = await readdir(transactionPath, { withFileTypes: true });
+        for (const file of files) {
+          if (!file.isFile()) continue;
+          const source = path.join(transactionPath, file.name);
+          const destination = path.join(this.uploadsDir, file.name);
+          await rm(destination, { force: true });
+          await rename(source, destination);
+        }
+      }
+      await rm(transactionPath, { recursive: true, force: true });
     }
   }
 
@@ -317,6 +343,73 @@ export class VideoStore {
   getVideo(id) {
     const record = this.find(id);
     return record ? publicRecord(record) : null;
+  }
+
+  deletionPaths(record) {
+    const names = new Set([
+      `${record.id}.part`,
+      record.sourceStoredName,
+      `${record.id}.processing.tmp.mp4`,
+      record.storedName,
+      record.streamStoredName,
+    ].filter(Boolean));
+    const uploadsRoot = `${path.resolve(this.uploadsDir)}${path.sep}`;
+    return [...names].map((name) => {
+      const candidate = path.resolve(this.uploadsDir, name);
+      if (!candidate.startsWith(uploadsRoot)) {
+        throw new ApiError(500, "INVALID_STORED_PATH", "Некоректний шлях збереженого відео.");
+      }
+      return candidate;
+    });
+  }
+
+  async deleteVideo(id) {
+    const record = this.requireUpload(id);
+    if (this.activeWrites.has(id) || ["UPLOADING", "ANALYZING", "PROCESSING"].includes(record.status)) {
+      throw new ApiError(
+        409,
+        "VIDEO_BUSY",
+        "Дочекайтеся завершення завантаження або обробки відео.",
+      );
+    }
+
+    const recordIndex = this.records.indexOf(record);
+    const transactionPath = path.join(this.trashDir, record.id);
+    const moved = [];
+    await rm(transactionPath, { recursive: true, force: true });
+    await mkdir(transactionPath, { recursive: true });
+
+    const restoreMovedFiles = async () => {
+      for (const entry of moved.reverse()) {
+        await rename(entry.trashPath, entry.originalPath).catch(() => {});
+      }
+      await rm(transactionPath, { recursive: true, force: true }).catch(() => {});
+    };
+
+    try {
+      for (const originalPath of this.deletionPaths(record)) {
+        const trashPath = path.join(transactionPath, path.basename(originalPath));
+        try {
+          await rename(originalPath, trashPath);
+          moved.push({ originalPath, trashPath });
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      }
+      this.records.splice(recordIndex, 1);
+      try {
+        await this.persist();
+      } catch (error) {
+        this.records.splice(recordIndex, 0, record);
+        throw error;
+      }
+    } catch (error) {
+      await restoreMovedFiles();
+      throw error;
+    }
+
+    await rm(transactionPath, { recursive: true, force: true });
+    return publicRecord(record);
   }
 
   partialPath(record) {

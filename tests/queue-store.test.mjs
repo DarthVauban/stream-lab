@@ -42,6 +42,10 @@ test("persists queue order and restores it after restart", async (t) => {
     "video-2",
     "video-1",
   ]);
+
+  await restored.add("video-1");
+  assert.equal(await restored.removeVideo("video-1"), 2);
+  assert.deepEqual(restored.snapshot().items.map((item) => item.videoId), ["video-2"]);
 });
 
 test("rejects incomplete or foreign reorder payloads", async (t) => {

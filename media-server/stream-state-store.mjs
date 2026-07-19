@@ -10,6 +10,18 @@ import path from "node:path";
 const FILE_VERSION = 1;
 const AAD = Buffer.from("streamlab-stream-state-v1", "utf8");
 
+function validateIds(value, field) {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > 1_000 ||
+    value.some((id) => typeof id !== "string" || !id || id.length > 128)
+  ) {
+    throw new Error(`Некоректне поле ${field}.`);
+  }
+  return [...value];
+}
+
 function validateState(value) {
   if (
     !value ||
@@ -26,12 +38,25 @@ function validateState(value) {
   ) {
     throw new Error("Збережена конфігурація трансляції пошкоджена.");
   }
-  return {
+  const validated = {
     videoId: value.videoId,
     target: value.target,
     streamKey: value.streamKey,
     startedAt: value.startedAt,
   };
+  if (value.videoIds !== undefined) {
+    validated.videoIds = validateIds(value.videoIds, "videoIds");
+    if (validated.videoIds[0] !== validated.videoId) {
+      throw new Error("Перший елемент плейлиста не відповідає активному відео.");
+    }
+  }
+  if (value.queueItemIds !== undefined) {
+    validated.queueItemIds = validateIds(value.queueItemIds, "queueItemIds");
+    if (!validated.videoIds || validated.queueItemIds.length !== validated.videoIds.length) {
+      throw new Error("Елементи черги не відповідають збереженому плейлисту.");
+    }
+  }
+  return validated;
 }
 
 export class EncryptedStreamStateStore {

@@ -16,6 +16,8 @@ if [ "$(id -u)" = "0" ]; then
     "$data_dir/videos.json.tmp" \
     "$data_dir/queue.json" \
     "$data_dir/queue.json.tmp" \
+    "$data_dir/stream-playlist.ffconcat" \
+    "$data_dir/stream-playlist.ffconcat.tmp" \
     "$data_dir/stream-state.enc.json" \
     "$data_dir/stream-state.enc.json.tmp" \
     "$data_dir/uploads"/*.part \

@@ -22,7 +22,7 @@ class FakeChild extends EventEmitter {
   }
 }
 
-function controllerHarness({ persisted = null } = {}) {
+function controllerHarness({ persisted = null, playlistPath = null, now } = {}) {
   const children = [];
   const persistedWrites = [];
   let clears = 0;
@@ -48,6 +48,8 @@ function controllerHarness({ persisted = null } = {}) {
       return { status: 0, stdout: "ffmpeg test" };
     },
     stateStore,
+    playlistPath,
+    ...(now ? { now } : {}),
     reconnectBaseMs: 5,
     reconnectMaxMs: 10,
     stableRunMs: 50,
@@ -121,6 +123,48 @@ test("reconnects FFmpeg after a crash and manual stop cancels recovery", async (
   assert.equal(harness.controller.snapshot().autoResumeEnabled, false);
   await delay(20);
   assert.equal(harness.children.length, 2);
+});
+
+test("plays every queued video in order and reports the current queue item", async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-playlist-test-"));
+  const playlistPath = path.join(rootDir, "stream-playlist.ffconcat");
+  let currentTime = 1_000;
+  const harness = controllerHarness({ playlistPath, now: () => currentTime });
+  const first = {
+    ...video,
+    queueItemId: "queue-1",
+    media: { durationSeconds: 10 },
+  };
+  const second = {
+    id: "video-2",
+    name: "next.mp4",
+    filePath: "C:/media/next.mp4",
+    queueItemId: "queue-2",
+    media: { durationSeconds: 20 },
+  };
+  t.after(async () => {
+    await harness.controller.stop();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  await harness.controller.start({
+    videos: [first, second],
+    target: "rtmps://example.test/live/playlist-key",
+    streamKey: "playlist-key",
+  });
+  const playlist = await readFile(playlistPath, "utf8");
+  assert.match(playlist, /demo\.mp4[\s\S]+next\.mp4/);
+  assert.equal(harness.persistedWrites[0].videoIds.length, 2);
+  assert.deepEqual(harness.persistedWrites[0].queueItemIds, ["queue-1", "queue-2"]);
+  assert.equal(harness.controller.snapshot().queueItemId, "queue-1");
+
+  currentTime += 11_000;
+  assert.equal(harness.controller.snapshot().videoId, "video-2");
+  assert.equal(harness.controller.snapshot().queueItemId, "queue-2");
+
+  currentTime += 20_000;
+  assert.equal(harness.controller.snapshot().videoId, "video-1");
+  assert.equal(harness.controller.snapshot().queueItemId, "queue-1");
 });
 
 test("restores the desired stream after service restart without clearing encrypted state", async () => {

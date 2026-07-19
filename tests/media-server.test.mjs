@@ -7,10 +7,11 @@ import { createOwnerAuth, hashPassword } from "../media-server/auth.mjs";
 import { MediaProcessor } from "../media-server/media-processor.mjs";
 import { createMvpServer, normalizeServerError } from "../media-server/server.mjs";
 import { VideoStore } from "../media-server/store.mjs";
-import { buildFfmpegArgs } from "../media-server/stream-controller.mjs";
+import { buildConcatPlaylist, buildFfmpegArgs } from "../media-server/stream-controller.mjs";
 
 class FakeController {
   constructor() {
+    this.lastPlaylist = [];
     this.state = {
       status: "STOPPED",
       videoId: null,
@@ -30,7 +31,9 @@ class FakeController {
     return { ...this.state };
   }
 
-  async start({ video }) {
+  async start({ videos }) {
+    this.lastPlaylist = videos;
+    const video = videos[0];
     this.state = {
       ...this.state,
       status: "LIVE",
@@ -72,7 +75,7 @@ async function login(baseUrl) {
   };
 }
 
-test("uploads a video in chunks and starts the selected stream", async (t) => {
+test("uploads a video in chunks and starts the queue stream", async (t) => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "streamlab-test-"));
   const controller = new FakeController();
   const store = new VideoStore({ rootDir: dataDir });
@@ -192,11 +195,24 @@ test("uploads a video in chunks and starts the selected stream", async (t) => {
   assert.equal(queueBody.queue.items.length, 1);
   assert.equal(queueBody.queue.items[0].video.name, "demo.mp4");
 
+  const addAgainResponse = await fetch(`${baseUrl}/api/queue/items`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: session.cookie,
+      "X-CSRF-Token": session.csrfToken,
+    },
+    body: JSON.stringify({ videoId: created.upload.id }),
+  });
+  assert.equal(addAgainResponse.status, 201);
+
   const queueResponse = await fetch(`${baseUrl}/api/queue`, {
     headers: { Cookie: session.cookie },
   });
   assert.equal(queueResponse.status, 200);
-  assert.equal((await queueResponse.json()).queue.mode, "LOOP_ALL");
+  const savedQueue = (await queueResponse.json()).queue;
+  assert.equal(savedQueue.mode, "LOOP_ALL");
+  assert.equal(savedQueue.items.length, 2);
 
   const startResponse = await fetch(`${baseUrl}/api/stream/start`, {
     method: "POST",
@@ -206,7 +222,6 @@ test("uploads a video in chunks and starts the selected stream", async (t) => {
       "X-CSRF-Token": session.csrfToken,
     },
     body: JSON.stringify({
-      videoId: created.upload.id,
       streamUrl: "rtmps://a.rtmps.youtube.com/live2",
       streamKey: "abcd-efgh-ijkl-mnop",
     }),
@@ -215,7 +230,46 @@ test("uploads a video in chunks and starts the selected stream", async (t) => {
   const started = await startResponse.json();
   assert.equal(started.stream.status, "LIVE");
   assert.equal(started.stream.videoName, "demo.mp4");
+  assert.deepEqual(controller.lastPlaylist.map((video) => video.id), [
+    created.upload.id,
+    created.upload.id,
+  ]);
   assert.doesNotMatch(JSON.stringify(started), /abcd-efgh/);
+
+  const changeActiveQueueResponse = await fetch(`${baseUrl}/api/queue/items`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: session.cookie,
+      "X-CSRF-Token": session.csrfToken,
+    },
+    body: JSON.stringify({ videoId: created.upload.id }),
+  });
+  assert.equal(changeActiveQueueResponse.status, 409);
+
+  const deleteActiveResponse = await fetch(`${baseUrl}/api/videos/${created.upload.id}`, {
+    method: "DELETE",
+    headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+  });
+  assert.equal(deleteActiveResponse.status, 409);
+
+  const stopResponse = await fetch(`${baseUrl}/api/stream/stop`, {
+    method: "POST",
+    headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+  });
+  assert.equal(stopResponse.status, 200);
+
+  const deleteResponse = await fetch(`${baseUrl}/api/videos/${created.upload.id}`, {
+    method: "DELETE",
+    headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+  });
+  assert.equal(deleteResponse.status, 200);
+  const deleted = await deleteResponse.json();
+  assert.equal(deleted.queue.items.length, 0);
+  assert.deepEqual(
+    (await readdir(path.join(dataDir, "uploads"))).filter((name) => name !== ".trash"),
+    [],
+  );
 });
 
 test("rejects state-changing requests without a CSRF token", async (t) => {
@@ -240,7 +294,7 @@ test("rejects state-changing requests without a CSRF token", async (t) => {
 
 test("builds a fixed 1080p30 CBR FFmpeg command without a shell", () => {
   const args = buildFfmpegArgs({
-    inputPath: "C:/media/demo.mp4",
+    playlistPath: "C:/media/stream-playlist.ffconcat",
     target: "rtmps://example.test/live/key",
   });
   assert.ok(args.includes("libx264"));
@@ -249,6 +303,14 @@ test("builds a fixed 1080p30 CBR FFmpeg command without a shell", () => {
   assert.ok(args.includes("flv"));
   assert.equal(args.at(-1), "rtmps://example.test/live/key");
   assert.match(args[args.indexOf("-vf") + 1], /scale=1920:1080/);
+  assert.equal(args[args.indexOf("-f") + 1], "concat");
+  assert.equal(args[args.indexOf("-i") + 1], "C:/media/stream-playlist.ffconcat");
+
+  const playlist = buildConcatPlaylist([
+    { filePath: "C:/media/first.mp4" },
+    { filePath: "C:/media/second.mp4" },
+  ]);
+  assert.match(playlist, /first\.mp4[\s\S]+second\.mp4/);
 });
 
 test("returns actionable storage errors without exposing filesystem details", () => {
