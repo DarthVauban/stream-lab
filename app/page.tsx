@@ -39,6 +39,10 @@ type Video = {
   compressionProfile: "ECONOMY" | "STANDARD" | "QUALITY";
   fingerprint: string | null;
   thumbnailUrl: string | null;
+  thumbnailPositionSeconds: number | null;
+  thumbnailUpdatedAt: string | null;
+  thumbnailStatus: "NONE" | "GENERATING" | "READY" | "FAILED";
+  thumbnailError: string | null;
 };
 
 type StreamStatus = {
@@ -92,6 +96,50 @@ type StorageStatus = {
   updatedAt: string;
 };
 
+type SystemStatus = {
+  updatedAt: string;
+  intervalMs: number;
+  cpu: {
+    usagePercent: number | null;
+    cores: number;
+    model: string;
+    speedMhz: number | null;
+    loadAverage: number[];
+    temperatureCelsius: number | null;
+  };
+  memory: {
+    totalBytes: number;
+    usedBytes: number;
+    freeBytes: number;
+    usagePercent: number | null;
+    processRssBytes: number;
+    processHeapUsedBytes: number;
+    availableToProcessBytes: number | null;
+  };
+  disk: StorageStatus;
+  network: {
+    receivedBytesPerSecond: number | null;
+    transmittedBytesPerSecond: number | null;
+    receivedBytes: number | null;
+    transmittedBytes: number | null;
+  };
+  system: {
+    hostname: string;
+    platform: string;
+    release: string;
+    architecture: string;
+    uptimeSeconds: number;
+    nodeVersion: string | null;
+  };
+  history: Array<{
+    capturedAt: string;
+    cpuUsagePercent: number | null;
+    memoryUsagePercent: number | null;
+    receivedBytesPerSecond: number | null;
+    transmittedBytesPerSecond: number | null;
+  }>;
+};
+
 type StreamPresetSummary = {
   id: string;
   name: string;
@@ -113,6 +161,7 @@ type Health = {
   database: { configured: boolean; connected: boolean };
   realtime: { configured: boolean; connected: boolean };
   storage: StorageStatus | null;
+  system: SystemStatus | null;
 };
 
 type QueueItem = {
@@ -319,6 +368,11 @@ function humanSize(bytes: number) {
   return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
 }
 
+function formatRate(bytes: number | null | undefined) {
+  if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) return "—";
+  return `${humanSize(bytes)}/с`;
+}
+
 function formatDuration(startedAt: string | null, currentTime: number) {
   if (!startedAt) return "—";
   if (!currentTime) return "00:00:00";
@@ -497,6 +551,7 @@ export default function Home() {
   const [youtube, setYoutube] = useState<YouTubeStatus | null>(null);
   const [youtubeAction, setYoutubeAction] = useState("");
   const [monitoring, setMonitoring] = useState<MonitoringStatus | null>(null);
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [monitoringRange, setMonitoringRange] = useState<MonitoringRange>(24);
   const [telegram, setTelegram] = useState<TelegramStatus | null>(null);
@@ -506,6 +561,8 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [failedChannelAvatarUrl, setFailedChannelAvatarUrl] = useState("");
+  const [thumbnailDrafts, setThumbnailDrafts] = useState<Record<string, number>>({});
+  const [thumbnailAction, setThumbnailAction] = useState("");
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [now, setNow] = useState(0);
@@ -514,7 +571,7 @@ export default function Home() {
 
   const refresh = useCallback(async () => {
     try {
-      const [healthResult, videosResult, uploadsResult, streamResult, queueResult, playlistsResult, youtubeResult] = await Promise.all([
+      const [healthResult, videosResult, uploadsResult, streamResult, queueResult, playlistsResult, youtubeResult, systemResult] = await Promise.all([
         api<Health>("/api/health"),
         api<{ videos: Video[] }>("/api/videos"),
         api<{ uploads: Video[] }>("/api/uploads"),
@@ -522,6 +579,7 @@ export default function Home() {
         api<{ queue: QueueState }>("/api/queue"),
         api<{ playlists: Playlist[] }>("/api/playlists"),
         api<{ youtube: YouTubeStatus }>("/api/youtube/status"),
+        api<{ system: SystemStatus | null }>("/api/system/status"),
       ]);
       setHealth(healthResult);
       setVideos(videosResult.videos);
@@ -531,6 +589,7 @@ export default function Home() {
       setPlaylists(playlistsResult.playlists);
       setSelectedPlaylistId((current) => current || playlistsResult.playlists[0]?.id || "");
       setYoutube(youtubeResult.youtube);
+      setSystemStatus(systemResult.system);
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
         setAuthState("anonymous");
@@ -629,8 +688,12 @@ export default function Home() {
     let closed = false;
     const handleMessage = (data: string) => {
       try {
-        const payload = JSON.parse(data) as { type?: string };
+        const payload = JSON.parse(data) as { type?: string; payload?: unknown };
         if (payload.type === "READY") return;
+        if (payload.type === "SYSTEM_METRICS" && payload.payload) {
+          setSystemStatus(payload.payload as SystemStatus);
+          return;
+        }
         window.clearTimeout(refreshTimer);
         refreshTimer = window.setTimeout(() => void refresh(), 150);
       } catch {
@@ -943,6 +1006,7 @@ export default function Home() {
       setYoutube(null);
       setYoutubeAction("");
       setMonitoring(null);
+      setSystemStatus(null);
       setAuditEntries([]);
       setMonitoringRange(24);
       setTelegram(null);
@@ -951,6 +1015,8 @@ export default function Home() {
       setTelegramAction("");
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
+      setThumbnailDrafts({});
+      setThumbnailAction("");
       setRealtimeConnected(false);
     }
   }
@@ -1100,6 +1166,40 @@ export default function Home() {
       });
     } finally {
       setProcessingAction("");
+    }
+  }
+
+  async function updateVideoThumbnail(video: Video) {
+    if (thumbnailAction || video.status !== "READY" || !video.media?.durationSeconds) return;
+    const maxPosition = Math.max(0, video.media.durationSeconds - 0.05);
+    const suggestedPosition = Math.min(10, video.media.durationSeconds * 0.1, maxPosition);
+    const positionSeconds = Math.min(
+      maxPosition,
+      Math.max(0, thumbnailDrafts[video.id] ?? video.thumbnailPositionSeconds ?? suggestedPosition),
+    );
+    setThumbnailAction(video.id);
+    setNotice(null);
+    try {
+      const result = await api<{ video: Video }>(
+        `/api/videos/${video.id}/thumbnail`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ positionSeconds }),
+        },
+        csrfToken,
+      );
+      setVideos((current) => current.map((item) => item.id === video.id
+        ? { ...result.video, thumbnailStatus: "GENERATING", thumbnailError: null }
+        : item));
+      setNotice({ type: "success", text: `Створення прев’ю з кадру ${formatMediaTime(positionSeconds * 1_000)} запущено.` });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося створити прев’ю.",
+      });
+    } finally {
+      setThumbnailAction("");
     }
   }
 
@@ -1946,6 +2046,17 @@ export default function Home() {
               videos.map((video) => {
                 const ready = video.status === "READY";
                 const processing = ["ANALYZING", "PROCESSING"].includes(video.status);
+                const durationSeconds = video.media?.durationSeconds ?? 0;
+                const thumbnailMax = Math.max(0, durationSeconds - 0.05);
+                const thumbnailPosition = Math.min(
+                  thumbnailMax,
+                  Math.max(
+                    0,
+                    thumbnailDrafts[video.id]
+                      ?? video.thumbnailPositionSeconds
+                      ?? Math.min(10, durationSeconds * 0.1),
+                  ),
+                );
                 return (
                   <div
                     className={`video-row video-row--${video.status.toLowerCase()}`}
@@ -2013,6 +2124,39 @@ export default function Home() {
                         >
                           {processingAction === video.id ? "Запускаємо…" : "Повторити"}
                         </button>
+                      </div>
+                    )}
+                    {ready && durationSeconds > 0 && (
+                      <div className="video-thumbnail-editor">
+                        <div className="video-thumbnail-copy">
+                          <span>Кадр для прев’ю</span>
+                          <strong>{formatMediaTime(thumbnailPosition * 1_000)} / {formatMediaTime(durationSeconds * 1_000)}</strong>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={thumbnailMax}
+                          step={0.1}
+                          value={thumbnailPosition}
+                          onChange={(event) => setThumbnailDrafts((current) => ({
+                            ...current,
+                            [video.id]: Number(event.target.value),
+                          }))}
+                          aria-label={`Момент кадру для ${video.name}`}
+                          disabled={video.thumbnailStatus === "GENERATING" || thumbnailAction === video.id}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => updateVideoThumbnail(video)}
+                          disabled={video.thumbnailStatus === "GENERATING" || Boolean(thumbnailAction)}
+                        >
+                          {video.thumbnailStatus === "GENERATING" || thumbnailAction === video.id
+                            ? "Створюємо…"
+                            : video.thumbnailUrl ? "Оновити кадр" : "Встановити кадр"}
+                        </button>
+                        {video.thumbnailError && (
+                          <p role="alert">{video.thumbnailError}</p>
+                        )}
                       </div>
                     )}
                   </div>
@@ -2297,6 +2441,99 @@ export default function Home() {
               ))}
             </div>
           </div>
+
+          {!systemStatus ? (
+            <div className="system-monitoring-empty">Очікуємо перший знімок ресурсів сервера…</div>
+          ) : (
+            <div className="system-monitoring" aria-label="Ресурси сервера у реальному часі">
+              <div className="system-monitoring-heading">
+                <div>
+                  <span className="system-live-dot" aria-hidden="true" />
+                  <div>
+                    <span>Сервер у реальному часі</span>
+                    <strong>{systemStatus.system.hostname}</strong>
+                  </div>
+                </div>
+                <time dateTime={systemStatus.updatedAt}>
+                  LIVE · {new Date(systemStatus.updatedAt).toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                </time>
+              </div>
+
+              <div className="system-metrics">
+                <div className="system-metric">
+                  <span>Процесор</span>
+                  <strong>{formatMetric(systemStatus.cpu.usagePercent, "%", 1)}</strong>
+                  <div className="system-meter" aria-hidden="true"><i style={{ width: `${systemStatus.cpu.usagePercent ?? 0}%` }} /></div>
+                  <small>{systemStatus.cpu.cores} ядер · load {formatMetric(systemStatus.cpu.loadAverage[0], "", 2)}</small>
+                </div>
+                <div className="system-metric">
+                  <span>Оперативна пам’ять</span>
+                  <strong>{formatMetric(systemStatus.memory.usagePercent, "%", 1)}</strong>
+                  <div className="system-meter" aria-hidden="true"><i style={{ width: `${systemStatus.memory.usagePercent ?? 0}%` }} /></div>
+                  <small>{humanSize(systemStatus.memory.usedBytes)} з {humanSize(systemStatus.memory.totalBytes)}</small>
+                </div>
+                <div className={`system-metric system-metric--${systemStatus.disk.level.toLowerCase()}`}>
+                  <span>Диск із медіа</span>
+                  <strong>{formatMetric(systemStatus.disk.percentUsed, "%", 1)}</strong>
+                  <div className="system-meter" aria-hidden="true"><i style={{ width: `${systemStatus.disk.percentUsed}%` }} /></div>
+                  <small>{humanSize(systemStatus.disk.freeBytes)} вільно</small>
+                </div>
+                <div className="system-metric">
+                  <span>Мережа</span>
+                  <strong>↓ {formatRate(systemStatus.network.receivedBytesPerSecond)}</strong>
+                  <div className="system-network-out">↑ {formatRate(systemStatus.network.transmittedBytesPerSecond)}</div>
+                  <small>поточна швидкість контейнера</small>
+                </div>
+              </div>
+
+              <div className="system-detail-grid">
+                <div className="system-history-card">
+                  <div className="system-card-heading">
+                    <div><span>Навантаження</span><strong>Останні {Math.round((systemStatus.history.length * systemStatus.intervalMs) / 1_000)} секунд</strong></div>
+                    <span>CPU / RAM</span>
+                  </div>
+                  <div className="system-history-row">
+                    <b>CPU</b>
+                    <div aria-label="Історія завантаження процесора">
+                      {systemStatus.history.map((sample) => (
+                        <i
+                          key={`cpu-${sample.capturedAt}`}
+                          style={{ height: `${Math.max(2, sample.cpuUsagePercent ?? 0)}%` }}
+                          title={`${formatMetric(sample.cpuUsagePercent, "%", 1)} · ${formatEventTime(sample.capturedAt)}`}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                  <div className="system-history-row system-history-row--memory">
+                    <b>RAM</b>
+                    <div aria-label="Історія використання оперативної пам’яті">
+                      {systemStatus.history.map((sample) => (
+                        <i
+                          key={`ram-${sample.capturedAt}`}
+                          style={{ height: `${Math.max(2, sample.memoryUsagePercent ?? 0)}%` }}
+                          title={`${formatMetric(sample.memoryUsagePercent, "%", 1)} · ${formatEventTime(sample.capturedAt)}`}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="system-hardware-card">
+                  <div className="system-card-heading">
+                    <div><span>Залізо та система</span><strong>{systemStatus.cpu.model}</strong></div>
+                  </div>
+                  <dl>
+                    <div><dt>CPU</dt><dd>{systemStatus.cpu.cores} × {formatMetric(systemStatus.cpu.speedMhz, " МГц")}</dd></div>
+                    <div><dt>Температура</dt><dd>{formatMetric(systemStatus.cpu.temperatureCelsius, " °C", 1)}</dd></div>
+                    <div><dt>RAM процесу</dt><dd>{humanSize(systemStatus.memory.processRssBytes)}</dd></div>
+                    <div><dt>Система</dt><dd>{systemStatus.system.platform} {systemStatus.system.release} · {systemStatus.system.architecture}</dd></div>
+                    <div><dt>Uptime сервера</dt><dd>{formatMediaTime(systemStatus.system.uptimeSeconds * 1_000)}</dd></div>
+                  </dl>
+                  <p>Температура відображається лише тоді, коли VPS передає її контейнеру.</p>
+                </div>
+              </div>
+            </div>
+          )}
 
           {!monitoring ? (
             <div className="monitoring-empty">Завантажуємо показники ефіру…</div>

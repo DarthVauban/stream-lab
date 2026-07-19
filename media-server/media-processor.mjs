@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { ApiError } from "./api-error.mjs";
 import { compressionProfile } from "./compression-profiles.mjs";
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024 * 1024;
@@ -222,8 +223,33 @@ export function buildTranscodeArgs({
   ];
 }
 
-export function buildThumbnailArgs({ inputPath, outputPath, durationSeconds = 0 }) {
-  const seekSeconds = Math.max(0, Math.min(10, Number(durationSeconds) * 0.1 || 1));
+export function normalizeThumbnailPosition(positionSeconds, durationSeconds) {
+  const duration = Number(durationSeconds);
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new ApiError(409, "VIDEO_DURATION_UNAVAILABLE", "Не вдалося визначити тривалість відео.");
+  }
+  const maximum = Math.max(0, duration - 0.05);
+  const hasExplicitPosition = positionSeconds !== null && positionSeconds !== undefined && positionSeconds !== "";
+  const requested = hasExplicitPosition
+    ? Number(positionSeconds)
+    : Math.min(10, duration * 0.1 || 1);
+  if (!Number.isFinite(requested) || requested < 0 || requested > maximum + 0.001) {
+    throw new ApiError(
+      400,
+      "INVALID_THUMBNAIL_POSITION",
+      `Оберіть момент від 0 до ${maximum.toFixed(1)} секунди.`,
+    );
+  }
+  return Number(Math.min(maximum, requested).toFixed(3));
+}
+
+export function buildThumbnailArgs({
+  inputPath,
+  outputPath,
+  durationSeconds = 0,
+  positionSeconds = null,
+}) {
+  const seekSeconds = normalizeThumbnailPosition(positionSeconds, durationSeconds);
   return [
     "-hide_banner",
     "-loglevel",
@@ -236,7 +262,7 @@ export function buildThumbnailArgs({ inputPath, outputPath, durationSeconds = 0 
     "-frames:v",
     "1",
     "-vf",
-    "scale=480:-2:force_original_aspect_ratio=decrease",
+    "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2",
     "-q:v",
     "3",
     outputPath,
@@ -247,13 +273,14 @@ export async function generateThumbnail({
   inputPath,
   outputPath,
   durationSeconds,
+  positionSeconds = null,
   ffmpegPath = "ffmpeg",
   spawnImpl = spawn,
   signal,
 }) {
   await collectProcess(
     ffmpegPath,
-    buildThumbnailArgs({ inputPath, outputPath, durationSeconds }),
+    buildThumbnailArgs({ inputPath, outputPath, durationSeconds, positionSeconds }),
     { spawnImpl, signal },
   );
 }
@@ -390,9 +417,24 @@ export class MediaProcessor {
 
   enqueueThumbnail(videoId) {
     if (this.shuttingDown || this.queued.has(videoId) || this.activeVideoId === videoId) return;
-    this.queue.push({ videoId, thumbnailOnly: true });
+    this.queue.push({ videoId, thumbnailOnly: true, positionSeconds: null });
     this.queued.add(videoId);
     if (!this.drainPromise) this.drainPromise = Promise.resolve().then(() => this.drain());
+  }
+
+  requestThumbnail(videoId, positionSeconds) {
+    if (this.shuttingDown) {
+      throw new ApiError(503, "PROCESSOR_STOPPING", "Медіапроцесор зупиняється.");
+    }
+    if (this.queued.has(videoId) || this.activeVideoId === videoId) {
+      throw new ApiError(409, "VIDEO_PROCESSING_BUSY", "Для цього відео вже виконується медіаоперація.");
+    }
+    const paths = this.store.getThumbnailBackfillPaths(videoId);
+    const normalizedPosition = normalizeThumbnailPosition(positionSeconds, paths.durationSeconds);
+    this.queue.push({ videoId, thumbnailOnly: true, positionSeconds: normalizedPosition });
+    this.queued.add(videoId);
+    if (!this.drainPromise) this.drainPromise = Promise.resolve().then(() => this.drain());
+    return { videoId, positionSeconds: normalizedPosition };
   }
 
   async drain() {
@@ -403,7 +445,9 @@ export class MediaProcessor {
         this.queued.delete(videoId);
         this.activeVideoId = videoId;
         this.abortController = new AbortController();
-        if (task.thumbnailOnly) await this.processThumbnail(videoId, this.abortController.signal);
+        if (task.thumbnailOnly) {
+          await this.processThumbnail(videoId, this.abortController.signal, task.positionSeconds);
+        }
         else await this.processOne(videoId, this.abortController.signal);
         this.activeVideoId = null;
         this.abortController = null;
@@ -475,23 +519,31 @@ export class MediaProcessor {
     }
   }
 
-  async processThumbnail(videoId, signal) {
+  async processThumbnail(videoId, signal, requestedPositionSeconds = null) {
     try {
       const paths = this.store.getThumbnailBackfillPaths(videoId);
+      const positionSeconds = normalizeThumbnailPosition(
+        requestedPositionSeconds,
+        paths.durationSeconds,
+      );
+      await this.store.beginThumbnailGeneration(videoId, positionSeconds);
+      await this.onEvent("VIDEO_THUMBNAIL_STARTED", { videoId, positionSeconds });
       await this.thumbnailImpl({
         inputPath: paths.inputPath,
         outputPath: paths.tempThumbnailPath,
         durationSeconds: paths.durationSeconds,
+        positionSeconds,
         ffmpegPath: this.ffmpegPath,
         signal,
       });
-      await this.store.completeThumbnail(videoId);
-      await this.onEvent("VIDEO_THUMBNAIL_READY", { videoId });
+      await this.store.completeThumbnail(videoId, positionSeconds);
+      await this.onEvent("VIDEO_THUMBNAIL_READY", { videoId, positionSeconds });
     } catch (error) {
       if (this.shuttingDown && (signal.aborted || error?.name === "AbortError")) return;
       this.logger.error(`Помилка створення прев’ю відео ${videoId}:`, error);
-      await this.store.failThumbnail?.(videoId);
-      await this.onEvent("VIDEO_THUMBNAIL_FAILED", { videoId });
+      const message = error instanceof Error ? error.message : "Не вдалося створити прев’ю.";
+      await this.store.failThumbnail?.(videoId, message);
+      await this.onEvent("VIDEO_THUMBNAIL_FAILED", { videoId, message });
     }
   }
 

@@ -104,6 +104,7 @@ services:
       REDIS_URL: redis://redis:6379
       STORAGE_WARNING_PERCENT: ${STORAGE_WARNING_PERCENT:-80}
       STORAGE_CRITICAL_PERCENT: ${STORAGE_CRITICAL_PERCENT:-90}
+      SYSTEM_MONITOR_INTERVAL_MS: ${SYSTEM_MONITOR_INTERVAL_MS:-2000}
     volumes:
       - ./data:/app/data
     depends_on:

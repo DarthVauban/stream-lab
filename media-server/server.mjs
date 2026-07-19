@@ -16,6 +16,7 @@ import { QueueStore } from "./queue-store.mjs";
 import { RealtimeHub } from "./realtime-hub.mjs";
 import { SettingsStore } from "./settings-store.mjs";
 import { StorageMonitor } from "./storage-monitor.mjs";
+import { SystemMonitor } from "./system-monitor.mjs";
 import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
 import { EncryptedStreamPresetStore } from "./stream-preset-store.mjs";
@@ -143,6 +144,7 @@ export async function createMvpServer({
   audit,
   playlists,
   storage,
+  system,
 } = {}) {
   const databaseService = database ?? new PostgresDatabase();
   await databaseService.init?.();
@@ -260,6 +262,12 @@ export async function createMvpServer({
   await storageMonitor.snapshot().catch((error) => {
     console.error("StreamLab storage status failed.", error);
   });
+  const systemMonitor = system ?? new SystemMonitor({
+    storage: storageMonitor,
+    onSnapshot: (snapshot) => realtimeHub.publish("SYSTEM_METRICS", snapshot),
+  });
+  await systemMonitor.init?.();
+  systemMonitor.start?.();
   const captureMonitoring = async () => {
     try {
       await monitoringService.capture?.();
@@ -342,6 +350,7 @@ export async function createMvpServer({
           database: databaseHealth,
           realtime: realtimeHealth,
           storage: storageStatus,
+          system: systemMonitor.snapshot?.() ?? null,
         });
         return;
       }
@@ -472,8 +481,23 @@ export async function createMvpServer({
         return;
       }
 
+      if (request.method === "POST" && thumbnailMatch) {
+        const body = await readJson(request, 8 * 1024);
+        const operation = mediaProcessor.requestThumbnail(
+          thumbnailMatch[1],
+          body.positionSeconds,
+        );
+        json(response, 202, { operation, video: videoStore.getVideo(thumbnailMatch[1]) });
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/api/storage/status") {
         json(response, 200, { storage: await storageMonitor.snapshot() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/system/status") {
+        json(response, 200, { system: systemMonitor.snapshot?.() ?? null });
         return;
       }
 
@@ -924,6 +948,7 @@ export async function createMvpServer({
     audit: auditStore,
     realtime: realtimeHub,
     database: databaseService,
+    system: systemMonitor,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -934,6 +959,7 @@ export async function createMvpServer({
       });
     },
     async close() {
+      await systemMonitor.stop?.();
       await monitoringService.stop?.();
       youtubeIntegration.stop?.();
       await mediaProcessor.shutdown?.();

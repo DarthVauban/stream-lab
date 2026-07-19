@@ -10,7 +10,13 @@ import { normalizeCompressionProfile } from "./compression-profiles.mjs";
 const ALLOWED_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".webm", ".m4v"]);
 const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024 * 1024;
 
+function defaultThumbnailPosition(durationSeconds) {
+  const duration = Number(durationSeconds) || 0;
+  return Number(Math.max(0, Math.min(10, duration * 0.1 || 1, Math.max(0, duration - 0.05))).toFixed(3));
+}
+
 function publicRecord(record) {
+  const thumbnailVersion = record.thumbnailUpdatedAt || record.processedAt || "1";
   return {
     id: record.id,
     name: record.name,
@@ -28,7 +34,15 @@ function publicRecord(record) {
     media: record.mediaInfo ?? record.sourceMediaInfo ?? null,
     compressionProfile: normalizeCompressionProfile(record.compressionProfile),
     fingerprint: record.fingerprint ?? null,
-    thumbnailUrl: record.thumbnailStoredName ? `/api/videos/${record.id}/thumbnail` : null,
+    thumbnailUrl: record.thumbnailStoredName
+      ? `/api/videos/${record.id}/thumbnail?v=${encodeURIComponent(thumbnailVersion)}`
+      : null,
+    thumbnailPositionSeconds: Number.isFinite(record.thumbnailPositionSeconds)
+      ? record.thumbnailPositionSeconds
+      : null,
+    thumbnailUpdatedAt: record.thumbnailUpdatedAt ?? null,
+    thumbnailStatus: record.thumbnailStatus || (record.thumbnailStoredName ? "READY" : "NONE"),
+    thumbnailError: record.thumbnailError ?? null,
   };
 }
 
@@ -168,6 +182,10 @@ export class VideoStore {
       streamStoredName: `${id}.stream.mp4`,
       thumbnailStoredName: null,
       thumbnailTargetName: `${id}.thumbnail.jpg`,
+      thumbnailPositionSeconds: null,
+      thumbnailUpdatedAt: null,
+      thumbnailStatus: "NONE",
+      thumbnailError: null,
       fingerprint: validated.fingerprint || null,
       compressionProfile: normalizeCompressionProfile(input?.compressionProfile),
       processingProgress: 0,
@@ -346,6 +364,10 @@ export class VideoStore {
       await rm(this.thumbnailPath(record), { force: true }).catch(() => {});
       await rename(this.tempThumbnailPath(record), this.thumbnailPath(record));
       record.thumbnailStoredName = record.thumbnailTargetName;
+      record.thumbnailPositionSeconds = defaultThumbnailPosition(mediaInfo?.durationSeconds);
+      record.thumbnailUpdatedAt = new Date().toISOString();
+      record.thumbnailStatus = "READY";
+      record.thumbnailError = null;
     }
     record.preparedSize = (await stat(this.outputPath(record))).size;
     record.storedName = record.streamStoredName;
@@ -416,19 +438,41 @@ export class VideoStore {
     };
   }
 
-  async completeThumbnail(id) {
+  async beginThumbnailGeneration(id, positionSeconds) {
+    const record = this.requireUpload(id);
+    if (record.status !== "READY" || !record.storedName) {
+      throw new ApiError(409, "VIDEO_NOT_READY", "Прев’ю можна змінити лише для готового відео.");
+    }
+    record.thumbnailStatus = "GENERATING";
+    record.thumbnailError = null;
+    record.thumbnailPendingPositionSeconds = positionSeconds;
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  async completeThumbnail(id, positionSeconds) {
     const record = this.requireUpload(id);
     if (record.status !== "READY") return publicRecord(record);
     await rm(this.thumbnailPath(record), { force: true }).catch(() => {});
     await rename(this.tempThumbnailPath(record), this.thumbnailPath(record));
     record.thumbnailStoredName = record.thumbnailTargetName || `${record.id}.thumbnail.jpg`;
+    record.thumbnailPositionSeconds = positionSeconds;
+    record.thumbnailPendingPositionSeconds = null;
+    record.thumbnailUpdatedAt = new Date().toISOString();
+    record.thumbnailStatus = "READY";
+    record.thumbnailError = null;
     await this.persist();
     return publicRecord(record);
   }
 
-  async failThumbnail(id) {
+  async failThumbnail(id, message = "Не вдалося створити прев’ю.") {
     const record = this.find(id);
-    if (record) await rm(this.tempThumbnailPath(record), { force: true }).catch(() => {});
+    if (!record) return;
+    await rm(this.tempThumbnailPath(record), { force: true }).catch(() => {});
+    record.thumbnailPendingPositionSeconds = null;
+    record.thumbnailStatus = "FAILED";
+    record.thumbnailError = String(message).slice(0, 300);
+    await this.persist();
   }
 
   getReadyVideo(id) {

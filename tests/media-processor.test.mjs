@@ -99,6 +99,7 @@ test("restores pending processing and supports retry after a failure", async (t)
   };
   const streamMedia = { ...sourceMedia, width: 1920, height: 1080, fps: 30 };
   let failFirstProbe = true;
+  const thumbnailPositions = [];
   const processor = new MediaProcessor({
     store,
     probeImpl: async (filePath) => {
@@ -112,7 +113,10 @@ test("restores pending processing and supports retry after a failure", async (t)
       onProgress(60);
       await copyFile(inputPath, outputPath);
     },
-    thumbnailImpl: async ({ inputPath, outputPath }) => copyFile(inputPath, outputPath),
+    thumbnailImpl: async ({ inputPath, outputPath, positionSeconds }) => {
+      thumbnailPositions.push(positionSeconds ?? null);
+      await copyFile(inputPath, outputPath);
+    },
     logger: { error() {} },
   });
   t.after(async () => processor.shutdown());
@@ -127,4 +131,13 @@ test("restores pending processing and supports retry after a failure", async (t)
   await processor.waitForIdle();
   assert.equal(store.listVideos()[0].status, "READY");
   assert.equal(store.listVideos()[0].processingProgress, 100);
+
+  const operation = processor.requestThumbnail(upload.id, 5.2);
+  assert.equal(operation.positionSeconds, 5.2);
+  await processor.waitForIdle();
+  const updated = store.listVideos()[0];
+  assert.equal(updated.thumbnailStatus, "READY");
+  assert.equal(updated.thumbnailPositionSeconds, 5.2);
+  assert.match(updated.thumbnailUrl, /\/thumbnail\?v=/);
+  assert.deepEqual(thumbnailPositions, [null, 5.2]);
 });

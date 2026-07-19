@@ -5,7 +5,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { compressionProfile, listCompressionProfiles } from "../media-server/compression-profiles.mjs";
-import { buildThumbnailArgs } from "../media-server/media-processor.mjs";
+import { buildThumbnailArgs, normalizeThumbnailPosition } from "../media-server/media-processor.mjs";
 import { PlaylistStore } from "../media-server/playlist-store.mjs";
 import { SettingsStore } from "../media-server/settings-store.mjs";
 import { StorageMonitor } from "../media-server/storage-monitor.mjs";
@@ -72,7 +72,13 @@ test("builds a bounded thumbnail command and reports disk thresholds", async () 
     durationSeconds: 200,
   });
   assert.equal(args[args.indexOf("-ss") + 1], "10.000");
+  assert.equal(
+    args[args.indexOf("-vf") + 1],
+    "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2",
+  );
   assert.equal(args.at(-1), "C:/media/preview.jpg");
+  assert.equal(normalizeThumbnailPosition(42.5, 200), 42.5);
+  assert.throws(() => normalizeThumbnailPosition(201, 200), /Оберіть момент/);
 
   const monitor = new StorageMonitor({
     path: "C:/media",
