@@ -8,6 +8,7 @@ import { QueueStore } from "./queue-store.mjs";
 import { SettingsStore } from "./settings-store.mjs";
 import { VideoStore } from "./store.mjs";
 import { StreamController } from "./stream-controller.mjs";
+import { EncryptedStreamPresetStore } from "./stream-preset-store.mjs";
 import { EncryptedStreamStateStore } from "./stream-state-store.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -103,13 +104,21 @@ export async function createMvpServer({
   processor,
   queue,
   settings,
+  presets,
 } = {}) {
   const videoStore = store ?? new VideoStore({ rootDir: dataDir });
   const liveQueue = queue ?? new QueueStore({ rootDir: dataDir });
   const settingsStore = settings ?? new SettingsStore({ rootDir: dataDir });
+  const streamPresetStore =
+    presets ??
+    new EncryptedStreamPresetStore({
+      rootDir: dataDir,
+      secret: process.env.STREAM_CONFIG_SECRET,
+    });
   await videoStore.init();
   await liveQueue.init();
   await settingsStore.init();
+  await streamPresetStore.init();
   const encryptedStateStore =
     stateStore ??
     (controller
@@ -261,6 +270,53 @@ export async function createMvpServer({
 
       if (request.method === "GET" && url.pathname === "/api/settings/stream") {
         json(response, 200, { settings: settingsStore.snapshot() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/stream-presets") {
+        json(response, 200, { presets: streamPresetStore.list() });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/stream-presets") {
+        const body = await readJson(request);
+        const input = {
+          name: body.name,
+          streamUrl: typeof body.streamUrl === "string" ? body.streamUrl.trim() : body.streamUrl,
+          streamKey: typeof body.streamKey === "string" ? body.streamKey.trim() : body.streamKey,
+        };
+        buildTarget(input.streamUrl, input.streamKey);
+        const createdPreset = await streamPresetStore.create(input);
+        json(response, 201, {
+          preset: streamPresetStore.list().find((preset) => preset.id === createdPreset.id),
+        });
+        return;
+      }
+
+      const streamPresetMatch = url.pathname.match(/^\/api\/stream-presets\/([^/]+)$/);
+      if (request.method === "GET" && streamPresetMatch) {
+        json(response, 200, { preset: streamPresetStore.get(streamPresetMatch[1]) });
+        return;
+      }
+
+      if (request.method === "PUT" && streamPresetMatch) {
+        const body = await readJson(request);
+        const input = {
+          name: body.name,
+          streamUrl: typeof body.streamUrl === "string" ? body.streamUrl.trim() : body.streamUrl,
+          streamKey: typeof body.streamKey === "string" ? body.streamKey.trim() : body.streamKey,
+        };
+        buildTarget(input.streamUrl, input.streamKey);
+        const updatedPreset = await streamPresetStore.update(streamPresetMatch[1], input);
+        json(response, 200, {
+          preset: streamPresetStore.list().find((preset) => preset.id === updatedPreset.id),
+        });
+        return;
+      }
+
+      if (request.method === "DELETE" && streamPresetMatch) {
+        await streamPresetStore.remove(streamPresetMatch[1]);
+        json(response, 200, { presets: streamPresetStore.list() });
         return;
       }
 
@@ -471,6 +527,7 @@ export async function createMvpServer({
     processor: mediaProcessor,
     queue: liveQueue,
     settings: settingsStore,
+    presets: streamPresetStore,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);

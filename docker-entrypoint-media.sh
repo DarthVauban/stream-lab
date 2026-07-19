@@ -18,6 +18,8 @@ if [ "$(id -u)" = "0" ]; then
     "$data_dir/queue.json.tmp" \
     "$data_dir/settings.json" \
     "$data_dir/settings.json.tmp" \
+    "$data_dir/stream-presets.enc.json" \
+    "$data_dir/stream-presets.enc.json.tmp" \
     "$data_dir/stream-state.enc.json" \
     "$data_dir/stream-state.enc.json.tmp" \
     "$data_dir/uploads"/*.part \

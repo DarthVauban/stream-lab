@@ -173,6 +173,20 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .field input::placeholder { color: #555f6c; }
 .field small { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; line-height: 1.45; }
 
+.preset-manager { margin-bottom: 18px; padding: 14px; border: 1px solid var(--border); border-radius: 14px; background: rgba(0,0,0,.14); }
+.preset-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.preset-fields .field { margin-bottom: 10px; }
+.preset-actions { display: flex; gap: 7px; }
+.preset-actions button { min-height: 34px; padding: 0 12px; border: 1px solid #303842; border-radius: 9px; background: #171c22; color: #b8c1cb; font-size: 10px; font-weight: 750; }
+.preset-actions button:not(:disabled):hover { border-color: #485361; color: var(--text); }
+.preset-actions .preset-save { color: var(--green); border-color: rgba(121,242,164,.22); }
+.preset-actions .preset-delete { margin-left: auto; color: #ff898d; border-color: rgba(255,93,99,.18); background: transparent; }
+.preset-manager > p { margin: 10px 0 0; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.secret-input { position: relative; }
+.secret-input input { padding-right: 88px; }
+.secret-input button { position: absolute; top: 50%; right: 7px; min-width: 70px; height: 34px; transform: translateY(-50%); border: 1px solid #303842; border-radius: 8px; background: #171c22; color: var(--green); font-size: 9px; font-weight: 750; }
+.secret-input button:not(:disabled):hover { border-color: rgba(121,242,164,.4); }
+
 .bitrate-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px; }
 .bitrate-control .field { margin-bottom: 0; }
 .bitrate-input { position: relative; }
@@ -275,6 +289,9 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
   .hero-copy { font-size: 14px; }
   .panel { padding: 18px; border-radius: 18px; }
   .output-grid { grid-template-columns: repeat(2, 1fr); }
+  .preset-fields { grid-template-columns: 1fr; gap: 0; }
+  .preset-actions { flex-wrap: wrap; }
+  .preset-actions .preset-delete { margin-left: 0; }
   .bitrate-control { grid-template-columns: 1fr; }
   .bitrate-save { width: 100%; margin-bottom: 4px; }
   .stream-controls { grid-template-columns: 1fr; }

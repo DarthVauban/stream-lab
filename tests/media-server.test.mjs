@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdtemp, readdir, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,6 +7,7 @@ import { createOwnerAuth, hashPassword } from "../media-server/auth.mjs";
 import { MediaProcessor } from "../media-server/media-processor.mjs";
 import { createMvpServer, normalizeServerError } from "../media-server/server.mjs";
 import { VideoStore } from "../media-server/store.mjs";
+import { EncryptedStreamPresetStore } from "../media-server/stream-preset-store.mjs";
 import {
   buildPlayoutFfmpegArgs,
   buildUplinkFfmpegArgs,
@@ -97,6 +98,13 @@ function testAuth() {
   });
 }
 
+function testPresetStore(dataDir) {
+  return new EncryptedStreamPresetStore({
+    rootDir: dataDir,
+    secret: "streamlab-test-preset-secret-32-characters",
+  });
+}
+
 async function login(baseUrl) {
   const response = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
@@ -148,6 +156,7 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
     processor,
     controller,
     auth: testAuth(),
+    presets: testPresetStore(dataDir),
   });
   const address = await app.listen(0, "127.0.0.1");
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -161,6 +170,35 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(unauthorized.status, 401);
 
   const session = await login(baseUrl);
+  const createPresetResponse = await fetch(`${baseUrl}/api/stream-presets`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: session.cookie,
+      "X-CSRF-Token": session.csrfToken,
+    },
+    body: JSON.stringify({
+      name: "Основний канал",
+      streamUrl: "rtmps://a.rtmps.youtube.com/live2",
+      streamKey: "preset-secret-key",
+    }),
+  });
+  assert.equal(createPresetResponse.status, 201);
+  const presetSummary = (await createPresetResponse.json()).preset;
+  assert.equal(presetSummary.name, "Основний канал");
+  assert.equal(presetSummary.streamKey, undefined);
+  assert.match(presetSummary.streamKeyMasked, /-key$/);
+
+  const rawPresets = await readFile(path.join(dataDir, "stream-presets.enc.json"), "utf8");
+  assert.doesNotMatch(rawPresets, /preset-secret-key/);
+
+  const presetDetailsResponse = await fetch(
+    `${baseUrl}/api/stream-presets/${presetSummary.id}`,
+    { headers: { Cookie: session.cookie } },
+  );
+  assert.equal(presetDetailsResponse.status, 200);
+  assert.equal((await presetDetailsResponse.json()).preset.streamKey, "preset-secret-key");
+
   const createResponse = await fetch(`${baseUrl}/api/uploads`, {
     method: "POST",
     headers: {
@@ -346,7 +384,12 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
 
 test("rejects state-changing requests without a CSRF token", async (t) => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "streamlab-auth-test-"));
-  const app = await createMvpServer({ dataDir, controller: new FakeController(), auth: testAuth() });
+  const app = await createMvpServer({
+    dataDir,
+    controller: new FakeController(),
+    auth: testAuth(),
+    presets: testPresetStore(dataDir),
+  });
   const address = await app.listen(0, "127.0.0.1");
   const baseUrl = `http://127.0.0.1:${address.port}`;
 

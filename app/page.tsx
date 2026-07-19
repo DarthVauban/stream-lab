@@ -68,6 +68,19 @@ type StreamSettings = {
   updatedAt: string | null;
 };
 
+type StreamPresetSummary = {
+  id: string;
+  name: string;
+  streamUrl: string;
+  streamKeyMasked: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type StreamPresetDetails = Omit<StreamPresetSummary, "streamKeyMasked"> & {
+  streamKey: string;
+};
+
 type Health = {
   ok: boolean;
   ffmpeg: { available: boolean; version: string | null; message: string | null };
@@ -243,6 +256,11 @@ export default function Home() {
   const [deletingVideoId, setDeletingVideoId] = useState("");
   const [streamUrl, setStreamUrl] = useState("rtmps://a.rtmps.youtube.com/live2");
   const [streamKey, setStreamKey] = useState("");
+  const [streamKeyVisible, setStreamKeyVisible] = useState(false);
+  const [streamPresets, setStreamPresets] = useState<StreamPresetSummary[]>([]);
+  const [selectedPresetId, setSelectedPresetId] = useState("");
+  const [presetName, setPresetName] = useState("");
+  const [presetAction, setPresetAction] = useState("");
   const [streamAction, setStreamAction] = useState(false);
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [now, setNow] = useState(0);
@@ -321,12 +339,16 @@ export default function Home() {
   useEffect(() => {
     if (authState !== "authenticated") return;
     let cancelled = false;
-    void api<{ settings: StreamSettings }>("/api/settings/stream")
-      .then(({ settings }) => {
+    void Promise.all([
+      api<{ settings: StreamSettings }>("/api/settings/stream"),
+      api<{ presets: StreamPresetSummary[] }>("/api/stream-presets"),
+    ])
+      .then(([{ settings }, { presets }]) => {
         if (cancelled) return;
         setStreamSettings(settings);
         setBitrateDraft(settings.videoBitrateKbps);
         setFallbackVideoDraft(settings.fallbackVideoId ?? "");
+        setStreamPresets(presets);
       })
       .catch((error) => {
         if (!cancelled) {
@@ -399,6 +421,11 @@ export default function Home() {
       setStreamSettings(null);
       setBitrateDraft(8000);
       setFallbackVideoDraft("");
+      setStreamPresets([]);
+      setSelectedPresetId("");
+      setPresetName("");
+      setStreamKey("");
+      setStreamKeyVisible(false);
     }
   }
 
@@ -711,6 +738,105 @@ export default function Home() {
     void saveQueueOrder(items);
   }
 
+  async function loadStreamPreset(presetId: string) {
+    setSelectedPresetId(presetId);
+    if (!presetId) {
+      setPresetName("");
+      return;
+    }
+    if (presetAction) return;
+    setPresetAction("load");
+    setNotice(null);
+    try {
+      const result = await api<{ preset: StreamPresetDetails }>(
+        `/api/stream-presets/${encodeURIComponent(presetId)}`,
+      );
+      setPresetName(result.preset.name);
+      setStreamUrl(result.preset.streamUrl);
+      setStreamKey(result.preset.streamKey);
+      setStreamKeyVisible(false);
+    } catch (error) {
+      setSelectedPresetId("");
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося відкрити пресет.",
+      });
+    } finally {
+      setPresetAction("");
+    }
+  }
+
+  function beginNewStreamPreset() {
+    setSelectedPresetId("");
+    setPresetName("");
+    setNotice(null);
+  }
+
+  async function saveStreamPreset() {
+    if (presetAction || active) return;
+    if (!presetName.trim()) {
+      setNotice({ type: "error", text: "Вкажіть назву пресету." });
+      return;
+    }
+    setPresetAction("save");
+    setNotice(null);
+    try {
+      const path = selectedPresetId
+        ? `/api/stream-presets/${encodeURIComponent(selectedPresetId)}`
+        : "/api/stream-presets";
+      const result = await api<{ preset: StreamPresetSummary }>(path, {
+        method: selectedPresetId ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: presetName, streamUrl, streamKey }),
+      }, csrfToken);
+      setStreamPresets((current) => {
+        const index = current.findIndex((preset) => preset.id === result.preset.id);
+        if (index === -1) return [...current, result.preset];
+        const updated = [...current];
+        updated[index] = result.preset;
+        return updated;
+      });
+      setSelectedPresetId(result.preset.id);
+      setPresetName(result.preset.name);
+      setNotice({
+        type: "success",
+        text: selectedPresetId ? "Пресет оновлено." : "Пресет збережено.",
+      });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося зберегти пресет.",
+      });
+    } finally {
+      setPresetAction("");
+    }
+  }
+
+  async function deleteStreamPreset() {
+    if (!selectedPresetId || presetAction || active) return;
+    if (!window.confirm(`Видалити пресет «${presetName}»?`)) return;
+    setPresetAction("delete");
+    setNotice(null);
+    try {
+      const result = await api<{ presets: StreamPresetSummary[] }>(
+        `/api/stream-presets/${encodeURIComponent(selectedPresetId)}`,
+        { method: "DELETE" },
+        csrfToken,
+      );
+      setStreamPresets(result.presets);
+      setSelectedPresetId("");
+      setPresetName("");
+      setNotice({ type: "success", text: "Пресет видалено. Поля ефіру залишилися без змін." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося видалити пресет.",
+      });
+    } finally {
+      setPresetAction("");
+    }
+  }
+
   async function saveStreamSettings(showNotice = true) {
     if (settingsAction || active) return null;
     setSettingsAction(true);
@@ -761,7 +887,6 @@ export default function Home() {
         body: JSON.stringify({ streamUrl, streamKey }),
       }, csrfToken);
       setStream(result.stream);
-      setStreamKey("");
       setNotice({ type: "success", text: "FFmpeg запущено. Очікуємо сигнал від YouTube." });
     } catch (error) {
       setNotice({
@@ -1097,6 +1222,64 @@ export default function Home() {
           </div>
 
           <form onSubmit={startStream}>
+            <div className="preset-manager">
+              <div className="preset-fields">
+                <label className="field">
+                  <span>Пресет підключення</span>
+                  <select
+                    value={selectedPresetId}
+                    onChange={(event) => void loadStreamPreset(event.target.value)}
+                    disabled={active || Boolean(presetAction)}
+                  >
+                    <option value="">Без пресету</option>
+                    {streamPresets.map((preset) => (
+                      <option key={preset.id} value={preset.id}>
+                        {preset.name} · {preset.streamKeyMasked}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Назва пресету</span>
+                  <input
+                    value={presetName}
+                    onChange={(event) => setPresetName(event.target.value)}
+                    placeholder="Наприклад, Основний канал"
+                    maxLength={80}
+                    disabled={active || Boolean(presetAction)}
+                  />
+                </label>
+              </div>
+              <div className="preset-actions">
+                <button type="button" onClick={beginNewStreamPreset} disabled={active || Boolean(presetAction)}>
+                  Новий
+                </button>
+                <button
+                  className="preset-save"
+                  type="button"
+                  onClick={() => void saveStreamPreset()}
+                  disabled={
+                    active ||
+                    Boolean(presetAction) ||
+                    !presetName.trim() ||
+                    !streamUrl.trim() ||
+                    !streamKey.trim()
+                  }
+                >
+                  {presetAction === "save" ? "Зберігаємо…" : selectedPresetId ? "Оновити" : "Зберегти"}
+                </button>
+                <button
+                  className="preset-delete"
+                  type="button"
+                  onClick={() => void deleteStreamPreset()}
+                  disabled={active || Boolean(presetAction) || !selectedPresetId}
+                >
+                  Видалити
+                </button>
+              </div>
+              <p>Пресети зберігаються на сервері у зашифрованому вигляді.</p>
+            </div>
+
             <label className="field">
               <span>Server URL</span>
               <input
@@ -1110,15 +1293,26 @@ export default function Home() {
             </label>
             <label className="field">
               <span>Stream key</span>
-              <input
-                type="password"
-                value={streamKey}
-                onChange={(event) => setStreamKey(event.target.value)}
-                placeholder="xxxx-xxxx-xxxx-xxxx"
-                disabled={active}
-                autoComplete="off"
-              />
-              <small>Ключ передається лише під час запуску й не повертається в інтерфейс.</small>
+              <div className="secret-input">
+                <input
+                  type={streamKeyVisible ? "text" : "password"}
+                  value={streamKey}
+                  onChange={(event) => setStreamKey(event.target.value)}
+                  placeholder="xxxx-xxxx-xxxx-xxxx"
+                  disabled={active}
+                  autoComplete="off"
+                />
+                <button
+                  type="button"
+                  onClick={() => setStreamKeyVisible((visible) => !visible)}
+                  aria-label={streamKeyVisible ? "Приховати stream key" : "Показати stream key"}
+                  aria-pressed={streamKeyVisible}
+                  disabled={!streamKey}
+                >
+                  {streamKeyVisible ? "Сховати" : "Показати"}
+                </button>
+              </div>
+              <small>Ключ залишається у полі після запуску та за замовчуванням прихований.</small>
             </label>
 
             <label className="field">
