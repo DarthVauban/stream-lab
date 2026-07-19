@@ -59,25 +59,30 @@ npm run stream:secret --silent
 docker compose up -d --build --wait
 ```
 
-Відкрийте `http://127.0.0.1:3000`. Назовні публікується лише вебпорт `3000`.
+Відкрийте `http://127.0.0.1:3000`. Локальний запуск не вмикає production-профіль
+Caddy, тому HTTPS-сертифікат для домену не запитується.
 Next.js передає `/api` до медіасервера через внутрішню Docker-мережу, тому порт
 `8788` із хоста недоступний.
 
 ### Продакшн (обидва сервіси в Docker)
 
-`compose.yaml` запускає Next.js і медіасервер окремими процесами. Перед стартом
+`compose.yaml` запускає Caddy, Next.js і медіасервер окремими процесами. Перед стартом
 контейнер готує права каталогу `data/`, а сам Node.js медіасервер працює від
 непривілейованого користувача `node`.
 На сервері створіть `stream-lab/.env` з `OWNER_PASSWORD_HASH`, `SESSION_SECRET`,
-`STREAM_CONFIG_SECRET` та іншими значеннями з `.env.example`.
+`STREAM_CONFIG_SECRET` та іншими значеннями з `.env.example`. Для production
+використовуйте `STREAMLAB_DOMAIN=stream.mt-panel.sbs` і `AUTH_COOKIE_SECURE=true`.
 
-```powershell
-docker compose up -d --wait
+```bash
+docker compose --profile production up -d --wait
 ```
 
-Панель буде доступна за `http://<SERVER_IP>:3000`. На цьому етапі HTTPS свідомо
-не налаштований, тому використовуйте довірену мережу і не передавайте пароль чи
-stream key через публічні незахищені мережі.
+Панель буде доступна за `https://stream.mt-panel.sbs`. Caddy автоматично отримує
+й поновлює TLS-сертифікат та перенаправляє HTTP на HTTPS. Для першого випуску порт
+`3000` залишається резервним; його потрібно закрити після перевірки доменного доступу.
+
+DNS-запис `A` повинен вказувати на той самий сервер, де працює Docker Compose,
+а TCP-порти `80` і `443` мають бути відкриті у firewall VPS та операційної системи.
 
 CI/CD спочатку запускає тести, lint і production-збірку, потім публікує SHA-образи
 та розгортає їх із healthcheck і rollback. Для деплою потрібні GitHub Secrets

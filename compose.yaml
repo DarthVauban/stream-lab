@@ -1,4 +1,32 @@
 services:
+  caddy:
+    image: caddy:2.11.4-alpine
+    profiles:
+      - production
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      STREAMLAB_DOMAIN: ${STREAMLAB_DOMAIN:-stream.mt-panel.sbs}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   media-server:
     image: ghcr.io/darthvauban/stream-lab-media:${IMAGE_TAG:-latest}
     build:
@@ -62,3 +90,7 @@ services:
       timeout: 5s
       retries: 6
       start_period: 15s
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -107,12 +107,14 @@ jobs:
             if [ -f .deploy-tag ]; then previous_tag=$(cat .deploy-tag); fi
             new_tag="sha-$GITHUB_SHA"
             export IMAGE_TAG="$new_tag"
-            docker compose pull media-server web
-            if ! docker compose up -d --wait --wait-timeout 120; then
+            export STREAMLAB_DOMAIN="stream.mt-panel.sbs"
+            export AUTH_COOKIE_SECURE="true"
+            docker compose --profile production pull media-server web caddy
+            if ! docker compose --profile production up -d --wait --wait-timeout 120; then
               echo "Deployment failed, rolling back to $previous_tag"
               export IMAGE_TAG="$previous_tag"
-              docker compose pull media-server web
-              docker compose up -d --wait --wait-timeout 120
+              docker compose --profile production pull media-server web caddy
+              docker compose --profile production up -d --wait --wait-timeout 120
               exit 1
             fi
             printf '%s\n' "$new_tag" > .deploy-tag
