@@ -42,6 +42,20 @@ test("classifies stable, buffering-risk and critical uplink states", () => {
     evaluateStreamHealth({ stream: { ...base, status: "RECONNECTING" }, now }).status,
     "CRITICAL",
   );
+  assert.equal(
+    evaluateStreamHealth({
+      stream: { ...base, outputMetrics: { ...base.outputMetrics, deliveryLagMs: 2_500 } },
+      now,
+    }).status,
+    "BUFFERING_RISK",
+  );
+  assert.equal(
+    evaluateStreamHealth({
+      stream: { ...base, outputMetrics: { ...base.outputMetrics, timelineResets: 1 } },
+      now,
+    }).status,
+    "CRITICAL",
+  );
 });
 
 test("persists monitoring history and stream transition events", async (t) => {

@@ -26,7 +26,7 @@ export function buildUplinkFfmpegArgs({
   inputFormat = null,
   networkTimeoutMs = 15_000,
 }) {
-  const bitrate = normalizeVideoBitrateKbps(videoBitrateKbps);
+  normalizeVideoBitrateKbps(videoBitrateKbps);
   const timeoutMicroseconds = Math.max(1_000, Number(networkTimeoutMs) || 15_000) * 1_000;
   return [
     "-hide_banner",
@@ -40,46 +40,18 @@ export function buildUplinkFfmpegArgs({
     "-thread_queue_size",
     "8192",
     ...(inputFormat ? ["-f", inputFormat] : []),
+    // Keep one real-time clock for the whole broadcast. Playout workers are
+    // allowed to stay slightly ahead behind pipe backpressure, so this
+    // long-lived process can bridge file boundaries and catch up after jitter.
+    "-re",
     "-i",
     inputUrl,
     "-map",
     "0:v:0",
     "-map",
     "0:a:0",
-    "-r",
-    "30",
-    "-fps_mode",
-    "cfr",
     "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-profile:v",
-    "high",
-    "-level:v",
-    "4.1",
-    "-pix_fmt",
-    "yuv420p",
-    "-b:v",
-    `${bitrate}k`,
-    "-minrate",
-    `${bitrate}k`,
-    "-maxrate",
-    `${bitrate}k`,
-    "-bufsize",
-    `${bitrate * 2}k`,
-    "-g",
-    "60",
-    "-keyint_min",
-    "60",
-    "-sc_threshold",
-    "0",
-    "-bf",
-    "2",
-    "-refs",
-    "1",
-    "-x264-params",
-    "nal-hrd=cbr:force-cfr=1:open-gop=0",
+    "copy",
     "-c:a",
     "aac",
     "-b:a",
@@ -92,12 +64,16 @@ export function buildUplinkFfmpegArgs({
     "aresample=async=1000:min_hard_comp=0.100:first_pts=0",
     "-max_muxing_queue_size",
     "4096",
+    "-max_interleave_delta",
+    "1000000",
     "-rw_timeout",
     String(Math.round(timeoutMicroseconds)),
     "-tcp_nodelay",
     "1",
     "-flvflags",
     "no_duration_filesize",
+    "-flush_packets",
+    "1",
     "-f",
     "flv",
     target,
@@ -166,6 +142,7 @@ export function buildPlayoutFfmpegArgs({
   outputUrl,
   timestampOffsetSeconds = 0,
   startSeconds = 0,
+  videoBitrateKbps = 8_000,
   overlays = [],
 }) {
   const safeStart = Math.max(0, Number(startSeconds) || 0);
@@ -176,7 +153,6 @@ export function buildPlayoutFfmpegArgs({
     "-hide_banner",
     "-loglevel",
     "info",
-    "-re",
     ...(safeStart > 0 ? ["-ss", safeStart.toFixed(3)] : []),
     "-i",
     inputPath,
@@ -185,6 +161,7 @@ export function buildPlayoutFfmpegArgs({
   for (const overlay of safeOverlays) args.push("-loop", "1", "-i", overlay.filePath);
 
   if (safeOverlays.length) {
+    const overlayBitrate = normalizeVideoBitrateKbps(videoBitrateKbps);
     const filters = [];
     let previous = "0:v";
     safeOverlays.forEach((overlay, index) => {
@@ -210,15 +187,37 @@ export function buildPlayoutFfmpegArgs({
       "-c:v",
       "libx264",
       "-preset",
-      "veryfast",
+      "ultrafast",
       "-tune",
       "zerolatency",
-      "-crf",
-      "18",
+      "-profile:v",
+      "high",
+      "-level:v",
+      "4.1",
       "-pix_fmt",
       "yuv420p",
       "-r",
       "30",
+      "-fps_mode",
+      "cfr",
+      "-b:v",
+      `${overlayBitrate}k`,
+      "-minrate",
+      `${overlayBitrate}k`,
+      "-maxrate",
+      `${overlayBitrate}k`,
+      "-bufsize",
+      `${overlayBitrate * 2}k`,
+      "-g",
+      "60",
+      "-keyint_min",
+      "60",
+      "-sc_threshold",
+      "0",
+      "-bf",
+      "0",
+      "-x264-params",
+      "nal-hrd=cbr:force-cfr=1:open-gop=0",
       "-c:a",
       "copy",
       "-shortest",
@@ -271,6 +270,20 @@ function durationMs(item) {
   return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1_000) : 0;
 }
 
+function sourceBitrateKbps(item) {
+  const bitsPerSecond = Number(item?.media?.bitrate);
+  return Number.isFinite(bitsPerSecond) && bitsPerSecond > 0
+    ? Math.max(1, Math.round(bitsPerSecond / 1_000))
+    : null;
+}
+
+function playoutVideoBitrateKbps(item, fallback) {
+  return Math.min(
+    MAX_VIDEO_BITRATE_KBPS,
+    Math.max(MIN_VIDEO_BITRATE_KBPS, sourceBitrateKbps(item) ?? fallback),
+  );
+}
+
 export class StreamController {
   constructor({
     ffmpegPath = "ffmpeg",
@@ -283,6 +296,7 @@ export class StreamController {
     reconnectBaseMs = Number(process.env.STREAM_RECONNECT_BASE_MS || 2_000),
     reconnectMaxMs = Number(process.env.STREAM_RECONNECT_MAX_MS || 300_000),
     stableRunMs = Number(process.env.STREAM_STABLE_RUN_MS || 60_000),
+    prewarmLeadMs = Number(process.env.PLAYOUT_PREWARM_LEAD_MS || 1_500),
     setTimeoutImpl = setTimeout,
     clearTimeoutImpl = clearTimeout,
     now = () => Date.now(),
@@ -301,6 +315,7 @@ export class StreamController {
     this.reconnectBaseMs = reconnectBaseMs;
     this.reconnectMaxMs = reconnectMaxMs;
     this.stableRunMs = stableRunMs;
+    this.prewarmLeadMs = Math.max(250, Number(prewarmLeadMs) || 1_500);
     this.setTimeoutImpl = setTimeoutImpl;
     this.clearTimeoutImpl = clearTimeoutImpl;
     this.now = now;
@@ -320,6 +335,8 @@ export class StreamController {
     this.resolveVideo = null;
     this.reconnectTimer = null;
     this.playoutRetryTimer = null;
+    this.prewarmTimer = null;
+    this.prewarmedPlayout = null;
     this.failureStreak = 0;
     this.uplinkAttemptStartedAt = null;
     this.shuttingDown = false;
@@ -329,6 +346,7 @@ export class StreamController {
     this.ffmpegHealth = null;
     this.ffmpegHealthCheckedAt = 0;
     this.outputMetrics = null;
+    this.deliveryClock = null;
     this.playoutPausedForBackpressure = null;
     this.state = {
       status: "STOPPED",
@@ -469,6 +487,8 @@ export class StreamController {
       : Math.max(0, Math.min(currentDurationMs || Number.MAX_SAFE_INTEGER, this.now() - this.currentStartedAtMs));
     const next = this.nextItem();
     const queue = this.safeQueue();
+    const configuredVideoBitrateKbps = this.desired?.videoBitrateKbps ?? this.defaultVideoBitrateKbps;
+    const currentSourceBitrateKbps = sourceBitrateKbps(this.currentItem);
     return {
       ...this.state,
       videoId: this.currentItem?.id ?? null,
@@ -481,7 +501,13 @@ export class StreamController {
       nextQueueItemId: next?.queueItemId ?? null,
       nextVideoName: next?.name ?? null,
       isFallback: Boolean(this.currentItem?.isFallback),
-      videoBitrateKbps: this.desired?.videoBitrateKbps ?? this.defaultVideoBitrateKbps,
+      // The prepared asset is remuxed instead of encoded live. Report its
+      // measured bitrate as the active expectation so monitoring compares
+      // like-for-like rather than flagging the saved encoder preference.
+      videoBitrateKbps: currentSourceBitrateKbps ?? configuredVideoBitrateKbps,
+      configuredVideoBitrateKbps,
+      sourceBitrateKbps: currentSourceBitrateKbps,
+      transportMode: "REMUX",
       pid: this.uplinkChild?.pid ?? null,
       uplinkPid: this.uplinkChild?.pid ?? null,
       playoutPid: this.playoutChild?.pid ?? null,
@@ -541,6 +567,7 @@ export class StreamController {
     this.logs = [];
     this.history = [];
     this.outputMetrics = null;
+    this.deliveryClock = null;
     this.state = {
       status: "STARTING",
       startedAt,
@@ -590,16 +617,26 @@ export class StreamController {
     source?.stdout?.resume?.();
   }
 
+  pausePlayoutForBackpressure(source = this.playoutChild) {
+    if (!source || source !== this.playoutChild) return;
+    this.playoutPausedForBackpressure = source;
+    source.stdout?.pause?.();
+  }
+
   relayPlayoutChunk(chunk, source, runId) {
     if (runId !== this.playoutRunId || source !== this.playoutChild) return;
     const destination = this.uplinkChild?.stdin;
-    if (!destination || destination.destroyed || destination.writableEnded) return;
+    if (!destination || destination.destroyed || destination.writableEnded) {
+      this.pausePlayoutForBackpressure(source);
+      return;
+    }
     if (destination.write(chunk) || this.playoutPausedForBackpressure === source) return;
 
     this.playoutPausedForBackpressure = source;
     source.stdout?.pause?.();
     destination.once("drain", () => {
       if (this.playoutPausedForBackpressure !== source) return;
+      if (this.uplinkChild?.stdin !== destination) return;
       this.playoutPausedForBackpressure = null;
       if (runId === this.playoutRunId && source === this.playoutChild) source.stdout?.resume?.();
     });
@@ -618,6 +655,7 @@ export class StreamController {
     const runId = this.uplinkRunId;
     const progressParser = new FfmpegProgressParser({ now: this.now });
     this.outputMetrics = null;
+    this.deliveryClock = null;
     this.state.status = initial ? "STARTING" : "RECONNECTING";
     this.state.nextRetryAt = null;
     const args = buildUplinkFfmpegArgs({
@@ -641,7 +679,7 @@ export class StreamController {
     }
     this.uplinkChild = child;
     child.stdin?.on("error", () => {
-      this.resumePlayoutAfterBackpressure();
+      this.pausePlayoutForBackpressure();
     });
     this.uplinkAttemptStartedAt = this.now();
     let spawned = false;
@@ -660,7 +698,31 @@ export class StreamController {
     child.stdout?.on("data", (chunk) => {
       if (runId !== this.uplinkRunId) return;
       for (const metrics of progressParser.push(chunk)) {
-        this.outputMetrics = metrics;
+        const capturedAtMs = Date.parse(metrics.capturedAt);
+        const outTimeMs = metrics.outTimeMs;
+        if (!this.deliveryClock || (
+          outTimeMs !== null &&
+          outTimeMs < this.deliveryClock.lastOutTimeMs - 1_000
+        )) {
+          const timelineResets = (this.deliveryClock?.timelineResets || 0) + (this.deliveryClock ? 1 : 0);
+          this.deliveryClock = {
+            baseWallTimeMs: capturedAtMs,
+            baseOutTimeMs: outTimeMs ?? 0,
+            lastOutTimeMs: outTimeMs ?? 0,
+            timelineResets,
+          };
+        }
+        if (outTimeMs !== null) this.deliveryClock.lastOutTimeMs = outTimeMs;
+        const wallElapsedMs = Math.max(0, capturedAtMs - this.deliveryClock.baseWallTimeMs);
+        const outputElapsedMs = outTimeMs === null
+          ? 0
+          : Math.max(0, outTimeMs - this.deliveryClock.baseOutTimeMs);
+        this.outputMetrics = {
+          ...metrics,
+          deliveryLagMs: Math.max(0, wallElapsedMs - outputElapsedMs),
+          deliveryRate: wallElapsedMs >= 1_000 ? outputElapsedMs / wallElapsedMs : null,
+          timelineResets: this.deliveryClock.timelineResets,
+        };
         this.state.status = "LIVE";
         this.state.lastError = null;
         this.state.nextRetryAt = null;
@@ -673,7 +735,7 @@ export class StreamController {
       const ranFor = this.uplinkAttemptStartedAt === null ? 0 : this.now() - this.uplinkAttemptStartedAt;
       this.uplinkChild = null;
       this.uplinkAttemptStartedAt = null;
-      this.resumePlayoutAfterBackpressure();
+      this.pausePlayoutForBackpressure();
       if (!this.desired || this.shuttingDown || this.state.status === "STOPPING") return;
       if (ranFor >= this.stableRunMs) this.failureStreak = 0;
       this.scheduleReconnect(reason);
@@ -686,6 +748,7 @@ export class StreamController {
     return await new Promise((resolve, reject) => {
       child.once("spawn", () => {
         spawned = true;
+        this.resumePlayoutAfterBackpressure();
         resolve(this.snapshot());
       });
       child.once("error", (error) => {
@@ -702,18 +765,44 @@ export class StreamController {
     });
   }
 
-  async launchPlayout(item, { initial = false, resumeSeconds = 0 } = {}) {
-    if (!this.desired || this.shuttingDown || !item) return this.snapshot();
-    this.playoutRunId += 1;
-    const runId = this.playoutRunId;
-    this.currentItem = item;
-    this.currentStartedAtMs = this.now() - Math.max(0, Number(resumeSeconds) || 0) * 1_000;
-    this.skipRequested = false;
+  samePlayoutItem(left, right) {
+    if (!left || !right) return false;
+    if (left.queueItemId && right.queueItemId) return left.queueItemId === right.queueItemId;
+    return left.id === right.id && Boolean(left.isFallback) === Boolean(right.isFallback);
+  }
+
+  discardPrewarmedPlayout() {
+    if (this.prewarmTimer) this.clearTimeoutImpl(this.prewarmTimer);
+    this.prewarmTimer = null;
+    const candidate = this.prewarmedPlayout;
+    this.prewarmedPlayout = null;
+    candidate?.child?.kill?.("SIGTERM");
+  }
+
+  schedulePlayoutPrewarm() {
+    if (this.prewarmTimer) this.clearTimeoutImpl(this.prewarmTimer);
+    this.prewarmTimer = null;
+    if (!this.desired || !this.playoutChild || !this.currentItem || this.prewarmedPlayout) return;
+    const currentDurationMs = durationMs(this.currentItem);
+    if (!currentDurationMs || !this.nextItem()) return;
+    const elapsedMs = Math.max(0, this.now() - (this.currentStartedAtMs ?? this.now()));
+    const delayMs = Math.max(0, currentDurationMs - elapsedMs - this.prewarmLeadMs);
+    this.prewarmTimer = this.setTimeoutImpl(() => {
+      this.prewarmTimer = null;
+      this.prewarmNextPlayout();
+    }, delayMs);
+    this.prewarmTimer?.unref?.();
+  }
+
+  prewarmNextPlayout() {
+    if (!this.desired || this.shuttingDown || !this.playoutChild || this.prewarmedPlayout) return;
+    const next = this.nextItem();
+    if (!next) return;
     const args = buildPlayoutFfmpegArgs({
-      inputPath: item.filePath,
+      inputPath: next.filePath,
       outputUrl: this.playoutOutputUrl,
-      timestampOffsetSeconds: this.playoutClockSeconds,
-      startSeconds: resumeSeconds,
+      timestampOffsetSeconds: this.playoutClockSeconds + durationMs(this.currentItem) / 1_000,
+      videoBitrateKbps: playoutVideoBitrateKbps(next, this.desired.videoBitrateKbps),
       overlays: this.getOverlays?.() || [],
     });
     let child;
@@ -723,15 +812,62 @@ export class StreamController {
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (error) {
-      if (initial) throw error;
-      await this.advancePlayout("FAILED", String(error?.message || error));
-      return this.snapshot();
+      this.pushLogs(`Next playout prewarm failed: ${String(error?.message || error)}`, "controller");
+      return;
     }
+    const candidate = {
+      child,
+      item: next,
+      bufferedChunks: [],
+      bufferedBytes: 0,
+      spawned: false,
+    };
+    this.prewarmedPlayout = candidate;
+    child.stdout?.on("data", (chunk) => {
+      if (this.prewarmedPlayout !== candidate) return;
+      // Keep the first muxed packets in memory and stop the producer before
+      // it can advance past the active item. One Node stream read is usually
+      // enough, but accept any already queued reads up to a small hard limit.
+      if (candidate.bufferedBytes < 2 * 1024 * 1024) {
+        candidate.bufferedChunks.push(chunk);
+        candidate.bufferedBytes += chunk.length;
+      }
+      child.stdout.pause?.();
+    });
+    child.stderr?.on("data", (chunk) => {
+      if (this.prewarmedPlayout === candidate) this.pushLogs(chunk, "prewarm");
+    });
+    child.once("spawn", () => {
+      candidate.spawned = true;
+    });
+    const abandon = (reason) => {
+      if (this.prewarmedPlayout !== candidate) return;
+      this.prewarmedPlayout = null;
+      this.pushLogs(reason, "controller");
+    };
+    child.once("exit", (code, signal) => {
+      abandon(`Prewarmed playout exited early (code=${code ?? "null"}, signal=${signal ?? "null"}).`);
+    });
+    child.once("error", () => {
+      abandon("Prewarmed playout failed before promotion.");
+    });
+  }
+
+  async activatePlayoutChild(child, item, {
+    initial = false,
+    resumeSeconds = 0,
+    alreadySpawned = false,
+  } = {}) {
+    this.playoutRunId += 1;
+    const runId = this.playoutRunId;
+    this.currentItem = item;
+    this.currentStartedAtMs = this.now() - Math.max(0, Number(resumeSeconds) || 0) * 1_000;
+    this.skipRequested = false;
     this.playoutChild = child;
     child.stdout?.on("data", (chunk) => {
       this.relayPlayoutChunk(chunk, child, runId);
     });
-    let spawned = false;
+    let spawned = alreadySpawned;
     let terminalHandled = false;
 
     child.stderr?.on("data", (chunk) => {
@@ -759,8 +895,17 @@ export class StreamController {
     child.once("exit", (code, signal) => handleTerminal(code, signal));
 
     return await new Promise((resolve, reject) => {
+      if (alreadySpawned) {
+        child.once("error", () => {
+          handleTerminal(null, null, "Playout Engine завершився через системну помилку.");
+        });
+        this.schedulePlayoutPrewarm();
+        resolve(this.snapshot());
+        return;
+      }
       child.once("spawn", () => {
         spawned = true;
+        this.schedulePlayoutPrewarm();
         resolve(this.snapshot());
       });
       child.once("error", (error) => {
@@ -774,6 +919,43 @@ export class StreamController {
         if (!spawned) resolve(this.snapshot());
       });
     });
+  }
+
+  async promotePrewarmedPlayout(item) {
+    const candidate = this.prewarmedPlayout;
+    if (!candidate?.spawned || !this.samePlayoutItem(candidate.item, item)) return false;
+    this.prewarmedPlayout = null;
+    await this.activatePlayoutChild(candidate.child, item, { alreadySpawned: true });
+    if (candidate.bufferedChunks.length) {
+      this.relayPlayoutChunk(Buffer.concat(candidate.bufferedChunks), candidate.child, this.playoutRunId);
+    }
+    if (this.playoutPausedForBackpressure !== candidate.child) candidate.child.stdout?.resume?.();
+    return true;
+  }
+
+  async launchPlayout(item, { initial = false, resumeSeconds = 0 } = {}) {
+    if (!this.desired || this.shuttingDown || !item) return this.snapshot();
+    this.discardPrewarmedPlayout();
+    const args = buildPlayoutFfmpegArgs({
+      inputPath: item.filePath,
+      outputUrl: this.playoutOutputUrl,
+      timestampOffsetSeconds: this.playoutClockSeconds,
+      startSeconds: resumeSeconds,
+      videoBitrateKbps: playoutVideoBitrateKbps(item, this.desired.videoBitrateKbps),
+      overlays: this.getOverlays?.() || [],
+    });
+    let child;
+    try {
+      child = this.spawnImpl(this.ffmpegPath, args, {
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      if (initial) throw error;
+      await this.advancePlayout("FAILED", String(error?.message || error));
+      return this.snapshot();
+    }
+    return this.activatePlayoutChild(child, item, { initial, resumeSeconds });
   }
 
   async advancePlayout(outcome, reason) {
@@ -796,6 +978,7 @@ export class StreamController {
     this.currentStartedAtMs = null;
 
     if (!next) {
+      this.discardPrewarmedPlayout();
       this.state.status = "DEGRADED";
       this.state.lastError = "Черга порожня, а резервне відео не налаштоване.";
       this.state.lastFailure = reason;
@@ -807,9 +990,14 @@ export class StreamController {
       this.state.lastError = reason;
       this.state.lastFailure = reason;
     }
-    this.currentItem = next;
     try {
-      await this.launchPlayout(next);
+      const promoted = outcome === "COMPLETED"
+        ? await this.promotePrewarmedPlayout(next)
+        : false;
+      if (!promoted) {
+        this.discardPrewarmedPlayout();
+        await this.launchPlayout(next);
+      }
     } catch (error) {
       this.state.status = "DEGRADED";
       this.state.lastError = error instanceof Error ? error.message : "Не вдалося відкрити наступне відео.";
@@ -858,6 +1046,7 @@ export class StreamController {
       throw new ApiError(409, "PLAYOUT_NOT_ACTIVE", "Немає активного відео для пропуску.");
     }
     if (this.skipRequested) return this.snapshot();
+    this.discardPrewarmedPlayout();
     this.skipRequested = true;
     const completion = new Promise((resolve) => {
       this.skipCompletion = resolve;
@@ -872,6 +1061,7 @@ export class StreamController {
 
   async refreshPlayout() {
     if (!this.desired || !this.currentItem || !this.playoutChild) return this.snapshot();
+    this.discardPrewarmedPlayout();
     const currentDuration = durationMs(this.currentItem) / 1_000;
     const positionSeconds = Math.min(
       Math.max(0, currentDuration - 0.1),
@@ -919,6 +1109,7 @@ export class StreamController {
     if (this.playoutRetryTimer) this.clearTimeoutImpl(this.playoutRetryTimer);
     this.reconnectTimer = null;
     this.playoutRetryTimer = null;
+    this.discardPrewarmedPlayout();
   }
 
   async stop() {
@@ -943,6 +1134,7 @@ export class StreamController {
     this.currentItem = null;
     this.currentStartedAtMs = null;
     this.outputMetrics = null;
+    this.deliveryClock = null;
     this.resumePlayoutAfterBackpressure();
     this.state = {
       ...this.state,

@@ -64,6 +64,20 @@ export function evaluateStreamHealth({ stream = {}, youtube = {}, now = Date.now
       issues.push("speed_low");
       statuses.push("BUFFERING_RISK");
     }
+    const deliveryLagMs = numberOrNull(metrics.deliveryLagMs);
+    if (deliveryLagMs !== null && deliveryLagMs >= 5_000) {
+      issues.push("delivery_lag_critical");
+      statuses.push("CRITICAL");
+    } else if (deliveryLagMs !== null && deliveryLagMs >= 2_000) {
+      issues.push("delivery_lag_high");
+      statuses.push("BUFFERING_RISK");
+    }
+    const timelineResets = numberOrNull(metrics.timelineResets);
+    const previousTimelineResets = numberOrNull(previousSample?.timelineResets) ?? 0;
+    if (timelineResets !== null && timelineResets > previousTimelineResets) {
+      issues.push("timeline_reset");
+      statuses.push("CRITICAL");
+    }
     const bitrate = numberOrNull(metrics.bitrateKbps);
     const targetBitrate = numberOrNull(stream.videoBitrateKbps);
     if (bitrate !== null && targetBitrate) {
@@ -113,11 +127,21 @@ export function evaluateStreamHealth({ stream = {}, youtube = {}, now = Date.now
 
   const healthStatus = highestStatus(statuses);
   const reasons = {
-    STABLE: "Бітрейт, частота кадрів і швидкість кодування в нормі.",
+    STABLE: "Бітрейт, частота кадрів і швидкість подачі в нормі.",
     BUFFERING_RISK: "Один або кілька показників можуть спричинити буферизацію.",
     CRITICAL: "Сигнал потребує уваги: стабільна передача не підтверджена.",
   };
-  return { status: healthStatus, reason: reasons[healthStatus], issues };
+  let reason = reasons[healthStatus];
+  if (issues.includes("timeline_reset")) {
+    reason = "Виявлено розрив часової шкали між відео; це може перервати подачу на YouTube.";
+  } else if (issues.includes("delivery_lag_critical")) {
+    reason = "Подача відстає від реального часу більш ніж на 5 секунд.";
+  } else if (issues.includes("delivery_lag_high")) {
+    reason = "Подача відстає від реального часу більш ніж на 2 секунди.";
+  } else if (issues.includes("youtube_configuration_issue")) {
+    reason = "YouTube повідомляє про проблему вхідного сигналу.";
+  }
+  return { status: healthStatus, reason, issues };
 }
 
 export class MonitoringService {
@@ -196,6 +220,9 @@ export class MonitoringService {
       targetBitrateKbps: numberOrNull(current.stream.videoBitrateKbps),
       fps: numberOrNull(metrics.fps),
       speed: numberOrNull(metrics.speed),
+      deliveryRate: numberOrNull(metrics.deliveryRate),
+      deliveryLagMs: numberOrNull(metrics.deliveryLagMs),
+      timelineResets: numberOrNull(metrics.timelineResets) ?? 0,
       droppedFrames: numberOrNull(metrics.droppedFrames),
       duplicateFrames: numberOrNull(metrics.duplicateFrames),
       reconnectAttempt: numberOrNull(current.stream.reconnectAttempt) ?? 0,
@@ -330,6 +357,9 @@ export class MonitoringService {
         targetBitrateKbps: numberOrNull(current.stream.videoBitrateKbps),
         fps: numberOrNull(output.fps),
         speed: numberOrNull(output.speed),
+        deliveryRate: numberOrNull(output.deliveryRate),
+        deliveryLagMs: numberOrNull(output.deliveryLagMs),
+        timelineResets: numberOrNull(output.timelineResets) ?? 0,
         droppedFrames: numberOrNull(output.droppedFrames) ?? 0,
         duplicateFrames: numberOrNull(output.duplicateFrames) ?? 0,
         reconnectAttempt: numberOrNull(current.stream.reconnectAttempt) ?? 0,

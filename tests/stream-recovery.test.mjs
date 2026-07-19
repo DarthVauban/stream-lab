@@ -29,7 +29,7 @@ class FakeChild extends EventEmitter {
   }
 }
 
-function controllerHarness({ persisted = null, now, saveActiveImpl = null } = {}) {
+function controllerHarness({ persisted = null, now, saveActiveImpl = null, prewarmLeadMs } = {}) {
   const children = [];
   const uplinks = [];
   const playouts = [];
@@ -66,6 +66,7 @@ function controllerHarness({ persisted = null, now, saveActiveImpl = null } = {}
     reconnectBaseMs: 5,
     reconnectMaxMs: 10,
     stableRunMs: 50,
+    ...(prewarmLeadMs === undefined ? {} : { prewarmLeadMs }),
   });
   const init = () => controller.init({
     resolveVideo: (videoId) => queue.find((item) => item.id === videoId),
@@ -168,7 +169,7 @@ test("keeps one uplink while the live queue advances and changes", async (t) => 
   assert.equal(harness.uplinks.length, 1);
   assert.equal(harness.playouts.length, 1);
   assert.equal(harness.playouts[0].args[harness.playouts[0].args.indexOf("-i") + 1], firstVideo.filePath);
-  assert.ok(harness.uplinks[0].args.includes("7500k"));
+  assert.equal(harness.uplinks[0].args[harness.uplinks[0].args.indexOf("-c:v") + 1], "copy");
   assert.equal(harness.uplinks[0].args[harness.uplinks[0].args.indexOf("-progress") + 1], "pipe:1");
   assert.equal(harness.persistedWrites[0].videoId, firstVideo.id);
 
@@ -238,6 +239,33 @@ test("starts the next playout before slow state persistence completes", async (t
   await delay(0);
 });
 
+test("prewarms and promotes the next playout without spawning at the boundary", async (t) => {
+  const harness = controllerHarness();
+  harness.setQueue([firstVideo, secondVideo]);
+  await harness.init();
+  t.after(() => harness.controller.stop());
+  await harness.controller.start({
+    target: "rtmps://example.test/live/prewarm-key",
+    streamKey: "prewarm-key",
+  });
+
+  harness.controller.prewarmNextPlayout();
+  await delay(0);
+  await delay(0);
+  assert.equal(harness.playouts.length, 2);
+  assert.equal(harness.playouts[1].args[harness.playouts[1].args.indexOf("-i") + 1], secondVideo.filePath);
+
+  harness.playouts[1].stdout.write(Buffer.from("prewarmed-mpegts"));
+  await delay(0);
+  harness.playouts[0].emit("exit", 0, null);
+  await delay(0);
+  await delay(0);
+
+  assert.equal(harness.playouts.length, 2);
+  assert.equal(harness.controller.snapshot().videoId, secondVideo.id);
+  assert.equal(harness.controller.snapshot().playoutPid, harness.playouts[1].pid);
+});
+
 test("skips the current video without restarting the uplink", async (t) => {
   const harness = controllerHarness();
   harness.setQueue([firstVideo, secondVideo]);
@@ -269,10 +297,12 @@ test("reconnects only the uplink after a network failure", async (t) => {
 
   harness.uplinks[0].emit("exit", 1, null);
   assert.equal(harness.controller.snapshot().status, "RECONNECTING");
+  assert.equal(originalPlayout.stdout.isPaused(), true);
   await delay(15);
   assert.equal(harness.uplinks.length, 2);
   assert.equal(harness.playouts.length, 1);
   assert.equal(harness.playouts[0], originalPlayout);
+  assert.equal(originalPlayout.stdout.isPaused(), false);
 });
 
 test("uses and loops the fallback when the regular queue is empty", async (t) => {

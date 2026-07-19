@@ -59,6 +59,9 @@ type StreamStatus = {
   nextVideoName: string | null;
   isFallback: boolean;
   videoBitrateKbps: number;
+  configuredVideoBitrateKbps?: number;
+  sourceBitrateKbps?: number | null;
+  transportMode?: "REMUX" | "TRANSCODE";
   startedAt: string | null;
   stoppedAt: string | null;
   lastError: string | null;
@@ -208,6 +211,9 @@ type MonitoringStatus = {
     targetBitrateKbps: number | null;
     fps: number | null;
     speed: number | null;
+    deliveryRate: number | null;
+    deliveryLagMs: number | null;
+    timelineResets: number;
     droppedFrames: number;
     duplicateFrames: number;
     reconnectAttempt: number;
@@ -231,6 +237,9 @@ type MonitoringStatus = {
     targetBitrateKbps: number | null;
     fps: number | null;
     speed: number | null;
+    deliveryRate: number | null;
+    deliveryLagMs: number | null;
+    timelineResets: number;
     droppedFrames: number | null;
     duplicateFrames: number | null;
     reconnectAttempt: number;
@@ -3012,7 +3021,7 @@ export default function Home() {
                 <div><span>Частота</span><strong>30 FPS</strong></div>
                 <div><span>Відео</span><strong>H.264</strong></div>
                 <div>
-                  <span>Бітрейт</span>
+                  <span>{active && stream.transportMode === "REMUX" ? "Профіль поточного файлу" : "Бітрейт"}</span>
                   <strong>{((active ? stream.videoBitrateKbps : bitrateDraft) / 1000).toFixed(1)} Мбіт/с</strong>
                 </div>
               </div>
@@ -3465,9 +3474,16 @@ export default function Home() {
                   <small>ціль 30 FPS</small>
                 </div>
                 <div>
-                  <span>Швидкість кодування</span>
+                  <span>Швидкість подачі</span>
                   <strong>{formatMetric(monitoring.current.speed, "×", 2)}</strong>
                   <small>норма від 0,98×</small>
+                </div>
+                <div>
+                  <span>Відставання подачі</span>
+                  <strong>{monitoring.current.deliveryLagMs === null
+                    ? "—"
+                    : formatMediaTime(monitoring.current.deliveryLagMs)}</strong>
+                  <small>темп {formatMetric(monitoring.current.deliveryRate, "×", 3)} · скидань часу {monitoring.current.timelineResets}</small>
                 </div>
                 <div>
                   <span>Пропущені кадри</span>
@@ -3523,11 +3539,11 @@ export default function Home() {
 
                 <div className="monitoring-chart-card">
                   <div className="monitoring-chart-heading">
-                    <div><span>Швидкість кодування</span><strong>відносно реального часу</strong></div>
+                    <div><span>Швидкість подачі</span><strong>відносно реального часу</strong></div>
                     <span>норма ≥ 0,98×</span>
                   </div>
                   {monitoring.history.some((item) => item.speed !== null) ? (
-                    <div className="monitoring-chart" aria-label="Історія швидкості кодування">
+                    <div className="monitoring-chart" aria-label="Історія швидкості подачі">
                       {monitoringChartHistory.map((item) => (
                         <span
                           key={`speed-${item.capturedAt}`}
@@ -3541,7 +3557,7 @@ export default function Home() {
                       ))}
                     </div>
                   ) : (
-                    <div className="monitoring-chart-empty">Ще немає даних про швидкість FFmpeg.</div>
+                    <div className="monitoring-chart-empty">Ще немає даних про швидкість подачі.</div>
                   )}
                 </div>
               </div>

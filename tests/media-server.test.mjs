@@ -587,25 +587,24 @@ test("rejects state-changing requests without a CSRF token", async (t) => {
   assert.equal(response.status, 403);
 });
 
-test("builds separate dynamic playout and configurable CBR uplink commands", () => {
+test("builds a CPU-independent remux uplink and dynamic playout commands", () => {
   const args = buildUplinkFfmpegArgs({
     inputUrl: "udp://127.0.0.1:23000",
     target: "rtmps://example.test/live/key",
     videoBitrateKbps: 7_500,
   });
-  assert.ok(args.includes("libx264"));
-  assert.ok(args.includes("7500k"));
-  assert.ok(args.includes("60"));
+  assert.equal(args[args.indexOf("-c:v") + 1], "copy");
+  assert.equal(args.includes("libx264"), false);
   assert.ok(args.includes("flv"));
   assert.ok(args.includes("-nostats"));
   assert.equal(args[args.indexOf("-progress") + 1], "pipe:1");
   assert.equal(args.at(-1), "rtmps://example.test/live/key");
   assert.equal(args.includes("-vf"), false);
+  assert.equal(args.includes("-re"), true);
   assert.equal(args[args.indexOf("-i") + 1], "udp://127.0.0.1:23000");
-  assert.equal(args[args.indexOf("-fps_mode") + 1], "cfr");
   assert.equal(args[args.indexOf("-ar") + 1], "44100");
-  assert.match(args[args.indexOf("-x264-params") + 1], /nal-hrd=cbr/);
   assert.equal(args[args.indexOf("-rw_timeout") + 1], "15000000");
+  assert.equal(args[args.indexOf("-max_interleave_delta") + 1], "1000000");
 
   const playoutArgs = buildPlayoutFfmpegArgs({
     inputPath: "C:/media/first.mp4",
@@ -615,6 +614,7 @@ test("builds separate dynamic playout and configurable CBR uplink commands", () 
   assert.equal(playoutArgs[playoutArgs.indexOf("-i") + 1], "C:/media/first.mp4");
   assert.equal(playoutArgs[playoutArgs.indexOf("-c") + 1], "copy");
   assert.equal(playoutArgs[playoutArgs.indexOf("-output_ts_offset") + 1], "10.000");
+  assert.equal(playoutArgs.includes("-re"), false);
   assert.equal(playoutArgs[playoutArgs.indexOf("-f") + 1], "mpegts");
   assert.match(playoutArgs[playoutArgs.indexOf("-mpegts_flags") + 1], /initial_discontinuity/);
 
@@ -633,6 +633,9 @@ test("builds separate dynamic playout and configurable CBR uplink commands", () 
   assert.ok(promoArgs.includes("-filter_complex"));
   assert.match(promoArgs[promoArgs.indexOf("-filter_complex") + 1], /overlay=100:50/);
   assert.ok(promoArgs.includes("libx264"));
+  assert.equal(promoArgs[promoArgs.indexOf("-preset") + 1], "ultrafast");
+  assert.equal(promoArgs[promoArgs.indexOf("-b:v") + 1], "8000k");
+  assert.equal(promoArgs[promoArgs.indexOf("-g") + 1], "60");
 });
 
 test("returns actionable storage errors without exposing filesystem details", () => {
