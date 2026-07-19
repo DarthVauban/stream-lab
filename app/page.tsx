@@ -107,7 +107,59 @@ type AuthSession =
   | { authenticated: false }
   | { authenticated: true; owner: string; csrfToken: string; expiresAt: string };
 
-type WorkspaceTab = "library" | "queue" | "stream" | "youtube";
+type WorkspaceTab = "library" | "queue" | "stream" | "monitoring" | "youtube";
+type MonitoringRange = 1 | 24 | 168;
+type MonitoringHealthState = "STABLE" | "BUFFERING_RISK" | "CRITICAL" | "OFFLINE";
+
+type MonitoringStatus = {
+  status: MonitoringHealthState;
+  reason: string;
+  issues: string[];
+  updatedAt: string;
+  rangeHours: number;
+  current: {
+    streamStatus: StreamStatus["status"];
+    bitrateKbps: number | null;
+    targetBitrateKbps: number | null;
+    fps: number | null;
+    speed: number | null;
+    droppedFrames: number;
+    duplicateFrames: number;
+    reconnectAttempt: number;
+    metricsCapturedAt: string | null;
+    youtubeHealth: string | null;
+    viewers: number;
+  };
+  session: {
+    startedAt: string | null;
+    uptimeMs: number;
+    restarts: number;
+    peakViewers: number;
+    totalStreamStarts: number;
+    totalUplinkRestarts: number;
+  };
+  history: Array<{
+    capturedAt: string;
+    streamStatus: StreamStatus["status"];
+    healthStatus: MonitoringHealthState;
+    bitrateKbps: number | null;
+    targetBitrateKbps: number | null;
+    fps: number | null;
+    speed: number | null;
+    droppedFrames: number | null;
+    duplicateFrames: number | null;
+    reconnectAttempt: number;
+    viewers: number;
+    youtubeHealth: string | null;
+  }>;
+  events: Array<{
+    id: string;
+    occurredAt: string;
+    type: string;
+    severity: "info" | "success" | "warning" | "critical";
+    message: string;
+  }>;
+};
 
 type YouTubeBroadcast = {
   id: string;
@@ -269,6 +321,34 @@ function youtubeBroadcastStatus(status: string) {
   }[status] || status;
 }
 
+function monitoringStatusLabel(status: MonitoringHealthState | undefined) {
+  return {
+    STABLE: "Стабільно",
+    BUFFERING_RISK: "Ризик буферизації",
+    CRITICAL: "Критично",
+    OFFLINE: "Ефір зупинено",
+  }[status || "OFFLINE"];
+}
+
+function formatMetric(value: number | null | undefined, suffix = "", digits = 0) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return `${value.toLocaleString("uk-UA", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })}${suffix}`;
+}
+
+function formatEventTime(value: string) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "—";
+  return date.toLocaleString("uk-UA", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function videoStatusLabel(video: Video) {
   if (video.status === "ANALYZING") return "аналіз файлу";
   if (video.status === "PROCESSING") return `підготовка ${video.processingProgress}%`;
@@ -353,6 +433,8 @@ export default function Home() {
   const [streamAction, setStreamAction] = useState(false);
   const [youtube, setYoutube] = useState<YouTubeStatus | null>(null);
   const [youtubeAction, setYoutubeAction] = useState("");
+  const [monitoring, setMonitoring] = useState<MonitoringStatus | null>(null);
+  const [monitoringRange, setMonitoringRange] = useState<MonitoringRange>(24);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
   const [failedChannelAvatarUrl, setFailedChannelAvatarUrl] = useState("");
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
@@ -381,6 +463,19 @@ export default function Home() {
         setCsrfToken("");
       }
       setHealth(null);
+    }
+  }, []);
+
+  const refreshMonitoring = useCallback(async (hours: MonitoringRange) => {
+    try {
+      const result = await api<{ monitoring: MonitoringStatus }>(`/api/monitoring/status?hours=${hours}`);
+      setMonitoring(result.monitoring);
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 401) {
+        setAuthState("anonymous");
+        setOwner("");
+        setCsrfToken("");
+      }
     }
   }, []);
 
@@ -416,6 +511,16 @@ export default function Home() {
       window.clearInterval(clock);
     };
   }, [authState, refresh]);
+
+  useEffect(() => {
+    if (authState !== "authenticated") return;
+    const initialRefresh = window.setTimeout(() => void refreshMonitoring(monitoringRange), 0);
+    const poll = window.setInterval(() => void refreshMonitoring(monitoringRange), 5_000);
+    return () => {
+      window.clearTimeout(initialRefresh);
+      window.clearInterval(poll);
+    };
+  }, [authState, monitoringRange, refreshMonitoring]);
 
   useEffect(() => {
     if (authState !== "authenticated") return;
@@ -497,6 +602,11 @@ export default function Home() {
     : 0;
   const youtubeChart = youtube?.history.slice(-48) ?? [];
   const youtubeChartMax = Math.max(1, ...youtubeChart.map((item) => item.viewers));
+  const monitoringBitrateMax = Math.max(
+    1,
+    monitoring?.current.targetBitrateKbps ?? 0,
+    ...(monitoring?.history.map((item) => item.bitrateKbps ?? 0) ?? []),
+  );
 
   async function login(event: FormEvent) {
     event.preventDefault();
@@ -541,6 +651,8 @@ export default function Home() {
       setStreamKeyVisible(false);
       setYoutube(null);
       setYoutubeAction("");
+      setMonitoring(null);
+      setMonitoringRange(24);
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
     }
@@ -1346,6 +1458,20 @@ export default function Home() {
           </span>
         </button>
         <button
+          className={activeTab === "monitoring" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "monitoring"}
+          aria-controls="workspace-monitoring"
+          onClick={() => setActiveTab("monitoring")}
+        >
+          <span className="workspace-tab-number">04</span>
+          <span className="workspace-tab-copy"><strong>Моніторинг</strong><small>Якість і події</small></span>
+          <span className={`monitoring-tab-status monitoring-tab-status--${(monitoring?.status || "OFFLINE").toLowerCase()}`}>
+            {monitoringStatusLabel(monitoring?.status)}
+          </span>
+        </button>
+        <button
           className={activeTab === "youtube" ? "workspace-tab workspace-tab--active" : "workspace-tab"}
           type="button"
           role="tab"
@@ -1353,7 +1479,7 @@ export default function Home() {
           aria-controls="workspace-youtube"
           onClick={() => setActiveTab("youtube")}
         >
-          <span className="workspace-tab-number">04</span>
+          <span className="workspace-tab-number">05</span>
           <span className="workspace-tab-copy"><strong>YouTube</strong><small>Канал і аналітика</small></span>
           <span className={`workspace-tab-dot ${youtube?.connected ? "workspace-tab-dot--active" : ""}`} aria-label={youtube?.connected ? "Канал підключено" : "Канал не підключено"} />
         </button>
@@ -1749,11 +1875,163 @@ export default function Home() {
         </section>
         )}
 
+        {activeTab === "monitoring" && (
+        <section id="workspace-monitoring" className="panel monitoring-panel" role="tabpanel" aria-labelledby="monitoring-title">
+          <div className="panel-heading monitoring-heading">
+            <div>
+              <span className="step-number">04</span>
+              <h2 id="monitoring-title">Моніторинг ефіру</h2>
+            </div>
+            <div className="monitoring-range" aria-label="Період графіків">
+              {([1, 24, 168] as MonitoringRange[]).map((hours) => (
+                <button
+                  key={hours}
+                  className={monitoringRange === hours ? "monitoring-range--active" : ""}
+                  type="button"
+                  onClick={() => setMonitoringRange(hours)}
+                >
+                  {hours === 1 ? "1 год" : hours === 24 ? "24 год" : "7 днів"}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {!monitoring ? (
+            <div className="monitoring-empty">Завантажуємо показники ефіру…</div>
+          ) : (
+            <div className="monitoring-dashboard">
+              <div className={`monitoring-status-card monitoring-status-card--${monitoring.status.toLowerCase()}`}>
+                <span className="monitoring-status-icon" aria-hidden="true" />
+                <div>
+                  <span>Загальний стан</span>
+                  <strong>{monitoringStatusLabel(monitoring.status)}</strong>
+                  <p>{monitoring.reason}</p>
+                </div>
+                <time dateTime={monitoring.updatedAt}>Оновлено {formatEventTime(monitoring.updatedAt)}</time>
+              </div>
+
+              <div className="monitoring-metrics">
+                <div>
+                  <span>Фактичний бітрейт</span>
+                  <strong>{formatMetric(monitoring.current.bitrateKbps, " Кбіт/с")}</strong>
+                  <small>ціль {formatMetric(monitoring.current.targetBitrateKbps, " Кбіт/с")}</small>
+                </div>
+                <div>
+                  <span>Частота кадрів</span>
+                  <strong>{formatMetric(monitoring.current.fps, " FPS", 1)}</strong>
+                  <small>ціль 30 FPS</small>
+                </div>
+                <div>
+                  <span>Швидкість кодування</span>
+                  <strong>{formatMetric(monitoring.current.speed, "×", 2)}</strong>
+                  <small>норма від 0,98×</small>
+                </div>
+                <div>
+                  <span>Пропущені кадри</span>
+                  <strong>{monitoring.current.droppedFrames.toLocaleString("uk-UA")}</strong>
+                  <small>дубльовано {monitoring.current.duplicateFrames.toLocaleString("uk-UA")}</small>
+                </div>
+                <div>
+                  <span>RTMPS-відновлення</span>
+                  <strong>{monitoring.session.restarts}</strong>
+                  <small>за поточну сесію</small>
+                </div>
+                <div>
+                  <span>Uptime</span>
+                  <strong>{formatMediaTime(monitoring.session.uptimeMs)}</strong>
+                  <small>безперервна робота</small>
+                </div>
+                <div>
+                  <span>Глядачі зараз</span>
+                  <strong>{monitoring.current.viewers.toLocaleString("uk-UA")}</strong>
+                  <small>пік {monitoring.session.peakViewers.toLocaleString("uk-UA")}</small>
+                </div>
+                <div>
+                  <span>Сигнал YouTube</span>
+                  <strong>{youtubeHealthLabel(monitoring.current.youtubeHealth || "noData")}</strong>
+                  <small>{youtube?.connected ? "канал підключено" : "канал не підключено"}</small>
+                </div>
+              </div>
+
+              <div className="monitoring-chart-grid">
+                <div className="monitoring-chart-card">
+                  <div className="monitoring-chart-heading">
+                    <div><span>Вихідний бітрейт</span><strong>Кбіт/с</strong></div>
+                    <span>ціль {formatMetric(monitoring.current.targetBitrateKbps)}</span>
+                  </div>
+                  {monitoring.history.some((item) => item.bitrateKbps !== null) ? (
+                    <div className="monitoring-chart" aria-label="Історія вихідного бітрейту">
+                      {monitoring.history.map((item) => (
+                        <span
+                          key={`bitrate-${item.capturedAt}`}
+                          title={`${formatEventTime(item.capturedAt)} · ${formatMetric(item.bitrateKbps, " Кбіт/с")}`}
+                        >
+                          <i
+                            className={`monitoring-chart-bar monitoring-chart-bar--${item.healthStatus.toLowerCase()}`}
+                            style={{ height: `${Math.max(2, ((item.bitrateKbps ?? 0) / monitoringBitrateMax) * 100)}%` }}
+                          />
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="monitoring-chart-empty">Графік з’явиться після запуску ефіру.</div>
+                  )}
+                </div>
+
+                <div className="monitoring-chart-card">
+                  <div className="monitoring-chart-heading">
+                    <div><span>Швидкість кодування</span><strong>відносно реального часу</strong></div>
+                    <span>норма ≥ 0,98×</span>
+                  </div>
+                  {monitoring.history.some((item) => item.speed !== null) ? (
+                    <div className="monitoring-chart" aria-label="Історія швидкості кодування">
+                      {monitoring.history.map((item) => (
+                        <span
+                          key={`speed-${item.capturedAt}`}
+                          title={`${formatEventTime(item.capturedAt)} · ${formatMetric(item.speed, "×", 2)}`}
+                        >
+                          <i
+                            className={`monitoring-chart-bar monitoring-chart-bar--${item.healthStatus.toLowerCase()}`}
+                            style={{ height: `${Math.max(2, Math.min(100, ((item.speed ?? 0) / 1.05) * 100))}%` }}
+                          />
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="monitoring-chart-empty">Ще немає даних про швидкість FFmpeg.</div>
+                  )}
+                </div>
+              </div>
+
+              <div className="monitoring-events">
+                <div className="monitoring-events-heading">
+                  <div><span>Журнал подій</span><strong>Останні зміни стану</strong></div>
+                  <span>{monitoring.events.length}</span>
+                </div>
+                {monitoring.events.length ? (
+                  <div className="monitoring-event-list">
+                    {monitoring.events.slice(0, 24).map((event) => (
+                      <div className={`monitoring-event monitoring-event--${event.severity}`} key={event.id}>
+                        <span className="monitoring-event-dot" aria-hidden="true" />
+                        <p>{event.message}</p>
+                        <time dateTime={event.occurredAt}>{formatEventTime(event.occurredAt)}</time>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="monitoring-events-empty">Подій ще немає. Тут з’являться запуск, зупинка, відновлення та зміни відео.</div>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+        )}
+
         {activeTab === "youtube" && (
         <section id="workspace-youtube" className="panel youtube-panel" role="tabpanel" aria-labelledby="youtube-title">
           <div className="panel-heading">
             <div>
-              <span className="step-number">04</span>
+              <span className="step-number">05</span>
               <h2 id="youtube-title">YouTube</h2>
             </div>
             <span className={`youtube-connection ${youtube?.connected ? "youtube-connection--active" : ""}`}>

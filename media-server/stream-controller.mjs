@@ -29,6 +29,9 @@ export function buildUplinkFfmpegArgs({
     "-hide_banner",
     "-loglevel",
     "info",
+    "-nostats",
+    "-progress",
+    "pipe:1",
     "-fflags",
     "+genpts+discardcorrupt",
     "-thread_queue_size",
@@ -73,6 +76,63 @@ export function buildUplinkFfmpegArgs({
     "flv",
     target,
   ];
+}
+
+function finiteNumber(value) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function finiteInteger(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export class FfmpegProgressParser {
+  constructor({ now = () => Date.now() } = {}) {
+    this.now = now;
+    this.buffer = "";
+    this.values = {};
+  }
+
+  push(chunk) {
+    this.buffer += String(chunk);
+    const lines = this.buffer.split(/\r?\n/);
+    this.buffer = lines.pop() ?? "";
+    const snapshots = [];
+    for (const line of lines) {
+      const separator = line.indexOf("=");
+      if (separator <= 0) continue;
+      const key = line.slice(0, separator).trim();
+      const value = line.slice(separator + 1).trim();
+      this.values[key] = value;
+      if (key === "progress") {
+        snapshots.push(this.snapshot());
+        this.values = {};
+      }
+    }
+    return snapshots;
+  }
+
+  snapshot() {
+    const bitrateKbps = this.values.bitrate === "N/A"
+      ? null
+      : finiteNumber(String(this.values.bitrate ?? "").replace(/kbits\/s$/i, ""));
+    const outTimeMicroseconds = finiteInteger(
+      this.values.out_time_us ?? this.values.out_time_ms,
+    );
+    return {
+      capturedAt: new Date(this.now()).toISOString(),
+      frame: finiteInteger(this.values.frame),
+      fps: finiteNumber(this.values.fps),
+      bitrateKbps,
+      totalSizeBytes: finiteInteger(this.values.total_size),
+      outTimeMs: outTimeMicroseconds === null ? null : Math.round(outTimeMicroseconds / 1_000),
+      duplicateFrames: finiteInteger(this.values.dup_frames),
+      droppedFrames: finiteInteger(this.values.drop_frames),
+      speed: finiteNumber(String(this.values.speed ?? "").replace(/x$/i, "")),
+    };
+  }
 }
 
 export function buildPlayoutFfmpegArgs({ inputPath, outputUrl, timestampOffsetSeconds = 0 }) {
@@ -181,6 +241,7 @@ export class StreamController {
     this.history = [];
     this.ffmpegHealth = null;
     this.ffmpegHealthCheckedAt = 0;
+    this.outputMetrics = null;
     this.state = {
       status: "STOPPED",
       startedAt: null,
@@ -337,6 +398,7 @@ export class StreamController {
       playoutPid: this.playoutChild?.pid ?? null,
       history: this.history.map((item) => ({ ...item })),
       logs: [...this.logs],
+      outputMetrics: this.outputMetrics ? { ...this.outputMetrics } : null,
     };
   }
 
@@ -389,6 +451,7 @@ export class StreamController {
     this.secrets = [target, streamKey];
     this.logs = [];
     this.history = [];
+    this.outputMetrics = null;
     this.state = {
       status: "STARTING",
       startedAt,
@@ -443,6 +506,8 @@ export class StreamController {
 
     this.uplinkRunId += 1;
     const runId = this.uplinkRunId;
+    const progressParser = new FfmpegProgressParser({ now: this.now });
+    this.outputMetrics = null;
     this.state.status = initial ? "STARTING" : "RECONNECTING";
     this.state.nextRetryAt = null;
     const args = buildUplinkFfmpegArgs({
@@ -455,7 +520,7 @@ export class StreamController {
     try {
       child = this.spawnImpl(this.ffmpegPath, args, {
         windowsHide: true,
-        stdio: ["ignore", "ignore", "pipe"],
+        stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (error) {
       if (initial) throw error;
@@ -471,6 +536,16 @@ export class StreamController {
       if (runId !== this.uplinkRunId) return;
       const lines = this.pushLogs(chunk, "uplink");
       if (lines.some((line) => line.includes("frame="))) {
+        this.state.status = "LIVE";
+        this.state.lastError = null;
+        this.state.nextRetryAt = null;
+      }
+    });
+
+    child.stdout?.on("data", (chunk) => {
+      if (runId !== this.uplinkRunId) return;
+      for (const metrics of progressParser.push(chunk)) {
+        this.outputMetrics = metrics;
         this.state.status = "LIVE";
         this.state.lastError = null;
         this.state.nextRetryAt = null;
@@ -721,6 +796,7 @@ export class StreamController {
     this.uplinkChild = null;
     this.currentItem = null;
     this.currentStartedAtMs = null;
+    this.outputMetrics = null;
     this.state = {
       ...this.state,
       status: "STOPPED",

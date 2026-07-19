@@ -4,6 +4,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { ApiError } from "./api-error.mjs";
 import { createOwnerAuth } from "./auth.mjs";
 import { MediaProcessor } from "./media-processor.mjs";
+import { MonitoringService } from "./monitoring-service.mjs";
+import { MonitoringStore } from "./monitoring-store.mjs";
 import { QueueStore } from "./queue-store.mjs";
 import { SettingsStore } from "./settings-store.mjs";
 import { VideoStore } from "./store.mjs";
@@ -113,6 +115,7 @@ export async function createMvpServer({
   settings,
   presets,
   youtube,
+  monitoring,
 } = {}) {
   const videoStore = store ?? new VideoStore({ rootDir: dataDir });
   const liveQueue = queue ?? new QueueStore({ rootDir: dataDir });
@@ -189,6 +192,22 @@ export async function createMvpServer({
   await mediaProcessor.init?.();
   await youtubeIntegration.init?.();
   youtubeIntegration.start?.();
+  const monitoringService =
+    monitoring ??
+    new MonitoringService({
+      controller: streamController,
+      youtube: youtubeIntegration,
+      store: new MonitoringStore({ rootDir: dataDir }),
+    });
+  await monitoringService.init?.();
+  monitoringService.start?.();
+  const captureMonitoring = async () => {
+    try {
+      await monitoringService.capture?.();
+    } catch (error) {
+      console.error("StreamLab monitoring capture failed.", error);
+    }
+  };
 
   const queueSnapshot = () => {
     const snapshot = liveQueue.snapshot();
@@ -320,6 +339,13 @@ export async function createMvpServer({
 
       if (request.method === "GET" && url.pathname === "/api/youtube/status") {
         json(response, 200, { youtube: youtubeIntegration.snapshot() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/monitoring/status") {
+        json(response, 200, {
+          monitoring: monitoringService.snapshot({ hours: url.searchParams.get("hours") }),
+        });
         return;
       }
 
@@ -583,6 +609,7 @@ export async function createMvpServer({
             streamKey: body.streamKey.trim(),
             videoBitrateKbps: settingsStore.snapshot().videoBitrateKbps,
           });
+          await captureMonitoring();
           json(response, 202, { stream });
         } finally {
           streamStartInProgress = false;
@@ -592,12 +619,14 @@ export async function createMvpServer({
 
       if (request.method === "POST" && url.pathname === "/api/stream/stop") {
         const stream = await streamController.stop();
+        await captureMonitoring();
         json(response, 200, { stream });
         return;
       }
 
       if (request.method === "POST" && url.pathname === "/api/stream/skip") {
         const stream = await streamController.skip();
+        await captureMonitoring();
         json(response, 200, { stream });
         return;
       }
@@ -624,6 +653,7 @@ export async function createMvpServer({
     settings: settingsStore,
     presets: streamPresetStore,
     youtube: youtubeIntegration,
+    monitoring: monitoringService,
     listen(port = 8788, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -634,6 +664,7 @@ export async function createMvpServer({
       });
     },
     async close() {
+      await monitoringService.stop?.();
       youtubeIntegration.stop?.();
       await mediaProcessor.shutdown?.();
       if (streamController.shutdown) await streamController.shutdown();

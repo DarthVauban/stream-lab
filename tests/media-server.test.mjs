@@ -329,6 +329,15 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(controller.lastBitrate, 7_500);
   assert.doesNotMatch(JSON.stringify(started), /abcd-efgh/);
 
+  const monitoringResponse = await fetch(`${baseUrl}/api/monitoring/status?hours=1`, {
+    headers: { Cookie: session.cookie },
+  });
+  assert.equal(monitoringResponse.status, 200);
+  const monitoring = (await monitoringResponse.json()).monitoring;
+  assert.equal(monitoring.current.targetBitrateKbps, 7_500);
+  assert.equal(monitoring.session.totalStreamStarts, 1);
+  assert.doesNotMatch(JSON.stringify(monitoring), /abcd-efgh/);
+
   const changeActiveQueueResponse = await fetch(`${baseUrl}/api/queue/items`, {
     method: "POST",
     headers: {
@@ -417,6 +426,8 @@ test("builds separate dynamic playout and configurable CBR uplink commands", () 
   assert.ok(args.includes("7500k"));
   assert.ok(args.includes("60"));
   assert.ok(args.includes("flv"));
+  assert.ok(args.includes("-nostats"));
+  assert.equal(args[args.indexOf("-progress") + 1], "pipe:1");
   assert.equal(args.at(-1), "rtmps://example.test/live/key");
   assert.match(args[args.indexOf("-vf") + 1], /scale=1920:1080/);
   assert.equal(args[args.indexOf("-i") + 1], "udp://127.0.0.1:23000");

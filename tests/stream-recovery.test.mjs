@@ -6,7 +6,10 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
-import { StreamController } from "../media-server/stream-controller.mjs";
+import {
+  FfmpegProgressParser,
+  StreamController,
+} from "../media-server/stream-controller.mjs";
 import { EncryptedStreamStateStore } from "../media-server/stream-state-store.mjs";
 
 class FakeChild extends EventEmitter {
@@ -15,6 +18,7 @@ class FakeChild extends EventEmitter {
     this.pid = pid;
     this.role = role;
     this.args = args;
+    this.stdout = new PassThrough();
     this.stderr = new PassThrough();
   }
 
@@ -99,6 +103,23 @@ const secondVideo = {
   media: { durationSeconds: 20 },
 };
 
+test("parses machine-readable FFmpeg uplink progress", () => {
+  const parser = new FfmpegProgressParser({ now: () => Date.parse("2026-07-19T12:00:00.000Z") });
+  assert.deepEqual(parser.push("frame=180\nfps=29.97\nbitrate=8192.5kbits/s\nout_time_us=6000000\n"), []);
+  const [metrics] = parser.push("dup_frames=2\ndrop_frames=1\nspeed=0.998x\nprogress=continue\n");
+  assert.deepEqual(metrics, {
+    capturedAt: "2026-07-19T12:00:00.000Z",
+    frame: 180,
+    fps: 29.97,
+    bitrateKbps: 8192.5,
+    totalSizeBytes: null,
+    outTimeMs: 6000,
+    duplicateFrames: 2,
+    droppedFrames: 1,
+    speed: 0.998,
+  });
+});
+
 test("encrypts persisted stream configuration and removes it on clear", async (t) => {
   const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-state-test-"));
   const store = new EncryptedStreamStateStore({
@@ -146,11 +167,16 @@ test("keeps one uplink while the live queue advances and changes", async (t) => 
   assert.equal(harness.playouts.length, 1);
   assert.equal(harness.playouts[0].args[harness.playouts[0].args.indexOf("-i") + 1], firstVideo.filePath);
   assert.ok(harness.uplinks[0].args.includes("7500k"));
+  assert.equal(harness.uplinks[0].args[harness.uplinks[0].args.indexOf("-progress") + 1], "pipe:1");
   assert.equal(harness.persistedWrites[0].videoId, firstVideo.id);
 
   harness.uplinks[0].stderr.write(`frame=1 ${target}\n`);
+  harness.uplinks[0].stdout.write(
+    "frame=1\nfps=30.00\nbitrate=7692.0kbits/s\nout_time_us=1000000\ndup_frames=0\ndrop_frames=0\nspeed=1.00x\nprogress=continue\n",
+  );
   await delay(0);
   assert.equal(harness.controller.snapshot().status, "LIVE");
+  assert.equal(harness.controller.snapshot().outputMetrics.bitrateKbps, 7692);
   assert.doesNotMatch(JSON.stringify(harness.controller.snapshot()), /super-secret-key/);
 
   const thirdVideo = {
