@@ -273,12 +273,19 @@ export async function createMvpServer({
   await mediaProcessor.init?.();
   await youtubeIntegration.init?.();
   youtubeIntegration.start?.();
+  let telegramIntegration = telegram ?? null;
   const monitoringService =
     monitoring ??
     new MonitoringService({
       controller: streamController,
       youtube: youtubeIntegration,
       store: new MonitoringStore({ rootDir: dataDir, repository: stateRepository }),
+      onEvent: (event) => {
+        void realtimeHub.publish("MONITORING_EVENT", event)
+          .catch((error) => console.error("StreamLab monitoring event publish failed.", error));
+        void telegramIntegration?.notifyMonitoringEvent?.(event)
+          .catch((error) => console.error("StreamLab Telegram notification failed.", error));
+      },
     });
   await monitoringService.init?.();
   monitoringService.start?.();
@@ -288,7 +295,11 @@ export async function createMvpServer({
   });
   const systemMonitor = system ?? new SystemMonitor({
     storage: storageMonitor,
-    onSnapshot: (snapshot) => realtimeHub.publish("SYSTEM_METRICS", snapshot),
+    onSnapshot: async (snapshot) => {
+      await realtimeHub.publish("SYSTEM_METRICS", snapshot);
+      void telegramIntegration?.notifySystemSnapshot?.(snapshot)
+        .catch((error) => console.error("StreamLab Telegram system alert failed.", error));
+    },
   });
   await systemMonitor.init?.();
   systemMonitor.start?.();
@@ -320,34 +331,91 @@ export async function createMvpServer({
       })),
     }));
 
-  const telegramIntegration =
-    telegram ??
-    new TelegramService({
-      store: new EncryptedTelegramStore({ rootDir: dataDir }),
-      getDashboardSnapshot: async () => {
-        const [storageStatus, databaseHealth, realtimeHealth] = await Promise.all([
-          storageMonitor.snapshot().catch(() => storageMonitor.last),
-          databaseService.health?.().catch(() => ({
-            configured: databaseService.configured,
-            connected: false,
-          })),
-          realtimeHub.health?.().catch(() => realtimeHub.snapshot()),
-        ]);
-        return {
-          stream: streamController.snapshot(),
-          queue: queueSnapshot(),
-          youtube: youtubeIntegration.snapshot(),
-          monitoring: monitoringService.snapshot({ hours: 24 }),
-          system: systemMonitor.snapshot?.() ?? null,
-          storage: storageStatus,
-          database: databaseHealth,
-          realtime: realtimeHealth,
-        };
-      },
-    });
+  let streamStartInProgress = false;
+  const startStream = async ({ streamUrl, streamKey }) => {
+    if (streamStartInProgress) {
+      throw new ApiError(409, "STREAM_ALREADY_RUNNING", "Трансляція вже запускається.");
+    }
+    if (liveQueue.snapshot().items.length === 0 && !settingsStore.snapshot().fallbackVideoId) {
+      throw new ApiError(
+        409,
+        "QUEUE_EMPTY",
+        "Додайте готове відео до черги або виберіть резервне відео.",
+      );
+    }
+    const target = buildTarget(streamUrl, streamKey);
+    streamStartInProgress = true;
+    try {
+      const stream = await streamController.start({
+        target,
+        streamKey: streamKey.trim(),
+        videoBitrateKbps: settingsStore.snapshot().videoBitrateKbps,
+      });
+      await captureMonitoring();
+      return stream;
+    } finally {
+      streamStartInProgress = false;
+    }
+  };
+  const stopStream = async () => {
+    const stream = await streamController.stop();
+    await captureMonitoring();
+    return stream;
+  };
+  const skipStream = async () => {
+    const stream = await streamController.skip();
+    await captureMonitoring();
+    return stream;
+  };
+
+  const getTelegramDashboardSnapshot = async () => {
+    const [storageStatus, databaseHealth, realtimeHealth] = await Promise.all([
+      storageMonitor.snapshot().catch(() => storageMonitor.last),
+      databaseService.health?.().catch(() => ({
+        configured: databaseService.configured,
+        connected: false,
+      })),
+      realtimeHub.health?.().catch(() => realtimeHub.snapshot()),
+    ]);
+    return {
+      stream: streamController.snapshot(),
+      queue: queueSnapshot(),
+      presets: streamPresetStore.list(),
+      youtube: youtubeIntegration.snapshot(),
+      monitoring: monitoringService.snapshot({ hours: 24 }),
+      system: systemMonitor.snapshot?.() ?? null,
+      storage: storageStatus,
+      database: databaseHealth,
+      realtime: realtimeHealth,
+    };
+  };
+  const executeTelegramControl = async (action, payload = {}) => {
+    let stream;
+    if (action === "start") {
+      const preset = streamPresetStore.get(payload.presetId);
+      stream = await startStream(preset);
+    } else if (action === "stop") {
+      stream = await stopStream();
+    } else if (action === "skip") {
+      stream = await skipStream();
+    } else {
+      throw new ApiError(400, "INVALID_TELEGRAM_CONTROL", "Невідома Telegram-команда керування.");
+    }
+    await realtimeHub.publish("STATE_CHANGED", {
+      resource: "stream",
+      action: `TELEGRAM_${action.toUpperCase()}`,
+    }).catch((error) => console.error("StreamLab Telegram state publish failed.", error));
+    return { stream };
+  };
+  telegramIntegration ??= new TelegramService({
+    store: new EncryptedTelegramStore({ rootDir: dataDir }),
+  });
+  telegramIntegration.configureRuntime?.({
+    getDashboardSnapshot: getTelegramDashboardSnapshot,
+    executeControl: executeTelegramControl,
+  });
   await telegramIntegration.init?.();
 
-  let streamStartInProgress = false;
   const deletingVideoIds = new Set();
   const streamEventClients = new Set();
   const realtimeEventClients = new Set();
@@ -467,15 +535,32 @@ export async function createMvpServer({
         );
         await auditStore.append({
           actor: result.userId ? `telegram:${result.userId}` : "telegram",
-          action: result.command ? `TELEGRAM_${result.command.toUpperCase()}` : "TELEGRAM_UPDATE",
+          action: result.controlAction
+            ? `TELEGRAM_CONTROL_${result.controlAction.toUpperCase()}_${
+                result.controlSucceeded === null
+                  ? "REQUESTED"
+                  : result.controlSucceeded
+                    ? "EXECUTED"
+                    : "FAILED"
+              }`
+            : result.command
+              ? `TELEGRAM_${result.command.split(":", 1)[0].toUpperCase()}`
+              : "TELEGRAM_UPDATE",
           targetType: "telegram",
           targetId: result.chatId || null,
-          status: result.authorized === false ? "REJECTED" : "SUCCESS",
+          status: result.authorized === false || result.confirmationExpired
+            ? "REJECTED"
+            : result.controlSucceeded === false
+              ? "FAILED"
+              : "SUCCESS",
           details: {
             updateId: result.updateId,
             authorized: result.authorized ?? null,
             duplicate: Boolean(result.duplicate),
             rateLimited: Boolean(result.rateLimited),
+            controlAction: result.controlAction || null,
+            controlSucceeded: result.controlSucceeded,
+            confirmationExpired: Boolean(result.confirmationExpired),
           },
         }).catch((error) => console.error("StreamLab Telegram audit write failed.", error));
         json(response, 200, { ok: true });
@@ -1028,46 +1113,20 @@ export async function createMvpServer({
       }
 
       if (request.method === "POST" && url.pathname === "/api/stream/start") {
-        if (streamStartInProgress) {
-          throw new ApiError(409, "STREAM_ALREADY_RUNNING", "Трансляція вже запускається.");
-        }
         const body = await readJson(request);
-        if (
-          liveQueue.snapshot().items.length === 0 &&
-          !settingsStore.snapshot().fallbackVideoId
-        ) {
-          throw new ApiError(
-            409,
-            "QUEUE_EMPTY",
-            "Додайте готове відео до черги або виберіть резервне відео.",
-          );
-        }
-        const target = buildTarget(body.streamUrl, body.streamKey);
-        streamStartInProgress = true;
-        try {
-          const stream = await streamController.start({
-            target,
-            streamKey: body.streamKey.trim(),
-            videoBitrateKbps: settingsStore.snapshot().videoBitrateKbps,
-          });
-          await captureMonitoring();
-          json(response, 202, { stream });
-        } finally {
-          streamStartInProgress = false;
-        }
+        const stream = await startStream(body);
+        json(response, 202, { stream });
         return;
       }
 
       if (request.method === "POST" && url.pathname === "/api/stream/stop") {
-        const stream = await streamController.stop();
-        await captureMonitoring();
+        const stream = await stopStream();
         json(response, 200, { stream });
         return;
       }
 
       if (request.method === "POST" && url.pathname === "/api/stream/skip") {
-        const stream = await streamController.skip();
-        await captureMonitoring();
+        const stream = await skipStream();
         json(response, 200, { stream });
         return;
       }

@@ -19,6 +19,7 @@ class FakeController {
   constructor() {
     this.getQueue = () => [];
     this.lastBitrate = null;
+    this.skipCount = 0;
     this.state = {
       status: "STOPPED",
       videoId: null,
@@ -76,6 +77,7 @@ class FakeController {
   }
 
   async skip() {
+    this.skipCount += 1;
     const queue = this.getQueue();
     const currentIndex = queue.findIndex((item) => item.queueItemId === this.state.queueItemId);
     const video = queue[(currentIndex + 1) % queue.length];
@@ -108,21 +110,30 @@ function testPresetStore(dataDir) {
 }
 
 function testTelegram(dataDir) {
-  return new TelegramService({
+  const calls = [];
+  const service = new TelegramService({
     store: new EncryptedTelegramStore({
       rootDir: dataDir,
       secret: "streamlab-test-telegram-secret-32-characters",
     }),
-    fetchImpl: async () => ({
-      ok: true,
-      async json() {
-        return {
-          ok: true,
-          result: { id: 123456, is_bot: true, username: "streamlab_test_bot", first_name: "StreamLab" },
-        };
-      },
-    }),
+    fetchImpl: async (url, init) => {
+      const method = new URL(url).pathname.split("/").at(-1);
+      calls.push({ method, body: JSON.parse(init.body) });
+      return {
+        ok: true,
+        async json() {
+          return {
+            ok: true,
+            result: method === "getMe"
+              ? { id: 123456, is_bot: true, username: "streamlab_test_bot", first_name: "StreamLab" }
+              : true,
+          };
+        },
+      };
+    },
   });
+  service.calls = calls;
+  return service;
 }
 
 async function login(baseUrl) {
@@ -428,6 +439,66 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(controller.lastBitrate, 7_500);
   assert.doesNotMatch(JSON.stringify(started), /abcd-efgh/);
 
+  const telegramSkipRequest = await fetch(`${baseUrl}/api/telegram/webhook`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": telegramSecret,
+    },
+    body: JSON.stringify({
+      update_id: 10,
+      message: { message_id: 10, from: { id: 111 }, chat: { id: 111 }, text: "/next" },
+    }),
+  });
+  assert.equal(telegramSkipRequest.status, 200);
+  const telegramConfirmation = app.telegram.calls
+    .filter((call) => call.method === "sendMessage" && /наступного відео/.test(call.body.text))
+    .at(-1).body.reply_markup.inline_keyboard[0][0].callback_data;
+  assert.match(telegramConfirmation, /^ctl_confirm:/);
+  const telegramSkipConfirm = await fetch(`${baseUrl}/api/telegram/webhook`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": telegramSecret,
+    },
+    body: JSON.stringify({
+      update_id: 11,
+      callback_query: {
+        id: "confirm-next",
+        from: { id: 111 },
+        data: telegramConfirmation,
+        message: { message_id: 11, chat: { id: 111 } },
+      },
+    }),
+  });
+  assert.equal(telegramSkipConfirm.status, 200);
+  assert.equal(controller.skipCount, 1);
+  await fetch(`${baseUrl}/api/telegram/webhook`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": telegramSecret,
+    },
+    body: JSON.stringify({
+      update_id: 12,
+      callback_query: {
+        id: "replay-next",
+        from: { id: 111 },
+        data: telegramConfirmation,
+        message: { message_id: 11, chat: { id: 111 } },
+      },
+    }),
+  });
+  assert.equal(controller.skipCount, 1);
+  const telegramAuditResponse = await fetch(`${baseUrl}/api/audit?limit=50`, {
+    headers: { Cookie: session.cookie },
+  });
+  assert.equal(telegramAuditResponse.status, 200);
+  const telegramAudit = (await telegramAuditResponse.json()).entries;
+  assert.ok(telegramAudit.some((entry) => entry.action === "TELEGRAM_CONTROL_SKIP_REQUESTED"));
+  assert.ok(telegramAudit.some((entry) => entry.action === "TELEGRAM_CONTROL_SKIP_EXECUTED"));
+  assert.ok(telegramAudit.some((entry) => entry.action === "TELEGRAM_CTL_CONFIRM" && entry.status === "REJECTED"));
+
   const monitoringResponse = await fetch(`${baseUrl}/api/monitoring/status?hours=1`, {
     headers: { Cookie: session.cookie },
   });
@@ -450,7 +521,7 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal((await changeActiveQueueResponse.json()).queue.items.length, 3);
 
   const removeCurrentResponse = await fetch(
-    `${baseUrl}/api/queue/items/${savedQueue.items[0].id}`,
+    `${baseUrl}/api/queue/items/${controller.state.queueItemId}`,
     {
       method: "DELETE",
       headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },

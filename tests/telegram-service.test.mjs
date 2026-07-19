@@ -39,21 +39,36 @@ function telegramFetch(calls) {
   };
 }
 
-test("registers an encrypted Telegram webhook and serves the read-only menu", async (t) => {
+test("registers an encrypted Telegram webhook and protects control confirmations", async (t) => {
   const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-telegram-test-"));
   t.after(() => rm(rootDir, { recursive: true, force: true }));
   const calls = [];
+  const controls = [];
+  let now = Date.parse("2026-07-19T12:00:00.000Z");
+  const dashboard = {
+    stream: {
+      status: "LIVE",
+      videoName: "Test video",
+      nextVideoName: "Next video",
+      startedAt: "2026-07-19T11:00:00.000Z",
+    },
+    queue: { items: [] },
+    presets: [{ id: "preset-1", name: "YouTube Main" }],
+    youtube: { metrics: { viewers: 12, views: 100, likes: 8 }, history: [] },
+    monitoring: { current: { bitrateKbps: 8_000, fps: 30 }, session: { peakViewers: 14 } },
+  };
   const store = new EncryptedTelegramStore({ rootDir, secret: SECRET });
   const service = new TelegramService({
     store,
-    now: () => Date.parse("2026-07-19T12:00:00.000Z"),
+    now: () => now,
     fetchImpl: telegramFetch(calls),
-    getDashboardSnapshot: async () => ({
-      stream: { status: "LIVE", videoName: "Test video", startedAt: "2026-07-19T11:00:00.000Z" },
-      queue: { items: [] },
-      youtube: { metrics: { viewers: 12, views: 100, likes: 8 }, history: [] },
-      monitoring: { current: { bitrateKbps: 8_000, fps: 30 }, session: { peakViewers: 14 } },
-    }),
+    getDashboardSnapshot: async () => structuredClone(dashboard),
+    executeControl: async (action, payload) => {
+      controls.push({ action, payload });
+      if (action === "stop") dashboard.stream = { status: "STOPPED", videoName: null };
+      if (action === "start") dashboard.stream = { status: "STARTING", videoName: "Test video" };
+      return { stream: { ...dashboard.stream } };
+    },
   });
   await service.init();
   const connected = await service.connect({ token: TOKEN, ...SETTINGS });
@@ -63,7 +78,9 @@ test("registers an encrypted Telegram webhook and serves the read-only menu", as
   assert.equal(connected.token, undefined);
   assert.equal(connected.webhook.url, SETTINGS.webhookUrl);
   assert.deepEqual(connected.webhook.allowedUserIds, ["111"]);
+  assert.equal(connected.webhook.notifications.videoChanges, false);
   assert.equal(connected.webhook.lastUpdateId, null);
+  assert.ok(calls.some((call) => call.method === "setMyCommands"));
 
   const registration = calls.find((call) => call.method === "setWebhook");
   assert.equal(registration.body.url, SETTINGS.webhookUrl);
@@ -86,7 +103,7 @@ test("registers an encrypted Telegram webhook and serves the read-only menu", as
   assert.equal(handled.command, "menu");
   const reply = calls.find((call) => call.method === "sendMessage");
   assert.equal(reply.body.chat_id, "111");
-  assert.match(reply.body.text, /режимі перегляду/);
+  assert.match(reply.body.text, /одноразовим підтвердженням/);
   assert.equal(reply.body.reply_markup.inline_keyboard.length, 4);
 
   const callCount = calls.length;
@@ -115,13 +132,146 @@ test("registers an encrypted Telegram webhook and serves the read-only menu", as
   assert.match(calls.filter((call) => call.method === "sendMessage").at(-1).body.text, /12/);
   assert.equal(service.snapshot().webhook.lastUpdateId, 3);
 
+  const stopRequest = await service.handleWebhook(connection.webhook.secret, {
+    update_id: 4,
+    callback_query: {
+      id: "callback-stop",
+      from: { id: 111 },
+      data: "ctl_stop",
+      message: { message_id: 2, chat: { id: 111 } },
+    },
+  });
+  assert.equal(stopRequest.controlAction, "stop");
+  assert.equal(controls.length, 0);
+  const confirmationMessage = calls.filter((call) => call.method === "sendMessage").at(-1);
+  const confirmationData = confirmationMessage.body.reply_markup.inline_keyboard[0][0].callback_data;
+  assert.match(confirmationData, /^ctl_confirm:/);
+
+  const confirmed = await service.handleWebhook(connection.webhook.secret, {
+    update_id: 5,
+    callback_query: {
+      id: "callback-confirm-stop",
+      from: { id: 111 },
+      data: confirmationData,
+      message: { message_id: 3, chat: { id: 111 } },
+    },
+  });
+  assert.equal(confirmed.controlAction, "stop");
+  assert.equal(confirmed.controlSucceeded, true);
+  assert.deepEqual(controls, [{ action: "stop", payload: {} }]);
+
+  const replayed = await service.handleWebhook(connection.webhook.secret, {
+    update_id: 6,
+    callback_query: {
+      id: "callback-replay-stop",
+      from: { id: 111 },
+      data: confirmationData,
+      message: { message_id: 3, chat: { id: 111 } },
+    },
+  });
+  assert.equal(replayed.confirmationExpired, true);
+  assert.equal(controls.length, 1);
+
+  await service.handleWebhook(connection.webhook.secret, {
+    update_id: 7,
+    callback_query: {
+      id: "callback-start-menu",
+      from: { id: 111 },
+      data: "ctl_start",
+      message: { message_id: 4, chat: { id: 111 } },
+    },
+  });
+  const presetMessage = calls.filter((call) => call.method === "sendMessage").at(-1);
+  assert.equal(presetMessage.body.reply_markup.inline_keyboard[0][0].callback_data, "ctl_preset:preset-1");
+  await service.handleWebhook(connection.webhook.secret, {
+    update_id: 8,
+    callback_query: {
+      id: "callback-preset",
+      from: { id: 111 },
+      data: "ctl_preset:preset-1",
+      message: { message_id: 5, chat: { id: 111 } },
+    },
+  });
+  const startConfirmation = calls.filter((call) => call.method === "sendMessage").at(-1)
+    .body.reply_markup.inline_keyboard[0][0].callback_data;
+  await service.handleWebhook(connection.webhook.secret, {
+    update_id: 9,
+    callback_query: {
+      id: "callback-confirm-start",
+      from: { id: 111 },
+      data: startConfirmation,
+      message: { message_id: 6, chat: { id: 111 } },
+    },
+  });
+  assert.deepEqual(controls.at(-1), {
+    action: "start",
+    payload: { presetId: "preset-1", presetName: "YouTube Main" },
+  });
+
+  await service.handleWebhook(connection.webhook.secret, {
+    update_id: 10,
+    callback_query: {
+      id: "callback-expiring-stop",
+      from: { id: 111 },
+      data: "ctl_stop",
+      message: { message_id: 7, chat: { id: 111 } },
+    },
+  });
+  const expiringConfirmation = calls.filter((call) => call.method === "sendMessage").at(-1)
+    .body.reply_markup.inline_keyboard[0][0].callback_data;
+  now += 60_001;
+  const expired = await service.handleWebhook(connection.webhook.secret, {
+    update_id: 11,
+    callback_query: {
+      id: "callback-expired-stop",
+      from: { id: 111 },
+      data: expiringConfirmation,
+      message: { message_id: 8, chat: { id: 111 } },
+    },
+  });
+  assert.equal(expired.confirmationExpired, true);
+  assert.equal(controls.length, 2);
+
+  const notificationsBefore = calls.filter((call) => call.method === "sendMessage").length;
+  await service.notifyMonitoringEvent({
+    id: "event-start",
+    type: "STREAM_STARTED",
+    message: "Трансляцію запущено.",
+  });
+  assert.equal(calls.filter((call) => call.method === "sendMessage").length, notificationsBefore + 1);
+  await service.notifyMonitoringEvent({
+    id: "event-video",
+    type: "VIDEO_CHANGED",
+    message: "Наступне відео.",
+  });
+  assert.equal(calls.filter((call) => call.method === "sendMessage").length, notificationsBefore + 1);
+  for (let index = 0; index < 3; index += 1) {
+    await service.notifySystemSnapshot({
+      cpu: { usagePercent: 95 },
+      memory: { usagePercent: 40 },
+      disk: { level: "OK", percentUsed: 50 },
+    });
+  }
+  assert.match(calls.filter((call) => call.method === "sendMessage").at(-1).body.text, /CPU/);
+  for (let index = 0; index < 3; index += 1) {
+    await service.notifySystemSnapshot({
+      cpu: { usagePercent: 20 },
+      memory: { usagePercent: 40 },
+      disk: { level: "OK", percentUsed: 50 },
+    });
+  }
+  assert.match(calls.filter((call) => call.method === "sendMessage").at(-1).body.text, /нормалізувалося/);
+
   const configured = await service.configure({
     webhookUrl: "https://stream.example.test/api/telegram/updated",
     allowedUserIds: "111, 222",
     allowedChatIds: "111, -100123",
+    notifications: { videoChanges: true },
   });
   assert.deepEqual(configured.webhook.allowedUserIds, ["111", "222"]);
   assert.deepEqual(configured.webhook.allowedChatIds, ["111", "-100123"]);
+  assert.equal(configured.webhook.notifications.videoChanges, true);
+  assert.equal(configured.webhook.notifications.streamEvents, true);
 
   const restoredStore = new EncryptedTelegramStore({ rootDir, secret: SECRET });
   await restoredStore.init();

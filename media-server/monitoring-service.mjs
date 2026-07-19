@@ -130,6 +130,7 @@ export class MonitoringService {
     sampleIntervalMs = 60_000,
     setIntervalImpl = setInterval,
     clearIntervalImpl = clearInterval,
+    onEvent = async () => {},
   } = {}) {
     if (!controller || !store) throw new Error("Для моніторингу потрібні controller і store.");
     this.controller = controller;
@@ -140,6 +141,7 @@ export class MonitoringService {
     this.sampleIntervalMs = sampleIntervalMs;
     this.setIntervalImpl = setIntervalImpl;
     this.clearIntervalImpl = clearIntervalImpl;
+    this.onEvent = onEvent;
     this.interval = null;
     this.previous = null;
     this.lastSampleAt = 0;
@@ -197,8 +199,10 @@ export class MonitoringService {
     };
   }
 
-  event(type, severity, message, occurredAt) {
-    return this.store.appendEvent({ type, severity, message, occurredAt });
+  async event(type, severity, message, occurredAt) {
+    const event = await this.store.appendEvent({ type, severity, message, occurredAt });
+    if (event) await this.onEvent(event);
+    return event;
   }
 
   capture({ forceSample = false } = {}) {

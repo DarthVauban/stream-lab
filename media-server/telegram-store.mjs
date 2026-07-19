@@ -22,6 +22,15 @@ function normalizeIdList(value, { allowNegative = false } = {}) {
   return [...new Set(values.map((item) => String(item).trim()).filter((item) => pattern.test(item)))].slice(0, 100);
 }
 
+function normalizeNotifications(value) {
+  return {
+    streamEvents: value?.streamEvents !== false,
+    healthWarnings: value?.healthWarnings !== false,
+    videoChanges: value?.videoChanges === true,
+    serverWarnings: value?.serverWarnings !== false,
+  };
+}
+
 function normalizeWebhook(value) {
   if (!value) return null;
   const url = typeof value.url === "string" ? value.url.trim() : "";
@@ -38,12 +47,14 @@ function normalizeWebhook(value) {
     secret,
     allowedUserIds: normalizeIdList(value.allowedUserIds),
     allowedChatIds: normalizeIdList(value.allowedChatIds, { allowNegative: true }),
+    notifications: normalizeNotifications(value.notifications),
     registeredAt: typeof value.registeredAt === "string" ? value.registeredAt : null,
     lastUpdateAt: typeof value.lastUpdateAt === "string" ? value.lastUpdateAt : null,
     lastUpdateId: Number.isSafeInteger(value.lastUpdateId) && value.lastUpdateId >= 0
       ? value.lastUpdateId
       : null,
     lastCommandAt: typeof value.lastCommandAt === "string" ? value.lastCommandAt : null,
+    lastNotificationAt: typeof value.lastNotificationAt === "string" ? value.lastNotificationAt : null,
     lastError: typeof value.lastError === "string" ? value.lastError.slice(0, 300) : null,
   };
 }
@@ -124,6 +135,7 @@ export class EncryptedTelegramStore {
                 ...connection.webhook,
                 allowedUserIds: [...connection.webhook.allowedUserIds],
                 allowedChatIds: [...connection.webhook.allowedChatIds],
+                notifications: { ...connection.webhook.notifications },
               }
             : null,
         }
@@ -149,10 +161,12 @@ export class EncryptedTelegramStore {
             url: connection.webhook.url,
             allowedUserIds: [...connection.webhook.allowedUserIds],
             allowedChatIds: [...connection.webhook.allowedChatIds],
+            notifications: { ...connection.webhook.notifications },
             registeredAt: connection.webhook.registeredAt,
             lastUpdateAt: connection.webhook.lastUpdateAt,
             lastUpdateId: connection.webhook.lastUpdateId,
             lastCommandAt: connection.webhook.lastCommandAt,
+            lastNotificationAt: connection.webhook.lastNotificationAt,
             lastError: connection.webhook.lastError,
           }
         : null,
@@ -216,6 +230,16 @@ export class EncryptedTelegramStore {
       const webhook = this.state.connection?.webhook;
       if (!webhook) return this.snapshot();
       webhook.lastError = String(message || "Невідома помилка Telegram webhook.").slice(0, 300);
+      return this.snapshot();
+    });
+  }
+
+  recordNotification({ sentAt, error = null }) {
+    return this.mutate(() => {
+      const webhook = this.state.connection?.webhook;
+      if (!webhook) return this.snapshot();
+      if (sentAt) webhook.lastNotificationAt = sentAt;
+      webhook.lastError = error ? String(error).slice(0, 300) : null;
       return this.snapshot();
     });
   }

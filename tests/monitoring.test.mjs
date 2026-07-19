@@ -63,12 +63,14 @@ test("persists monitoring history and stream transition events", async (t) => {
     }),
   };
   const store = new MonitoringStore({ rootDir, now: () => now });
+  const deliveredEvents = [];
   const monitoring = new MonitoringService({
     controller,
     youtube,
     store,
     now: () => now,
     sampleIntervalMs: 1,
+    onEvent: async (event) => deliveredEvents.push(event),
   });
   await monitoring.init();
 
@@ -117,6 +119,9 @@ test("persists monitoring history and stream transition events", async (t) => {
   assert.ok(snapshot.events.some((event) => event.type === "STREAM_STARTED"));
   assert.ok(snapshot.events.some((event) => event.type === "UPLINK_RECONNECTING"));
   assert.ok(snapshot.events.some((event) => event.type === "UPLINK_RECOVERED"));
+  assert.ok(deliveredEvents.some((event) => event.type === "STREAM_STARTED"));
+  assert.ok(deliveredEvents.some((event) => event.type === "UPLINK_RECONNECTING"));
+  assert.ok(deliveredEvents.some((event) => event.type === "UPLINK_RECOVERED"));
 
   const raw = JSON.parse(await readFile(path.join(rootDir, "monitoring.json"), "utf8"));
   assert.equal(raw.counters.streamStarts, 1);

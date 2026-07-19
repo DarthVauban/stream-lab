@@ -434,10 +434,17 @@ type TelegramStatus = {
     url: string;
     allowedUserIds: string[];
     allowedChatIds: string[];
+    notifications: {
+      streamEvents: boolean;
+      healthWarnings: boolean;
+      videoChanges: boolean;
+      serverWarnings: boolean;
+    };
     registeredAt: string | null;
     lastUpdateAt: string | null;
     lastUpdateId: number | null;
     lastCommandAt: string | null;
+    lastNotificationAt: string | null;
     lastError: string | null;
   } | null;
 };
@@ -692,6 +699,12 @@ export default function Home() {
   const [telegramWebhookUrl, setTelegramWebhookUrl] = useState("");
   const [telegramAllowedUserIds, setTelegramAllowedUserIds] = useState("");
   const [telegramAllowedChatIds, setTelegramAllowedChatIds] = useState("");
+  const [telegramNotifications, setTelegramNotifications] = useState({
+    streamEvents: true,
+    healthWarnings: true,
+    videoChanges: false,
+    serverWarnings: true,
+  });
   const [telegramAction, setTelegramAction] = useState("");
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -911,6 +924,7 @@ export default function Home() {
         setTelegramWebhookUrl(telegram.webhook?.url || `${window.location.origin}/api/telegram/webhook`);
         setTelegramAllowedUserIds(telegram.webhook?.allowedUserIds.join(", ") || "");
         setTelegramAllowedChatIds(telegram.webhook?.allowedChatIds.join(", ") || "");
+        if (telegram.webhook?.notifications) setTelegramNotifications(telegram.webhook.notifications);
         setCompressionProfiles(profiles);
       })
       .catch((error) => {
@@ -1170,6 +1184,12 @@ export default function Home() {
       setTelegramWebhookUrl("");
       setTelegramAllowedUserIds("");
       setTelegramAllowedChatIds("");
+      setTelegramNotifications({
+        streamEvents: true,
+        healthWarnings: true,
+        videoChanges: false,
+        serverWarnings: true,
+      });
       setTelegramAction("");
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
@@ -1866,6 +1886,7 @@ export default function Home() {
             webhookUrl: telegramWebhookUrl.trim(),
             allowedUserIds: telegramAllowedUserIds,
             allowedChatIds: telegramAllowedChatIds,
+            notifications: telegramNotifications,
           }),
         },
         csrfToken,
@@ -1874,6 +1895,9 @@ export default function Home() {
       setTelegramWebhookUrl(result.telegram.webhook?.url || telegramWebhookUrl.trim());
       setTelegramAllowedUserIds(result.telegram.webhook?.allowedUserIds.join(", ") || "");
       setTelegramAllowedChatIds(result.telegram.webhook?.allowedChatIds.join(", ") || "");
+      if (result.telegram.webhook?.notifications) {
+        setTelegramNotifications(result.telegram.webhook.notifications);
+      }
       setTelegramToken("");
       setTelegramTokenVisible(false);
       setNotice({
@@ -3700,13 +3724,40 @@ export default function Home() {
                     <small>StreamLab перевіряє токен через Telegram API й надалі показує лише масковане значення.</small>
                   </label>
                 </div>
+                <fieldset className="telegram-notifications">
+                  <legend>Сповіщення бота</legend>
+                  <div className="telegram-notification-grid">
+                    {[
+                      ["streamEvents", "Запуск і зупинка ефіру"],
+                      ["healthWarnings", "RTMPS та якість сигналу"],
+                      ["videoChanges", "Перехід між відео"],
+                      ["serverWarnings", "CPU, RAM і сховище"],
+                    ].map(([key, label]) => (
+                      <label key={key} className="telegram-notification-option">
+                        <input
+                          type="checkbox"
+                          checked={telegramNotifications[key as keyof typeof telegramNotifications]}
+                          onChange={(event) => setTelegramNotifications((current) => ({
+                            ...current,
+                            [key]: event.target.checked,
+                          }))}
+                          disabled={Boolean(telegramAction)}
+                        />
+                        <span>{label}</span>
+                      </label>
+                    ))}
+                  </div>
+                  <small>Попередження надсилаються лише при зміні стану. Перехід між кожним відео вимкнений за замовчуванням.</small>
+                </fieldset>
                 {telegram?.webhook?.configured && (
                   <div className={`telegram-webhook-state ${telegram.webhook.lastError ? "telegram-webhook-state--error" : ""}`}>
-                    <strong>{telegram.webhook.lastError ? "Webhook потребує уваги" : "Webhook активний · режим лише для читання"}</strong>
+                    <strong>{telegram.webhook.lastError ? "Webhook потребує уваги" : "Webhook активний · захищене керування увімкнено"}</strong>
                     <span>
                       {telegram.webhook.lastError || (telegram.webhook.lastUpdateAt
                         ? `Остання команда: ${new Date(telegram.webhook.lastUpdateAt).toLocaleString("uk-UA")}`
-                        : "Надішліть боту /start, щоб відкрити меню.")}
+                        : telegram.webhook.lastNotificationAt
+                          ? `Останнє сповіщення: ${new Date(telegram.webhook.lastNotificationAt).toLocaleString("uk-UA")}`
+                          : "Надішліть боту /start, щоб відкрити меню керування.")}
                     </span>
                   </div>
                 )}

@@ -605,6 +605,12 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .telegram-webhook-state span { color: var(--muted); font-size: 9px; line-height: 1.45; }
 .telegram-webhook-state--error { border-color: rgba(255,108,108,.22); background: rgba(255,108,108,.045); }
 .telegram-webhook-state--error strong { color: var(--red); }
+.telegram-notifications { min-width: 0; margin: 16px 0 0; padding: 13px; border: 1px solid var(--border); border-radius: 12px; }
+.telegram-notifications legend { padding: 0 6px; color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.telegram-notifications > small { display: block; margin-top: 10px; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.telegram-notification-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.telegram-notification-option { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 9px 10px; border-radius: 9px; background: rgba(255,255,255,.025); color: #cbd3dc; font-size: 10px; cursor: pointer; }
+.telegram-notification-option input { width: 15px; height: 15px; margin: 0; accent-color: var(--green); }
 
 .queue-panel { grid-column: 1 / -1; }
 .queue-summary { display: grid; grid-template-columns: 1fr 1fr minmax(130px, .45fr); gap: 10px; margin-bottom: 16px; }
@@ -709,6 +715,7 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
 @media (max-width: 600px) {
   .telegram-settings-grid { grid-template-columns: 1fr; }
   .telegram-webhook-field { grid-column: auto; }
+  .telegram-notification-grid { grid-template-columns: 1fr; }
   .dashboard-shell { --sidebar-width: 66px; }
   .app-sidebar { padding: 12px 7px; }
   .sidebar-nav { gap: 4px; }
