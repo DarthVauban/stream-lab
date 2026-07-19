@@ -226,7 +226,11 @@ export class YouTubeService {
     });
     this.runtime = emptyRuntime();
     this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0 };
-    await this.refreshAll();
+    try {
+      await this.refreshAll();
+    } catch {
+      // OAuth itself succeeded. Keep the connection and show the API refresh error in the dashboard.
+    }
     return this.snapshot();
   }
 
@@ -309,6 +313,23 @@ export class YouTubeService {
       if (reason === "liveStreamingNotEnabled") {
         throw new ApiError(403, "YOUTUBE_LIVE_DISABLED", "Для цього каналу не ввімкнені прямі трансляції.");
       }
+      if (["insufficientLivePermissions", "insufficientPermissions"].includes(reason)) {
+        throw new ApiError(
+          403,
+          "YOUTUBE_LIVE_PERMISSION_MISSING",
+          "YouTube не дозволив читати прямі трансляції цього каналу. Перевірте доступ до live streaming.",
+        );
+      }
+      if (["accessNotConfigured", "serviceDisabled"].includes(reason)) {
+        throw new ApiError(
+          503,
+          "YOUTUBE_API_DISABLED",
+          "У Google Cloud потрібно ввімкнути YouTube Data API v3 для цього OAuth-проєкту.",
+        );
+      }
+      if (reason === "invalidFilters") {
+        throw new ApiError(502, "YOUTUBE_INVALID_FILTERS", "Некоректний запит списку трансляцій YouTube.");
+      }
       throw new ApiError(502, "YOUTUBE_API_FAILED", "YouTube API не зміг оновити дані каналу.");
     }
     return body;
@@ -339,19 +360,15 @@ export class YouTubeService {
   }
 
   async refreshBroadcasts() {
-    const list = (broadcastStatus) =>
-      this.googleApi("liveBroadcasts", {
-        part: "id,snippet,status,contentDetails",
-        broadcastStatus,
-        mine: "true",
-        maxResults: "50",
-      });
-    const [active, upcoming] = await Promise.all([list("active"), list("upcoming")]);
-    const uniqueItems = new Map(
-      [...(active.items || []), ...(upcoming.items || [])].map((item) => [item.id, item]),
-    );
-    const broadcasts = [...uniqueItems.values()]
+    const body = await this.googleApi("liveBroadcasts", {
+      part: "id,snippet,status,contentDetails",
+      mine: "true",
+      broadcastType: "all",
+      maxResults: "50",
+    });
+    const broadcasts = (body.items || [])
       .map(publicBroadcast)
+      .filter((item) => !["complete", "revoked"].includes(item.lifeCycleStatus))
       .sort((left, right) => {
         const rank = (item) => (["live", "liveStarting", "testing", "testStarting"].includes(item.lifeCycleStatus) ? 0 : 1);
         return rank(left) - rank(right) || String(left.scheduledStartAt).localeCompare(String(right.scheduledStartAt));
@@ -479,10 +496,15 @@ export class YouTubeService {
     if (!this.configured || !this.store.read().tokens) return Promise.resolve(this.snapshot());
     const current = this.now();
     const tasks = [];
-    if (current - this.lastPoll.channel >= POLL_INTERVALS.channel) tasks.push(() => this.refreshChannel());
-    if (current - this.lastPoll.broadcasts >= POLL_INTERVALS.broadcasts) tasks.push(() => this.refreshBroadcasts());
-    if (current - this.lastPoll.stream >= POLL_INTERVALS.stream) tasks.push(() => this.refreshStream());
-    if (current - this.lastPoll.metrics >= POLL_INTERVALS.metrics) tasks.push(() => this.refreshMetrics());
+    const schedule = (key, task) => {
+      if (current - this.lastPoll[key] < POLL_INTERVALS[key]) return;
+      this.lastPoll[key] = current;
+      tasks.push(task);
+    };
+    schedule("channel", () => this.refreshChannel());
+    schedule("broadcasts", () => this.refreshBroadcasts());
+    schedule("stream", () => this.refreshStream());
+    schedule("metrics", () => this.refreshMetrics());
     return tasks.length ? this.runRefresh(tasks) : Promise.resolve(this.snapshot());
   }
 

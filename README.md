@@ -76,6 +76,10 @@ GOOGLE_OAUTH_REDIRECT_URI='https://stream.mt-panel.sbs/api/youtube/oauth/callbac
 `YOUTUBE_TOKEN_SECRET` необов’язковий; якщо він порожній, використовується
 `STREAM_CONFIG_SECRET`.
 
+Окремий YouTube API key не потрібний: запити до власного каналу, трансляцій і
+stream key авторизуються OAuth access token користувача. API key не замінює цей
+доступ і не додається до `.env`.
+
 Для постійної роботи переведіть зовнішній OAuth-застосунок зі статусу **Testing**
 у **Production**. У режимі Testing Google зазвичай обмежує refresh token сімома
 днями, після чого канал потрібно підключати повторно.

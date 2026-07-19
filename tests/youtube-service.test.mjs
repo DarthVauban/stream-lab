@@ -34,6 +34,9 @@ function googleFixtureFetch(calls) {
       });
     }
     if (url.pathname.endsWith("/liveBroadcasts")) {
+      assert.equal(url.searchParams.get("mine"), "true");
+      assert.equal(url.searchParams.get("broadcastStatus"), null);
+      assert.equal(url.searchParams.get("broadcastType"), "all");
       return Response.json({
         items: [
           {
@@ -123,7 +126,7 @@ test("connects YouTube, hides credentials and records live snapshots", async (t)
   assert.equal(snapshot.stream.healthStatus, "good");
   assert.equal(snapshot.metrics.viewers, 42);
   assert.equal(snapshot.history.length, 1);
-  assert.equal(snapshot.quota.used, 5);
+  assert.equal(snapshot.quota.used, 4);
   assert.doesNotMatch(JSON.stringify(snapshot), /youtube-access-token|youtube-refresh-token|secret-stream-key/);
   assert.deepEqual(service.getSelectedIngestion(), {
     streamUrl: "rtmps://a.rtmps.youtube.com/live2",
@@ -168,4 +171,51 @@ test("rejects an expired or mismatched OAuth state", async (t) => {
     service.completeOAuth({ code: "code", state: "wrong-state" }),
     (error) => error.code === "YOUTUBE_OAUTH_STATE_INVALID",
   );
+});
+
+test("keeps a successful OAuth connection when the first data refresh fails", async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-youtube-partial-test-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const service = new YouTubeService({
+    clientId: "client-id",
+    clientSecret: "client-secret",
+    redirectUri: "https://stream.example.test/api/youtube/oauth/callback",
+    store: new EncryptedYouTubeStore({
+      rootDir,
+      secret: "streamlab-youtube-partial-secret-32-characters",
+    }),
+    statsStore: new YouTubeStatsStore({ rootDir }),
+    fetchImpl: async (input) => {
+      const url = new URL(input.toString());
+      if (url.pathname === "/token") {
+        return Response.json({
+          access_token: "access-token",
+          refresh_token: "refresh-token",
+          expires_in: 3_600,
+        });
+      }
+      if (url.pathname.endsWith("/channels")) {
+        return Response.json({
+          items: [{ id: "channel-1", snippet: { title: "Connected channel" }, statistics: {} }],
+        });
+      }
+      if (url.pathname.endsWith("/liveBroadcasts")) {
+        return Response.json(
+          { error: { errors: [{ reason: "invalidFilters" }] } },
+          { status: 400 },
+        );
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  await service.init();
+  const authorizationUrl = new URL(await service.beginOAuth());
+  const snapshot = await service.completeOAuth({
+    code: "authorization-code",
+    state: authorizationUrl.searchParams.get("state"),
+  });
+
+  assert.equal(snapshot.connected, true);
+  assert.equal(snapshot.channel.title, "Connected channel");
+  assert.equal(snapshot.lastError, "Некоректний запит списку трансляцій YouTube.");
 });
