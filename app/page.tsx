@@ -766,6 +766,69 @@ function formatEventTime(value: string) {
   });
 }
 
+function formatChartTime(value: string) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "—";
+  return date.toLocaleString("uk-UA", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function chartPointClassName(baseClass: string, index: number, total: number) {
+  const position = total > 1 ? index / (total - 1) : 0.5;
+  const alignment = position < 0.25
+    ? "chart-point--start"
+    : position > 0.75
+      ? "chart-point--end"
+      : "chart-point--center";
+  return `chart-point ${baseClass} ${alignment}`;
+}
+
+function ChartTooltip({
+  label,
+  value,
+  capturedAt,
+  details = [],
+}: {
+  label: string;
+  value: string;
+  capturedAt: string;
+  details?: string[];
+}) {
+  return (
+    <span className="chart-tooltip" role="tooltip" aria-hidden="true">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      {details.filter(Boolean).map((detail) => <small key={detail}>{detail}</small>)}
+      <time dateTime={capturedAt}>{formatChartTime(capturedAt)}</time>
+    </span>
+  );
+}
+
+function youtubeGraphTooltipDetails(
+  graphId: string,
+  item: YouTubeStatus["history"][number] | undefined,
+) {
+  if (!item) return [];
+  const details: string[] = [];
+  if (graphId === "viewers") details.push(`Перегляди: ${item.views.toLocaleString("uk-UA")}`);
+  if (graphId === "views") details.push(`Усього: ${item.views.toLocaleString("uk-UA")}`, `Глядачі: ${item.viewers.toLocaleString("uk-UA")}`);
+  if (graphId === "likes") details.push(`Усього: ${item.likes.toLocaleString("uk-UA")}`, `Глядачі: ${item.viewers.toLocaleString("uk-UA")}`);
+  if (graphId === "subscribers") details.push(`Усього: ${item.subscriberCount?.toLocaleString("uk-UA") ?? "—"}`);
+  if (graphId === "bitrate") details.push(`FPS: ${formatMetric(item.fps, "", 1)}`, `Пропущені кадри: ${item.droppedFrames.toLocaleString("uk-UA")}`);
+  if (graphId === "cpu") details.push(`RAM: ${formatMetric(item.memoryPercent, "%", 1)}`);
+  if (graphId === "memory") details.push(`CPU: ${formatMetric(item.cpuPercent, "%", 1)}`);
+  if (graphId === "network") details.push(`Бітрейт: ${formatMetric(item.bitrateKbps, " Кбіт/с")}`);
+  if (graphId === "promos") details.push(`Усього показів: ${item.promoImpressions.toLocaleString("uk-UA")}`, `Активні промо: ${item.activePromoIds.length}`);
+  if (item.videoName) details.push(`Відео: ${item.videoName}`);
+  return details;
+}
+
 function videoStatusLabel(video: Video) {
   if (video.status === "ANALYZING") return "аналіз файлу";
   if (video.status === "PROCESSING") return `підготовка ${video.processingProgress}%`;
@@ -4051,24 +4114,52 @@ export default function Home() {
                   <div className="system-history-row">
                     <b>CPU</b>
                     <div aria-label="Історія завантаження процесора">
-                      {systemStatus.history.map((sample) => (
-                        <i
+                      {systemStatus.history.map((sample, index) => (
+                        <span
+                          className={chartPointClassName("system-history-point", index, systemStatus.history.length)}
                           key={`cpu-${sample.capturedAt}`}
                           style={{ height: `${Math.max(2, sample.cpuUsagePercent ?? 0)}%` }}
-                          title={`${formatMetric(sample.cpuUsagePercent, "%", 1)} · ${formatEventTime(sample.capturedAt)}`}
-                        />
+                          tabIndex={0}
+                          aria-label={`Завантаження CPU: ${formatMetric(sample.cpuUsagePercent, "%", 1)}. ${formatChartTime(sample.capturedAt)}`}
+                        >
+                          <i className="system-history-bar" />
+                          <ChartTooltip
+                            label="Завантаження CPU"
+                            value={formatMetric(sample.cpuUsagePercent, "%", 1)}
+                            capturedAt={sample.capturedAt}
+                            details={[
+                              `RAM: ${formatMetric(sample.memoryUsagePercent, "%", 1)}`,
+                              `Вхідна мережа: ${formatRate(sample.receivedBytesPerSecond)}`,
+                              `Вихідна мережа: ${formatRate(sample.transmittedBytesPerSecond)}`,
+                            ]}
+                          />
+                        </span>
                       ))}
                     </div>
                   </div>
                   <div className="system-history-row system-history-row--memory">
                     <b>RAM</b>
                     <div aria-label="Історія використання оперативної пам’яті">
-                      {systemStatus.history.map((sample) => (
-                        <i
+                      {systemStatus.history.map((sample, index) => (
+                        <span
+                          className={chartPointClassName("system-history-point", index, systemStatus.history.length)}
                           key={`ram-${sample.capturedAt}`}
                           style={{ height: `${Math.max(2, sample.memoryUsagePercent ?? 0)}%` }}
-                          title={`${formatMetric(sample.memoryUsagePercent, "%", 1)} · ${formatEventTime(sample.capturedAt)}`}
-                        />
+                          tabIndex={0}
+                          aria-label={`Використання RAM: ${formatMetric(sample.memoryUsagePercent, "%", 1)}. ${formatChartTime(sample.capturedAt)}`}
+                        >
+                          <i className="system-history-bar" />
+                          <ChartTooltip
+                            label="Використання RAM"
+                            value={formatMetric(sample.memoryUsagePercent, "%", 1)}
+                            capturedAt={sample.capturedAt}
+                            details={[
+                              `CPU: ${formatMetric(sample.cpuUsagePercent, "%", 1)}`,
+                              `Вхідна мережа: ${formatRate(sample.receivedBytesPerSecond)}`,
+                              `Вихідна мережа: ${formatRate(sample.transmittedBytesPerSecond)}`,
+                            ]}
+                          />
+                        </span>
                       ))}
                     </div>
                   </div>
@@ -4163,14 +4254,26 @@ export default function Home() {
                   </div>
                   {monitoring.history.some((item) => item.bitrateKbps !== null) ? (
                     <div className="monitoring-chart" aria-label="Історія вихідного бітрейту">
-                      {monitoringChartHistory.map((item) => (
+                      {monitoringChartHistory.map((item, index) => (
                         <span
+                          className={chartPointClassName("monitoring-chart-point", index, monitoringChartHistory.length)}
                           key={`bitrate-${item.capturedAt}`}
-                          title={`${formatEventTime(item.capturedAt)} · ${formatMetric(item.bitrateKbps, " Кбіт/с")}`}
+                          style={{ height: `${Math.max(2, ((item.bitrateKbps ?? 0) / monitoringBitrateMax) * 100)}%` }}
+                          tabIndex={0}
+                          aria-label={`Вихідний бітрейт: ${formatMetric(item.bitrateKbps, " Кбіт/с")}. ${formatChartTime(item.capturedAt)}`}
                         >
                           <i
                             className={`monitoring-chart-bar monitoring-chart-bar--${item.healthStatus.toLowerCase()}`}
-                            style={{ height: `${Math.max(2, ((item.bitrateKbps ?? 0) / monitoringBitrateMax) * 100)}%` }}
+                          />
+                          <ChartTooltip
+                            label="Вихідний бітрейт"
+                            value={formatMetric(item.bitrateKbps, " Кбіт/с")}
+                            capturedAt={item.capturedAt}
+                            details={[
+                              `Ціль: ${formatMetric(item.targetBitrateKbps, " Кбіт/с")}`,
+                              `FPS: ${formatMetric(item.fps, " FPS", 1)}`,
+                              `Стан: ${monitoringStatusLabel(item.healthStatus)}`,
+                            ]}
                           />
                         </span>
                       ))}
@@ -4187,14 +4290,26 @@ export default function Home() {
                   </div>
                   {monitoring.history.some((item) => item.speed !== null) ? (
                     <div className="monitoring-chart" aria-label="Історія швидкості подачі">
-                      {monitoringChartHistory.map((item) => (
+                      {monitoringChartHistory.map((item, index) => (
                         <span
+                          className={chartPointClassName("monitoring-chart-point", index, monitoringChartHistory.length)}
                           key={`speed-${item.capturedAt}`}
-                          title={`${formatEventTime(item.capturedAt)} · ${formatMetric(item.speed, "×", 2)}`}
+                          style={{ height: `${Math.max(2, Math.min(100, ((item.speed ?? 0) / 1.05) * 100))}%` }}
+                          tabIndex={0}
+                          aria-label={`Швидкість подачі: ${formatMetric(item.speed, "×", 2)}. ${formatChartTime(item.capturedAt)}`}
                         >
                           <i
                             className={`monitoring-chart-bar monitoring-chart-bar--${item.healthStatus.toLowerCase()}`}
-                            style={{ height: `${Math.max(2, Math.min(100, ((item.speed ?? 0) / 1.05) * 100))}%` }}
+                          />
+                          <ChartTooltip
+                            label="Швидкість подачі"
+                            value={formatMetric(item.speed, "×", 2)}
+                            capturedAt={item.capturedAt}
+                            details={[
+                              "Норма: ≥ 0,98×",
+                              `Відставання: ${item.deliveryLagMs === null ? "—" : formatMediaTime(item.deliveryLagMs)}`,
+                              `Стан: ${monitoringStatusLabel(item.healthStatus)}`,
+                            ]}
                           />
                         </span>
                       ))}
@@ -4407,14 +4522,30 @@ export default function Home() {
                     </div>
                     {series.values.length > 1 ? (
                       <div className="youtube-chart" aria-label={`Графік: ${series.label}`}>
-                        {series.values.map((value, index) => (
-                          <span
-                            className={value < 0 ? "youtube-chart-bar--negative" : ""}
-                            key={`${series.id}-${youtubeChart[index]?.capturedAt || index}`}
-                            style={{ height: `${Math.max(4, (Math.abs(value) / series.maximum) * 100)}%` }}
-                            title={`${series.format(value)} · ${youtubeChart[index] ? new Date(youtubeChart[index].capturedAt).toLocaleString("uk-UA") : ""}`}
-                          />
-                        ))}
+                        {series.values.map((value, index) => {
+                          const snapshot = youtubeChart[index];
+                          const capturedAt = snapshot?.capturedAt || "";
+                          const formattedValue = series.format(value);
+                          return (
+                            <span
+                              className={chartPointClassName("youtube-chart-point", index, series.values.length)}
+                              key={`${series.id}-${capturedAt || index}`}
+                              style={{ height: `${Math.max(4, (Math.abs(value) / series.maximum) * 100)}%` }}
+                              tabIndex={0}
+                              aria-label={`${series.label}: ${formattedValue}. ${formatChartTime(capturedAt)}`}
+                            >
+                              <i
+                                className={`youtube-chart-bar${value < 0 ? " youtube-chart-bar--negative" : ""}`}
+                              />
+                              <ChartTooltip
+                                label={series.label}
+                                value={formattedValue}
+                                capturedAt={capturedAt}
+                                details={youtubeGraphTooltipDetails(series.id, snapshot)}
+                              />
+                            </span>
+                          );
+                        })}
                       </div>
                     ) : <p className="youtube-chart-empty">Потрібно щонайменше два snapshots.</p>}
                   </article>
