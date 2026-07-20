@@ -76,6 +76,75 @@ test("keeps the upload offset unchanged when a chunk checksum is invalid", async
   assert.equal(store.listActiveUploads()[0].uploadedBytes, data.length);
 });
 
+test("acknowledges upload chunks without waiting for a slow progress checkpoint", async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-upload-checkpoint-test-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  let currentTime = 0;
+  let blockWrites = false;
+  let releaseWrite;
+  let markWriteStarted;
+  const writeStarted = new Promise((resolve) => { markWriteStarted = resolve; });
+  const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+  const repository = {
+    readDocument: async () => null,
+    writeDocument: async () => {
+      if (!blockWrites) return;
+      markWriteStarted();
+      await writeGate;
+    },
+  };
+  const store = new VideoStore({
+    rootDir,
+    repository,
+    now: () => currentTime,
+    progressPersistIntervalMs: 5_000,
+  });
+  await store.init();
+  const upload = await store.createUpload({ name: "fast.mp4", size: 2 });
+  currentTime = 6_000;
+  blockWrites = true;
+
+  const appended = store.appendChunk(upload.id, 0, Readable.from(Buffer.from("a")), {
+    checksumSha256: sha256(Buffer.from("a")),
+  });
+  const result = await Promise.race([
+    appended,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("chunk acknowledgement was blocked")), 250)),
+  ]);
+  assert.equal(result.uploadedBytes, 1);
+  await writeStarted;
+  releaseWrite();
+  await store.persistQueue;
+  blockWrites = false;
+  await store.cancelUpload(upload.id);
+});
+
+test("recovers non-checkpointed upload progress from the partial file", async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-upload-recovery-test-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  let saved = null;
+  const repository = {
+    readDocument: async () => saved,
+    writeDocument: async (_key, payload) => { saved = structuredClone(payload); },
+  };
+  const firstStore = new VideoStore({ rootDir, repository, now: () => 0 });
+  await firstStore.init();
+  const upload = await firstStore.createUpload({
+    name: "recover.mp4",
+    size: 3,
+    fingerprint: "recover.mp4:3:1",
+  });
+  await firstStore.appendChunk(upload.id, 0, Readable.from(Buffer.from("ab")), {
+    checksumSha256: sha256(Buffer.from("ab")),
+  });
+  assert.equal(saved.records[0].uploadedBytes, 0);
+
+  const restoredStore = new VideoStore({ rootDir, repository, now: () => 0 });
+  await restoredStore.init();
+  assert.equal(restoredStore.listActiveUploads()[0].uploadedBytes, 2);
+  await restoredStore.cancelUpload(upload.id);
+});
+
 test("pauses an in-flight chunk before allowing the upload to resume", async (t) => {
   const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-active-pause-test-"));
   t.after(() => rm(rootDir, { recursive: true, force: true }));

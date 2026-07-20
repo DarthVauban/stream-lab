@@ -210,6 +210,11 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .dropzone > span:last-child { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.45; }
 .upload-name-field { margin-top: 14px; margin-bottom: 0; }
 .upload-task-list { display: grid; gap: 12px; margin-top: 14px; }
+.upload-throughput { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 14px; padding: 11px; border: 1px solid rgba(121,242,164,.2); border-radius: 13px; background: rgba(121,242,164,.035); }
+.upload-throughput > div { min-width: 0; padding: 8px 9px; border-radius: 9px; background: rgba(0,0,0,.14); }
+.upload-throughput span, .upload-throughput strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-throughput span { color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.upload-throughput strong { margin-top: 5px; color: var(--green); font: 750 11px ui-monospace, monospace; }
 .upload-task { padding: 14px; border: 1px solid var(--border); border-radius: 14px; background: rgba(5,8,11,.32); }
 .upload-task--uploading, .upload-task--verifying { border-color: rgba(121,242,164,.28); }
 .upload-task--paused { border-color: rgba(244,201,93,.3); }
@@ -796,6 +801,7 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
 }
 
 @media (max-width: 900px) {
+  .upload-throughput { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dashboard-shell { --sidebar-width: 76px; }
   .app-sidebar { padding-inline: 10px; }
   .sidebar-header { justify-content: center; padding-inline: 0; }

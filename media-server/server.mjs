@@ -1363,6 +1363,7 @@ export async function createMvpServer({
       webSocketServer.close();
       await auditStore.close?.();
       await realtimeHub.close?.();
+      await videoStore.flush?.();
       await databaseService.close?.();
       await new Promise((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),

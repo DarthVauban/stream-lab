@@ -7,6 +7,15 @@
   @telegramWebhook path /api/telegram/webhook
   reverse_proxy @telegramWebhook media-server:8788
 
+  # Large binary chunks go straight to the media service. Authentication,
+  # CSRF validation and per-chunk SHA-256 verification still happen there,
+  # while the extra Node.js proxy hop is removed from the hot upload path.
+  @uploadChunks {
+    method PUT
+    path /api/uploads/*/chunks
+  }
+  reverse_proxy @uploadChunks media-server:8788
+
   reverse_proxy web:3000 {
     health_uri /api/health
     health_interval 10s

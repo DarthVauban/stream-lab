@@ -11,7 +11,7 @@ import {
   useState,
 } from "react";
 
-const CHUNK_SIZE = 8 * 1024 * 1024;
+const CHUNK_SIZE = 32 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024 * 1024;
 const ALLOWED_VIDEO_EXTENSIONS = new Set(["mp4", "mov", "mkv", "webm", "m4v"]);
 
@@ -1199,6 +1199,18 @@ export default function Home() {
   }, [authState]);
 
   const active = ["LIVE", "STARTING", "DEGRADED", "RECONNECTING", "STOPPING"].includes(stream.status);
+  const uploadingTasks = uploadTasks.filter((task) => task.status === "UPLOADING");
+  const aggregateUploadSpeed = uploadingTasks.reduce(
+    (total, task) => total + Math.max(0, task.speedBytesPerSecond),
+    0,
+  );
+  const aggregateUploadRemainingBytes = uploadingTasks.reduce(
+    (total, task) => total + Math.max(0, task.file.size - task.uploadedBytes),
+    0,
+  );
+  const aggregateUploadEtaSeconds = aggregateUploadSpeed > 0
+    ? aggregateUploadRemainingBytes / aggregateUploadSpeed
+    : null;
   const soakRun = soakTest?.current ?? null;
   const soakProgress = soakRun
     ? Math.min(100, Math.max(0, ((now - Date.parse(soakRun.startedAt)) / Math.max(1, Date.parse(soakRun.endsAt) - Date.parse(soakRun.startedAt))) * 100))
@@ -1649,8 +1661,9 @@ export default function Home() {
 
       const uploadId = created.upload.id;
       let offset = created.upload.uploadedBytes;
-      const initialOffset = offset;
       const uploadStartedAt = performance.now();
+      let speedWindowStartedAt = uploadStartedAt;
+      let speedWindowOffset = offset;
       patchUploadTask(task.id, { uploadId, uploadedBytes: offset });
       if (control.cancelled) {
         await api(`/api/uploads/${uploadId}`, { method: "DELETE" }, csrfToken);
@@ -1664,34 +1677,61 @@ export default function Home() {
         patchUploadTask(task.id, { status: "PAUSED", uploadId, uploadedBytes: offset });
         return;
       }
+      let currentChunk = task.file.slice(offset, Math.min(offset + CHUNK_SIZE, task.file.size));
+      let currentChecksumPromise = sha256Blob(currentChunk);
       while (offset < task.file.size) {
         if (control.paused || control.cancelled) return;
-        const chunk = task.file.slice(offset, Math.min(offset + CHUNK_SIZE, task.file.size));
-        const checksumSha256 = await sha256Blob(chunk);
+        const chunkStart = offset;
+        const chunkEnd = chunkStart + currentChunk.size;
+        const checksumSha256 = await currentChecksumPromise;
         if (control.paused || control.cancelled) return;
+
+        // Hash the following chunk while the current one is in flight. This
+        // keeps SHA-256 integrity without serializing CPU work and network I/O.
+        const nextChunk = chunkEnd < task.file.size
+          ? task.file.slice(chunkEnd, Math.min(chunkEnd + CHUNK_SIZE, task.file.size))
+          : null;
+        const nextChecksumPromise = nextChunk ? sha256Blob(nextChunk) : null;
         control.controller = new AbortController();
         const result = await api<{ upload: Video }>(
-          `/api/uploads/${uploadId}/chunks?offset=${offset}`,
+          `/api/uploads/${uploadId}/chunks?offset=${chunkStart}`,
           {
             method: "PUT",
             headers: {
               "Content-Type": "application/octet-stream",
               "X-Chunk-SHA256": checksumSha256,
             },
-            body: chunk,
+            body: currentChunk,
             signal: control.controller.signal,
           },
           csrfToken,
         );
         control.controller = null;
         offset = result.upload.uploadedBytes;
-        const elapsedSeconds = Math.max(0.001, (performance.now() - uploadStartedAt) / 1_000);
-        const speedBytesPerSecond = (offset - initialOffset) / elapsedSeconds;
+        if (offset <= chunkStart || offset > task.file.size) {
+          throw new Error("Сервер повернув некоректний прогрес завантаження.");
+        }
+        const capturedAt = performance.now();
+        const elapsedSeconds = Math.max(0.001, (capturedAt - speedWindowStartedAt) / 1_000);
+        const speedBytesPerSecond = (offset - speedWindowOffset) / elapsedSeconds;
         patchUploadTask(task.id, {
           uploadedBytes: offset,
           speedBytesPerSecond,
           etaSeconds: speedBytesPerSecond > 0 ? (task.file.size - offset) / speedBytesPerSecond : null,
         });
+        if (capturedAt - speedWindowStartedAt >= 5_000) {
+          speedWindowStartedAt = capturedAt;
+          speedWindowOffset = offset;
+        }
+        if (offset < task.file.size) {
+          if (offset === chunkEnd && nextChunk && nextChecksumPromise) {
+            currentChunk = nextChunk;
+            currentChecksumPromise = nextChecksumPromise;
+          } else {
+            currentChunk = task.file.slice(offset, Math.min(offset + CHUNK_SIZE, task.file.size));
+            currentChecksumPromise = sha256Blob(currentChunk);
+          }
+        }
       }
 
       patchUploadTask(task.id, { status: "VERIFYING", uploadedBytes: offset, etaSeconds: null });
@@ -3118,6 +3158,27 @@ export default function Home() {
             )}
           </label>
 
+          {uploadingTasks.length > 0 && (
+            <div className="upload-throughput" role="status" aria-live="polite">
+              <div>
+                <span>Сумарна швидкість</span>
+                <strong>{aggregateUploadSpeed > 0 ? formatRate(aggregateUploadSpeed) : "Вимірюємо…"}</strong>
+              </div>
+              <div>
+                <span>Активні файли</span>
+                <strong>{uploadingTasks.length}</strong>
+              </div>
+              <div>
+                <span>Залишилось</span>
+                <strong>{humanSize(aggregateUploadRemainingBytes)}</strong>
+              </div>
+              <div>
+                <span>Орієнтовний час</span>
+                <strong>{aggregateUploadEtaSeconds === null ? "—" : formatMediaTime(aggregateUploadEtaSeconds * 1_000)}</strong>
+              </div>
+            </div>
+          )}
+
           {uploadTasks.length > 0 && (
             <div className="upload-task-list">
               {uploadTasks.map((task) => {
@@ -3128,7 +3189,7 @@ export default function Home() {
                     <div className="upload-task-heading">
                       <div>
                         <strong>{task.file.name}</strong>
-                        <small>{humanSize(task.file.size)} · SHA-256 кожного chunk</small>
+                        <small>{humanSize(task.file.size)} · SHA-256 · блоки до {humanSize(CHUNK_SIZE)}</small>
                       </div>
                       <span>{task.status === "VERIFYING" ? "CHECKSUM" : task.status}</span>
                     </div>

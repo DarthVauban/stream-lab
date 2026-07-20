@@ -9,6 +9,8 @@ import { normalizeCompressionProfile } from "./compression-profiles.mjs";
 
 const ALLOWED_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".webm", ".m4v"]);
 const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024 * 1024;
+const DEFAULT_UPLOAD_PROGRESS_PERSIST_MS = 5_000;
+const UPLOAD_STREAM_HIGH_WATER_MARK = 1024 * 1024;
 const CHECKSUM_PATTERN = /^[a-f0-9]{64}$/i;
 
 function cleanText(value, maximum = 500) {
@@ -132,7 +134,16 @@ function normalizeVideoName(value, extension) {
 }
 
 export class VideoStore {
-  constructor({ rootDir, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, repository = null }) {
+  constructor({
+    rootDir,
+    maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES,
+    repository = null,
+    progressPersistIntervalMs = Number(
+      process.env.UPLOAD_PROGRESS_PERSIST_MS || DEFAULT_UPLOAD_PROGRESS_PERSIST_MS,
+    ),
+    now = () => Date.now(),
+    logger = console,
+  }) {
     this.rootDir = rootDir;
     this.uploadsDir = path.join(rootDir, "uploads");
     this.trashDir = path.join(this.uploadsDir, ".trash");
@@ -143,6 +154,14 @@ export class VideoStore {
     this.records = [];
     this.activeWrites = new Set();
     this.persistQueue = Promise.resolve();
+    this.progressPersistIntervalMs = Math.max(
+      1_000,
+      Math.min(60_000, Number(progressPersistIntervalMs) || DEFAULT_UPLOAD_PROGRESS_PERSIST_MS),
+    );
+    this.now = now;
+    this.logger = logger;
+    this.lastProgressPersistAt = Number.NEGATIVE_INFINITY;
+    this.progressPersistPending = false;
   }
 
   async init() {
@@ -159,8 +178,20 @@ export class VideoStore {
         this.records = [];
       }
     }
-    await this.persist();
     await this.recoverTrash();
+    await this.reconcileActiveUploadSizes();
+    await this.persist();
+  }
+
+  async reconcileActiveUploadSizes() {
+    for (const record of this.records) {
+      if (record.status !== "UPLOADING") continue;
+      const filePath = this.partialPath(record);
+      const actualSize = await stat(filePath).then((value) => value.size).catch(() => 0);
+      const safeSize = Math.min(record.size, actualSize);
+      if (actualSize > record.size) await truncate(filePath, record.size);
+      record.uploadedBytes = safeSize;
+    }
   }
 
   async recoverTrash() {
@@ -199,6 +230,26 @@ export class VideoStore {
       });
     });
     await this.persistQueue;
+    this.lastProgressPersistAt = this.now();
+  }
+
+  scheduleProgressPersist() {
+    const timestamp = this.now();
+    if (
+      this.progressPersistPending ||
+      timestamp - this.lastProgressPersistAt < this.progressPersistIntervalMs
+    ) return;
+    this.lastProgressPersistAt = timestamp;
+    this.progressPersistPending = true;
+    void this.persist()
+      .catch((error) => this.logger.error("StreamLab upload progress persistence failed.", error))
+      .finally(() => {
+        this.progressPersistPending = false;
+      });
+  }
+
+  async flush() {
+    await this.persist();
   }
 
   find(id) {
@@ -311,6 +362,7 @@ export class VideoStore {
     const expectedChunkChecksum = normalizeChecksum(checksumSha256);
     const chunkHash = createHash("sha256");
     const limiter = new Transform({
+      highWaterMark: UPLOAD_STREAM_HIGH_WATER_MARK,
       transform: (chunk, _encoding, callback) => {
         if (record.uploadState === "PAUSED") {
           callback(new ApiError(409, "UPLOAD_PAUSED", "Завантаження призупинено."));
@@ -330,7 +382,10 @@ export class VideoStore {
       await pipeline(
         readable,
         limiter,
-        createWriteStream(this.partialPath(record), { flags: "a" }),
+        createWriteStream(this.partialPath(record), {
+          flags: "a",
+          highWaterMark: UPLOAD_STREAM_HIGH_WATER_MARK,
+        }),
       );
       if (received === 0) {
         throw new ApiError(400, "EMPTY_CHUNK", "Порожній блок завантаження.");
@@ -340,7 +395,7 @@ export class VideoStore {
         throw new ApiError(422, "CHUNK_CHECKSUM_MISMATCH", "Checksum блоку не збігається. Повторіть передачу.");
       }
       record.uploadedBytes = requestedOffset + received;
-      await this.persist();
+      this.scheduleProgressPersist();
       return publicRecord(record);
     } catch (error) {
       await truncate(this.partialPath(record), requestedOffset).catch(() => {});
