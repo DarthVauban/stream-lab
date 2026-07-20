@@ -177,12 +177,14 @@ export class YouTubeService {
     this.runtime.history = this.statsStore.list({
       hours: 24,
       broadcastId: saved.selectedBroadcastId,
+      referenceTime: this.now(),
     });
     this.runtime.recentSubscribers = this.statsStore.listSubscribers();
     this.runtime.analyticsHistory = this.statsStore.listAnalyticsHistory();
     this.runtime.videoStats = this.statsStore.videoStatistics({
       hours: 24,
       broadcastId: saved.selectedBroadcastId,
+      referenceTime: this.now(),
     });
     return this.snapshot();
   }
@@ -560,8 +562,16 @@ export class YouTubeService {
         playbackError: playback.status === "ERROR",
         activePromoIds: playback.activePromoIds || [],
       });
-      this.runtime.history = this.statsStore.list({ hours: 24, broadcastId: videoId });
-      this.runtime.videoStats = this.statsStore.videoStatistics({ hours: 24, broadcastId: videoId });
+      this.runtime.history = this.statsStore.list({
+        hours: 24,
+        broadcastId: videoId,
+        referenceTime: this.now(),
+      });
+      this.runtime.videoStats = this.statsStore.videoStatistics({
+        hours: 24,
+        broadcastId: videoId,
+        referenceTime: this.now(),
+      });
     }
   }
 
@@ -699,7 +709,12 @@ export class YouTubeService {
   async refreshDailyReport() {
     this.lastPoll.dailyReport = this.now();
     const broadcastId = this.store?.read().selectedBroadcastId || null;
-    const items = this.statsStore?.list({ hours: 24, limit: 10_080, broadcastId }) || [];
+    const items = this.statsStore?.list({
+      hours: 24,
+      limit: 10_080,
+      broadcastId,
+      referenceTime: this.now(),
+    }) || [];
     const first = items[0] || null;
     const last = items.at(-1) || null;
     this.runtime.dailyReport = {
@@ -789,8 +804,16 @@ export class YouTubeService {
     this.runtime.selected = selected;
     this.runtime.stream = null;
     this.runtime.metrics = null;
-    this.runtime.history = this.statsStore.list({ hours: 24, broadcastId });
-    this.runtime.videoStats = this.statsStore.videoStatistics({ hours: 24, broadcastId });
+    this.runtime.history = this.statsStore.list({
+      hours: 24,
+      broadcastId,
+      referenceTime: this.now(),
+    });
+    this.runtime.videoStats = this.statsStore.videoStatistics({
+      hours: 24,
+      broadcastId,
+      referenceTime: this.now(),
+    });
     this.ingestion = null;
     this.lastPoll.stream = 0;
     this.lastPoll.metrics = 0;
@@ -814,12 +837,16 @@ export class YouTubeService {
 
   history(options = {}) {
     const selectedId = this.store?.read().selectedBroadcastId || null;
-    return this.statsStore ? this.statsStore.list({ ...options, broadcastId: selectedId }) : [];
+    return this.statsStore
+      ? this.statsStore.list({ ...options, broadcastId: selectedId, referenceTime: this.now() })
+      : [];
   }
 
   videoStatistics(options = {}) {
     const selectedId = this.store?.read().selectedBroadcastId || null;
-    return this.statsStore ? this.statsStore.videoStatistics({ ...options, broadcastId: selectedId }) : [];
+    return this.statsStore
+      ? this.statsStore.videoStatistics({ ...options, broadcastId: selectedId, referenceTime: this.now() })
+      : [];
   }
 
   subscribers({ limit = 50 } = {}) {

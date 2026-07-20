@@ -357,14 +357,23 @@ export class YouTubeStatsStore {
     await this.persist();
   }
 
-  list({ hours = 24, limit = 240, broadcastId = null, since = null, until = null, all = false } = {}) {
+  list({
+    hours = 24,
+    limit = 240,
+    broadcastId = null,
+    since = null,
+    until = null,
+    all = false,
+    referenceTime = Date.now(),
+  } = {}) {
     const explicitSince = Date.parse(since);
     const explicitUntil = Date.parse(until);
+    const currentTime = Number.isFinite(Number(referenceTime)) ? Number(referenceTime) : Date.now();
     const lowerBound = all
       ? Number.NEGATIVE_INFINITY
       : Number.isFinite(explicitSince)
         ? explicitSince
-        : Date.now() - Math.max(1, Math.min(24 * 365, Number(hours) || 24)) * 3_600_000;
+        : currentTime - Math.max(1, Math.min(24 * 365, Number(hours) || 24)) * 3_600_000;
     const upperBound = Number.isFinite(explicitUntil) ? explicitUntil : Number.POSITIVE_INFINITY;
     const filtered = this.items.filter(
       (item) =>
