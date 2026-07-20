@@ -387,8 +387,30 @@ type YouTubeStatus = {
     likes?: number;
     subscribersGained?: number;
     subscribersLost?: number;
+    netSubscribers?: number;
+    averageConcurrentViewers?: number | null;
+    peakConcurrentViewers?: number | null;
+    concurrentAvailable?: boolean;
+    concurrentError?: string | null;
+    estimatedRevenue?: number | null;
+    revenueCurrency?: string;
+    revenueAvailable?: boolean;
+    revenueReconnectRequired?: boolean;
+    revenueError?: string | null;
+    periodStart?: string;
+    periodEnd?: string;
     updatedAt: string | null;
   } | null;
+  analyticsHistory: Array<{
+    date: string;
+    views: number;
+    estimatedMinutesWatched: number;
+    averageViewDurationSeconds: number;
+    likes: number;
+    subscribersGained: number;
+    subscribersLost: number;
+    estimatedRevenue: number | null;
+  }>;
   dailyReport: {
     generatedAt: string;
     broadcastId: string | null;
@@ -404,6 +426,43 @@ type YouTubeStatus = {
     views: number;
     likes: number;
     health: string;
+    subscriberCount: number | null;
+    videoId: string | null;
+    videoName: string | null;
+    queueItemId: string | null;
+    positionMs: number;
+    bitrateKbps: number;
+    fps: number;
+    droppedFrames: number;
+    cpuPercent: number;
+    memoryPercent: number;
+    networkOutputBytesPerSecond: number;
+    promoImpressions: number;
+    streamStatus: string;
+    playbackError: boolean;
+    activePromoIds: string[];
+  }>;
+  recentSubscribers: Array<{
+    subscriptionId: string;
+    subscriberChannelId: string;
+    subscriberName: string;
+    thumbnailUrl: string | null;
+    subscribedAt: string | null;
+    detectedAt: string;
+    telegramSentAt: string | null;
+  }>;
+  videoStats: Array<{
+    videoId: string;
+    videoName: string;
+    playCount: number;
+    averageStartViewers: number;
+    averageEndViewers: number;
+    audienceChange: number;
+    localPeakViewers: number;
+    averageWatchIntervalSeconds: number;
+    promoIds: string[];
+    playbackErrors: number;
+    officialYouTubeMetric: false;
   }>;
   quota: {
     date: string;
@@ -418,6 +477,7 @@ type YouTubeStatus = {
     streamSeconds: number;
     broadcastSeconds: number;
     subscribersMinutes: number;
+    recentSubscribersMinutes: number;
     analyticsMinutes: number;
     dailyReportHours: number;
     estimatedDailyUnits: number;
@@ -425,6 +485,8 @@ type YouTubeStatus = {
   lastUpdatedAt: string | null;
   lastError: string | null;
 };
+
+type YouTubeRange = 1 | 6 | 24 | 168 | 720 | "all" | "custom";
 
 type PromoPlacement = {
   x: number;
@@ -800,6 +862,9 @@ export default function Home() {
   const [streamAction, setStreamAction] = useState(false);
   const [youtube, setYoutube] = useState<YouTubeStatus | null>(null);
   const [youtubeAction, setYoutubeAction] = useState("");
+  const [youtubeRange, setYoutubeRange] = useState<YouTubeRange>(24);
+  const [youtubeRangeFrom, setYoutubeRangeFrom] = useState("");
+  const [youtubeRangeTo, setYoutubeRangeTo] = useState("");
   const [monitoring, setMonitoring] = useState<MonitoringStatus | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [promos, setPromos] = useState<PromoStatus | null>(null);
@@ -838,6 +903,11 @@ export default function Home() {
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [now, setNow] = useState(0);
+  const youtubeRangeRef = useRef<{ range: YouTubeRange; from: string; to: string }>({
+    range: 24,
+    from: "",
+    to: "",
+  });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
   const uploadControlsRef = useRef(new Map<string, {
@@ -849,7 +919,15 @@ export default function Home() {
 
   const refresh = useCallback(async () => {
     try {
-      const [healthResult, videosResult, uploadsResult, streamResult, queueResult, playlistsResult, youtubeResult, systemResult, promosResult] = await Promise.all([
+      const selectedYoutubeRange = youtubeRangeRef.current;
+      const youtubeRangeParameters = new URLSearchParams();
+      if (selectedYoutubeRange.range === "all") youtubeRangeParameters.set("all", "true");
+      else if (selectedYoutubeRange.range === "custom") {
+        if (selectedYoutubeRange.from) youtubeRangeParameters.set("from", `${selectedYoutubeRange.from}T00:00:00.000Z`);
+        if (selectedYoutubeRange.to) youtubeRangeParameters.set("to", `${selectedYoutubeRange.to}T23:59:59.999Z`);
+      } else youtubeRangeParameters.set("hours", String(selectedYoutubeRange.range));
+      const rangeIsReady = selectedYoutubeRange.range !== "custom" || Boolean(selectedYoutubeRange.from && selectedYoutubeRange.to);
+      const [healthResult, videosResult, uploadsResult, streamResult, queueResult, playlistsResult, youtubeResult, youtubeRangeResult, systemResult, promosResult] = await Promise.all([
         api<Health>("/api/health"),
         api<{ videos: Video[] }>("/api/videos"),
         api<{ uploads: Video[] }>("/api/uploads"),
@@ -857,6 +935,11 @@ export default function Home() {
         api<{ queue: QueueState }>("/api/queue"),
         api<{ playlists: Playlist[] }>("/api/playlists"),
         api<{ youtube: YouTubeStatus }>("/api/youtube/status"),
+        selectedYoutubeRange.range === 24 || !rangeIsReady
+          ? Promise.resolve(null)
+          : api<{ stats: YouTubeStatus["history"]; videoStats: YouTubeStatus["videoStats"] }>(
+              `/api/youtube/stats?${youtubeRangeParameters}`,
+            ),
         api<{ system: SystemStatus | null }>("/api/system/status"),
         api<{ promos: PromoStatus }>("/api/promos"),
       ]);
@@ -867,7 +950,11 @@ export default function Home() {
       setQueue(queueResult.queue);
       setPlaylists(playlistsResult.playlists);
       setSelectedPlaylistId((current) => current || playlistsResult.playlists[0]?.id || "");
-      setYoutube(youtubeResult.youtube);
+      setYoutube(youtubeRangeResult ? {
+        ...youtubeResult.youtube,
+        history: youtubeRangeResult.stats,
+        videoStats: youtubeRangeResult.videoStats,
+      } : youtubeResult.youtube);
       setSystemStatus(systemResult.system);
       setPromos(promosResult.promos);
       setSelectedPromoId((current) => current || promosResult.promos.assets[0]?.id || "");
@@ -930,6 +1017,14 @@ export default function Home() {
     }, 0);
     return () => window.clearTimeout(restorePreference);
   }, []);
+
+  useEffect(() => {
+    youtubeRangeRef.current = {
+      range: youtubeRange,
+      from: youtubeRangeFrom,
+      to: youtubeRangeTo,
+    };
+  }, [youtubeRange, youtubeRangeFrom, youtubeRangeTo]);
 
   useEffect(() => {
     if (authState !== "authenticated") return;
@@ -1132,8 +1227,70 @@ export default function Home() {
   const playbackProgress = stream.durationMs > 0
     ? Math.min(100, Math.max(0, (stream.positionMs / stream.durationMs) * 100))
     : 0;
-  const youtubeChart = youtube?.history.slice(-48) ?? [];
-  const youtubeChartMax = Math.max(1, ...youtubeChart.map((item) => item.viewers));
+  const youtubeChart = youtube?.history ?? [];
+  const firstYoutubeSnapshot = youtubeChart[0] || null;
+  const subscriberBaseline = youtubeChart.find((item) => item.subscriberCount !== null)?.subscriberCount ?? 0;
+  const promoImpressionBaseline = youtubeChart[0]?.promoImpressions ?? 0;
+  const youtubeGraphSeries = [
+    {
+      id: "viewers",
+      label: "Одночасні глядачі",
+      values: youtubeChart.map((item) => item.viewers),
+      format: (value: number) => value.toLocaleString("uk-UA"),
+    },
+    {
+      id: "views",
+      label: "Нові перегляди",
+      values: youtubeChart.map((item) => Math.max(0, item.views - (firstYoutubeSnapshot?.views || 0))),
+      format: (value: number) => `+${Math.round(value).toLocaleString("uk-UA")}`,
+    },
+    {
+      id: "likes",
+      label: "Нові вподобання",
+      values: youtubeChart.map((item) => Math.max(0, item.likes - (firstYoutubeSnapshot?.likes || 0))),
+      format: (value: number) => `+${Math.round(value).toLocaleString("uk-UA")}`,
+    },
+    {
+      id: "subscribers",
+      label: "Приріст підписників",
+      values: youtubeChart.map((item) => item.subscriberCount === null ? 0 : item.subscriberCount - subscriberBaseline),
+      format: (value: number) => `${value >= 0 ? "+" : ""}${Math.round(value).toLocaleString("uk-UA")}`,
+    },
+    {
+      id: "bitrate",
+      label: "Вихідний бітрейт",
+      values: youtubeChart.map((item) => item.bitrateKbps),
+      format: (value: number) => `${Math.round(value).toLocaleString("uk-UA")} Кбіт/с`,
+    },
+    {
+      id: "cpu",
+      label: "CPU",
+      values: youtubeChart.map((item) => item.cpuPercent),
+      format: (value: number) => `${value.toLocaleString("uk-UA", { maximumFractionDigits: 1 })}%`,
+    },
+    {
+      id: "memory",
+      label: "RAM",
+      values: youtubeChart.map((item) => item.memoryPercent),
+      format: (value: number) => `${value.toLocaleString("uk-UA", { maximumFractionDigits: 1 })}%`,
+    },
+    {
+      id: "network",
+      label: "Вихідна мережа",
+      values: youtubeChart.map((item) => item.networkOutputBytesPerSecond),
+      format: (value: number) => `${(value * 8 / 1_000_000).toLocaleString("uk-UA", { maximumFractionDigits: 2 })} Мбіт/с`,
+    },
+    {
+      id: "promos",
+      label: "Покази промо",
+      values: youtubeChart.map((item) => Math.max(0, item.promoImpressions - promoImpressionBaseline)),
+      format: (value: number) => `+${Math.round(value).toLocaleString("uk-UA")}`,
+    },
+  ].map((series) => ({
+    ...series,
+    maximum: Math.max(1, ...series.values.map((value) => Math.abs(value))),
+    current: series.values.at(-1) || 0,
+  }));
   const monitoringBitrateMax = Math.max(
     1,
     monitoring?.current.targetBitrateKbps ?? 0,
@@ -1335,6 +1492,9 @@ export default function Home() {
       setStreamKeyVisible(false);
       setYoutube(null);
       setYoutubeAction("");
+      setYoutubeRange(24);
+      setYoutubeRangeFrom("");
+      setYoutubeRangeTo("");
       setMonitoring(null);
       setSystemStatus(null);
       setPromos(null);
@@ -2184,6 +2344,9 @@ export default function Home() {
         csrfToken,
       );
       setYoutube(result.youtube);
+      setYoutubeRange(24);
+      setYoutubeRangeFrom("");
+      setYoutubeRangeTo("");
       setFailedChannelAvatarUrl("");
       setNotice({ type: "success", text: "YouTube-канал відключено, доступ відкликано." });
     } catch (error) {
@@ -2581,13 +2744,95 @@ export default function Home() {
         { method: "POST" },
         csrfToken,
       );
-      setYoutube(result.youtube);
+      let refreshed = result.youtube;
+      const rangeReady = youtubeRange !== "custom" || Boolean(youtubeRangeFrom && youtubeRangeTo);
+      if (youtubeRange !== 24 && rangeReady) {
+        const rangeResult = await api<{
+          stats: YouTubeStatus["history"];
+          videoStats: YouTubeStatus["videoStats"];
+        }>(`/api/youtube/stats?${youtubeRangeQuery()}`);
+        refreshed = {
+          ...refreshed,
+          history: rangeResult.stats,
+          videoStats: rangeResult.videoStats,
+        };
+      } else if (!rangeReady) {
+        setYoutubeRange(24);
+      }
+      setYoutube(refreshed);
       setFailedChannelAvatarUrl("");
       setNotice({ type: "success", text: "Дані YouTube оновлено поза автоматичним графіком." });
     } catch (error) {
       setNotice({
         type: "error",
         text: error instanceof Error ? error.message : "Не вдалося оновити YouTube.",
+      });
+    } finally {
+      setYoutubeAction("");
+    }
+  }
+
+  function youtubeRangeQuery(range: YouTubeRange = youtubeRange) {
+    const parameters = new URLSearchParams();
+    if (range === "all") parameters.set("all", "true");
+    else if (range === "custom") {
+      if (youtubeRangeFrom) parameters.set("from", `${youtubeRangeFrom}T00:00:00.000Z`);
+      if (youtubeRangeTo) parameters.set("to", `${youtubeRangeTo}T23:59:59.999Z`);
+    } else parameters.set("hours", String(range));
+    return parameters.toString();
+  }
+
+  async function loadYouTubeRange(range: YouTubeRange) {
+    if (youtubeAction) return;
+    if (range === "custom" && (!youtubeRangeFrom || !youtubeRangeTo)) {
+      setNotice({ type: "error", text: "Вкажіть початкову та кінцеву дату власного діапазону." });
+      return;
+    }
+    setYoutubeAction("range");
+    setYoutubeRange(range);
+    try {
+      const result = await api<{ stats: YouTubeStatus["history"]; videoStats: YouTubeStatus["videoStats"] }>(
+        `/api/youtube/stats?${youtubeRangeQuery(range)}`,
+      );
+      setYoutube((current) => current ? {
+        ...current,
+        history: result.stats,
+        videoStats: result.videoStats,
+      } : current);
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося завантажити вибраний період.",
+      });
+    } finally {
+      setYoutubeAction("");
+    }
+  }
+
+  async function exportYouTubeStatistics(format: "csv" | "json") {
+    if (youtubeAction) return;
+    setYoutubeAction(`export:${format}`);
+    try {
+      const response = await fetch(`/api/youtube/stats/export?format=${format}&${youtubeRangeQuery()}`, {
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body?.error?.message || "Не вдалося створити файл експорту.");
+      }
+      const blob = await response.blob();
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = href;
+      link.download = `streamlab-youtube-${new Date().toISOString().slice(0, 10)}.${format}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(href);
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося експортувати статистику.",
       });
     } finally {
       setYoutubeAction("");
@@ -4021,9 +4266,57 @@ export default function Home() {
               <div className="youtube-manual-sync" role="note">
                 Автосинхронізація активна: метрики — кожні {youtube.polling.metricsSeconds} с, сигнал — {youtube.polling.streamSeconds} с,
                 статус ефіру — {youtube.polling.broadcastSeconds} с, підписники — {youtube.polling.subscribersMinutes} хв,
-                Analytics — {youtube.polling.analyticsMinutes} хв. Орієнтовно {youtube.polling.estimatedDailyUnits.toLocaleString("uk-UA")} одиниць квоти на добу.
+                recent subscribers — {youtube.polling.recentSubscribersMinutes} хв, Analytics — {youtube.polling.analyticsMinutes} хв.
+                Орієнтовно {youtube.polling.estimatedDailyUnits.toLocaleString("uk-UA")} одиниць квоти на добу.
                 {youtube.lastUpdatedAt && <span> Остання синхронізація: {new Date(youtube.lastUpdatedAt).toLocaleString("uk-UA")}.</span>}
               </div>
+
+              <div className="youtube-stats-toolbar">
+                <div className="youtube-range" aria-label="Період статистики YouTube">
+                  {([
+                    [1, "1 год"],
+                    [6, "6 год"],
+                    [24, "24 год"],
+                    [168, "7 днів"],
+                    [720, "30 днів"],
+                    ["all", "Увесь час"],
+                  ] as Array<[YouTubeRange, string]>).map(([range, label]) => (
+                    <button
+                      type="button"
+                      className={youtubeRange === range ? "youtube-range--active" : ""}
+                      key={String(range)}
+                      disabled={Boolean(youtubeAction)}
+                      onClick={() => void loadYouTubeRange(range)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    className={youtubeRange === "custom" ? "youtube-range--active" : ""}
+                    disabled={Boolean(youtubeAction)}
+                    onClick={() => setYoutubeRange("custom")}
+                  >
+                    Власний
+                  </button>
+                </div>
+                <div className="youtube-export-actions">
+                  <button type="button" disabled={Boolean(youtubeAction)} onClick={() => void exportYouTubeStatistics("csv")}>
+                    {youtubeAction === "export:csv" ? "CSV…" : "Export CSV"}
+                  </button>
+                  <button type="button" disabled={Boolean(youtubeAction)} onClick={() => void exportYouTubeStatistics("json")}>
+                    {youtubeAction === "export:json" ? "JSON…" : "Export JSON"}
+                  </button>
+                </div>
+              </div>
+
+              {youtubeRange === "custom" && (
+                <div className="youtube-custom-range">
+                  <label><span>Від</span><input type="date" value={youtubeRangeFrom} onChange={(event) => setYoutubeRangeFrom(event.target.value)} /></label>
+                  <label><span>До</span><input type="date" value={youtubeRangeTo} onChange={(event) => setYoutubeRangeTo(event.target.value)} /></label>
+                  <button type="button" disabled={Boolean(youtubeAction) || !youtubeRangeFrom || !youtubeRangeTo} onClick={() => void loadYouTubeRange("custom")}>Застосувати</button>
+                </div>
+              )}
 
               <div className="youtube-metrics" aria-label="Поточні показники YouTube">
                 <div>
@@ -4044,57 +4337,118 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="youtube-detail-grid">
-                <div className="youtube-chart-card">
-                  <div className="youtube-card-heading">
-                    <div>
-                      <span>Глядачі</span>
-                      <strong>Останні 24 години</strong>
+              <div className="youtube-graph-grid">
+                {youtubeGraphSeries.map((series) => (
+                  <article className="youtube-chart-card" key={series.id}>
+                    <div className="youtube-card-heading">
+                      <div><span>{series.label}</span><strong>{series.format(series.current)}</strong></div>
+                      <span>max {series.format(series.maximum)}</span>
                     </div>
-                    <span>пік {youtubeChartMax.toLocaleString("uk-UA")}</span>
-                  </div>
-                  {youtubeChart.length > 1 ? (
-                    <div className="youtube-chart" aria-label="Історія одночасних глядачів">
-                      {youtubeChart.map((item) => (
-                        <span
-                          key={`${item.capturedAt}-${item.broadcastId}`}
-                          style={{ height: `${Math.max(4, (item.viewers / youtubeChartMax) * 100)}%` }}
-                          title={`${item.viewers} · ${new Date(item.capturedAt).toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" })}`}
-                        />
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="youtube-chart-empty">Графік з’явиться після перших двох знімків статистики.</p>
-                  )}
-                </div>
+                    {series.values.length > 1 ? (
+                      <div className="youtube-chart" aria-label={`Графік: ${series.label}`}>
+                        {series.values.map((value, index) => (
+                          <span
+                            className={value < 0 ? "youtube-chart-bar--negative" : ""}
+                            key={`${series.id}-${youtubeChart[index]?.capturedAt || index}`}
+                            style={{ height: `${Math.max(4, (Math.abs(value) / series.maximum) * 100)}%` }}
+                            title={`${series.format(value)} · ${youtubeChart[index] ? new Date(youtubeChart[index].capturedAt).toLocaleString("uk-UA") : ""}`}
+                          />
+                        ))}
+                      </div>
+                    ) : <p className="youtube-chart-empty">Потрібно щонайменше два snapshots.</p>}
+                  </article>
+                ))}
+              </div>
 
-                <div className="youtube-quota-card">
-                  <div className="youtube-card-heading">
-                    <div>
-                      <span>API квота</span>
-                      <strong>{youtube.quota.used.toLocaleString("uk-UA")} / {youtube.quota.limit.toLocaleString("uk-UA")}</strong>
+              <section className="youtube-analytics-panel" aria-labelledby="youtube-analytics-title">
+                <div className="youtube-section-heading">
+                  <div>
+                    <span>Офіційні метрики</span>
+                    <h3 id="youtube-analytics-title">YouTube Analytics</h3>
+                  </div>
+                  <span>{youtube.analytics?.periodStart && youtube.analytics?.periodEnd ? `${youtube.analytics.periodStart} — ${youtube.analytics.periodEnd}` : `кожні ${youtube.polling.analyticsMinutes} хв`}</span>
+                </div>
+                {youtube.analytics?.reconnectRequired ? (
+                  <p className="youtube-analytics-note">Перепідключіть YouTube у профілі, щоб надати read-only доступ до Analytics.</p>
+                ) : (
+                  <>
+                    <div className="youtube-analytics-metrics">
+                      <div><span>Average concurrent</span><strong>{formatMetric(youtube.analytics?.averageConcurrentViewers)}</strong></div>
+                      <div><span>Peak concurrent</span><strong>{formatMetric(youtube.analytics?.peakConcurrentViewers)}</strong></div>
+                      <div><span>Watch time</span><strong>{formatMetric(youtube.analytics?.estimatedMinutesWatched, " хв")}</strong></div>
+                      <div><span>Average view</span><strong>{youtube.analytics?.averageViewDurationSeconds === undefined ? "—" : formatMediaTime(youtube.analytics.averageViewDurationSeconds * 1_000)}</strong></div>
+                      <div><span>Subscribers gained</span><strong>{youtube.analytics?.subscribersGained === undefined ? "—" : `+${formatMetric(youtube.analytics.subscribersGained)}`}</strong></div>
+                      <div><span>Subscribers lost</span><strong>{youtube.analytics?.subscribersLost === undefined ? "—" : `−${formatMetric(youtube.analytics.subscribersLost)}`}</strong></div>
+                      <div><span>Net subscribers</span><strong>{youtube.analytics?.netSubscribers === undefined ? "—" : `${youtube.analytics.netSubscribers >= 0 ? "+" : ""}${formatMetric(youtube.analytics.netSubscribers)}`}</strong></div>
+                      <div><span>Likes</span><strong>{formatMetric(youtube.analytics?.likes)}</strong></div>
+                      <div><span>Views</span><strong>{formatMetric(youtube.analytics?.views)}</strong></div>
+                      <div><span>Estimated revenue</span><strong>{youtube.analytics?.revenueAvailable ? `${formatMetric(youtube.analytics.estimatedRevenue, "", 2)} ${youtube.analytics.revenueCurrency || "USD"}` : "—"}</strong></div>
                     </div>
+                    {(youtube.analytics?.concurrentError || youtube.analytics?.revenueReconnectRequired || youtube.analytics?.revenueError) && (
+                      <p className="youtube-analytics-note">
+                        {youtube.analytics.concurrentError || (youtube.analytics.revenueReconnectRequired
+                          ? "Revenue потребує окремого monetary read-only дозволу; перепідключіть канал."
+                          : youtube.analytics.revenueError)}
+                      </p>
+                    )}
+                  </>
+                )}
+              </section>
+
+              <div className="youtube-secondary-grid">
+                <section className="youtube-subscribers-panel" aria-labelledby="youtube-subscribers-title">
+                  <div className="youtube-section-heading">
+                    <div><span>Deduplicated feed</span><h3 id="youtube-subscribers-title">Останні підписники</h3></div>
+                    <span>{youtube.recentSubscribers.length}</span>
+                  </div>
+                  <div className="youtube-subscriber-list">
+                    {youtube.recentSubscribers.length ? youtube.recentSubscribers.slice(0, 12).map((subscriber) => (
+                      <div key={subscriber.subscriptionId}>
+                        <span className="youtube-subscriber-avatar" aria-hidden="true">{subscriber.subscriberName.slice(0, 1).toUpperCase()}</span>
+                        <span><strong>{subscriber.subscriberName}</strong><small>{formatEventTime(subscriber.subscribedAt || subscriber.detectedAt)}</small></span>
+                      </div>
+                    )) : <p>API ще не повернув публічних recent subscribers.</p>}
+                  </div>
+                  <p className="youtube-panel-note">YouTube може повертати лише обмежену кількість публічних підписників. Агрегований приріст вище є повнішим показником.</p>
+                </section>
+
+                <section className="youtube-quota-card">
+                  <div className="youtube-card-heading">
+                    <div><span>API квота</span><strong>{youtube.quota.used.toLocaleString("uk-UA")} / {youtube.quota.limit.toLocaleString("uk-UA")}</strong></div>
                     <span>{Math.max(0, Math.round((youtube.quota.remaining / youtube.quota.limit) * 100))}% вільно</span>
                   </div>
-                  <div className="youtube-quota-track" aria-hidden="true">
-                    <span style={{ width: `${Math.min(100, (youtube.quota.used / youtube.quota.limit) * 100)}%` }} />
-                  </div>
-                  <p>Polling розподілено так, щоб залишатися нижче стандартного ліміту 10 000 одиниць на добу.</p>
-                </div>
-
-                <div className="youtube-quota-card youtube-analytics-card">
-                  <div className="youtube-card-heading">
-                    <div>
-                      <span>YouTube Analytics</span>
-                      <strong>{youtube.analytics?.available ? `${Math.round(youtube.analytics.estimatedMinutesWatched || 0).toLocaleString("uk-UA")} хв перегляду` : "Очікує доступу"}</strong>
-                    </div>
-                    <span>{youtube.analytics?.updatedAt ? formatEventTime(youtube.analytics.updatedAt) : `кожні ${youtube.polling.analyticsMinutes} хв`}</span>
-                  </div>
-                  <p>{youtube.analytics?.reconnectRequired
-                    ? "Щоб увімкнути Analytics, один раз перепідключіть YouTube у профілі для нового read-only дозволу."
-                    : `Середній перегляд: ${formatMediaTime((youtube.analytics?.averageViewDurationSeconds || 0) * 1_000)}.`}</p>
-                </div>
+                  <div className="youtube-quota-track" aria-hidden="true"><span style={{ width: `${Math.min(100, (youtube.quota.used / youtube.quota.limit) * 100)}%` }} /></div>
+                  <p>Recent subscribers використовує один deduplicated polling-запит кожні {youtube.polling.recentSubscribersMinutes} хв.</p>
+                </section>
               </div>
+
+              <section className="youtube-video-stats" aria-labelledby="youtube-video-stats-title">
+                <div className="youtube-section-heading">
+                  <div><span>Внутрішній розрахунок StreamLab</span><h3 id="youtube-video-stats-title">Статистика за відео</h3></div>
+                  <span>{youtube.videoStats.length}</span>
+                </div>
+                {youtube.videoStats.length ? (
+                  <div className="youtube-video-stats-scroll">
+                    <table>
+                      <thead><tr><th>Відео</th><th>Запуски</th><th>Start avg</th><th>End avg</th><th>Δ аудиторії</th><th>Локальний пік</th><th>Watch interval</th><th>Промо</th><th>Помилки</th></tr></thead>
+                      <tbody>{youtube.videoStats.map((item) => (
+                        <tr key={item.videoId}>
+                          <td>{item.videoName}</td>
+                          <td>{item.playCount}</td>
+                          <td>{formatMetric(item.averageStartViewers, "", 1)}</td>
+                          <td>{formatMetric(item.averageEndViewers, "", 1)}</td>
+                          <td className={item.audienceChange < 0 ? "youtube-negative" : "youtube-positive"}>{item.audienceChange >= 0 ? "+" : ""}{formatMetric(item.audienceChange, "", 1)}</td>
+                          <td>{item.localPeakViewers}</td>
+                          <td>{formatMediaTime(item.averageWatchIntervalSeconds * 1_000)}</td>
+                          <td>{item.promoIds.length}</td>
+                          <td>{item.playbackErrors}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                ) : <p className="youtube-panel-note">Статистика з’явиться після накопичення snapshots під час відтворення локальних відео.</p>}
+                <p className="youtube-panel-note">Цей розподіл корелює локальну timeline зі snapshots глядачів і не є офіційною метрикою YouTube.</p>
+              </section>
 
               {youtube.stream?.configurationIssues.length ? (
                 <div className="youtube-issues" role="status">

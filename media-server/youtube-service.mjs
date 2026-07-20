@@ -9,12 +9,14 @@ const OAUTH_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
 const OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/youtube.readonly",
   "https://www.googleapis.com/auth/yt-analytics.readonly",
+  "https://www.googleapis.com/auth/yt-analytics-monetary.readonly",
 ];
 const DEFAULT_POLL_INTERVALS = Object.freeze({
   metrics: 30_000,
   stream: 45_000,
   broadcasts: 60_000,
   channel: 10 * 60_000,
+  subscribers: 5 * 60_000,
   analytics: 60 * 60_000,
   dailyReport: 24 * 60 * 60_000,
 });
@@ -61,6 +63,44 @@ function publicBroadcast(item) {
   };
 }
 
+function analyticsRows(body) {
+  const headers = (body?.columnHeaders || []).map((header) => header.name);
+  return (body?.rows || []).map((row) => Object.fromEntries(
+    headers.map((header, index) => [header, row[index]]),
+  ));
+}
+
+function analyticsNumber(row, name) {
+  const value = Number(row?.[name]);
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function subscriberFromResource(item) {
+  const subscriber = item?.subscriberSnippet || {};
+  const snippet = item?.snippet || {};
+  const channelId = subscriber.channelId || snippet.resourceId?.channelId || "";
+  if (typeof item?.id !== "string" || !item.id || !channelId) return null;
+  return {
+    subscriptionId: item.id,
+    subscriberChannelId: channelId,
+    subscriberName: subscriber.title || snippet.title || "Невідомий підписник",
+    thumbnailUrl:
+      subscriber.thumbnails?.high?.url ||
+      subscriber.thumbnails?.medium?.url ||
+      subscriber.thumbnails?.default?.url ||
+      snippet.thumbnails?.high?.url ||
+      snippet.thumbnails?.default?.url ||
+      null,
+    subscribedAt: snippet.publishedAt || null,
+    telegramSentAt: null,
+  };
+}
+
+function csvCell(value) {
+  const text = Array.isArray(value) ? value.join("|") : String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
 function emptyRuntime() {
   return {
     channel: null,
@@ -69,8 +109,11 @@ function emptyRuntime() {
     stream: null,
     metrics: null,
     analytics: null,
+    analyticsHistory: [],
     dailyReport: null,
     history: [],
+    recentSubscribers: [],
+    videoStats: [],
     lastUpdatedAt: null,
     lastError: null,
   };
@@ -87,6 +130,8 @@ export class YouTubeService {
     fetchImpl = fetch,
     now = () => Date.now(),
     onUpdate = () => {},
+    onSubscriber = () => {},
+    getPlaybackSnapshot = () => null,
     pollIntervals = {},
     logger = console,
   } = {}) {
@@ -100,11 +145,13 @@ export class YouTubeService {
     this.fetchImpl = fetchImpl;
     this.now = now;
     this.onUpdate = onUpdate;
+    this.onSubscriber = onSubscriber;
+    this.getPlaybackSnapshot = getPlaybackSnapshot;
     this.pollIntervals = { ...DEFAULT_POLL_INTERVALS, ...pollIntervals };
     this.logger = logger;
     this.runtime = emptyRuntime();
     this.quota = { date: quotaDate(this.now()), used: 0, updatedAt: null };
-    this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0, analytics: 0, dailyReport: 0 };
+    this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0, subscribers: 0, analytics: 0, dailyReport: 0 };
     this.refreshPromise = null;
     this.tokenRefreshPromise = null;
     this.pollTimer = null;
@@ -128,6 +175,12 @@ export class YouTubeService {
       };
     }
     this.runtime.history = this.statsStore.list({
+      hours: 24,
+      broadcastId: saved.selectedBroadcastId,
+    });
+    this.runtime.recentSubscribers = this.statsStore.listSubscribers();
+    this.runtime.analyticsHistory = this.statsStore.listAnalyticsHistory();
+    this.runtime.videoStats = this.statsStore.videoStatistics({
       hours: 24,
       broadcastId: saved.selectedBroadcastId,
     });
@@ -188,6 +241,7 @@ export class YouTubeService {
       stream: this.runtime.stream,
       metrics: this.runtime.metrics,
       analytics: this.runtime.analytics,
+      analyticsHistory: this.runtime.analyticsHistory,
       dailyReport: this.runtime.dailyReport,
       lastUpdatedAt: this.runtime.lastUpdatedAt,
       lastError: this.runtime.lastError,
@@ -258,7 +312,7 @@ export class YouTubeService {
     });
     this.runtime = emptyRuntime();
     await this.store.setRuntimeCache(null);
-    this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0, analytics: 0, dailyReport: 0 };
+    this.lastPoll = { channel: 0, broadcasts: 0, stream: 0, metrics: 0, subscribers: 0, analytics: 0, dailyReport: 0 };
     return this.snapshot();
   }
 
@@ -481,6 +535,8 @@ export class YouTubeService {
       : null;
     this.lastPoll.metrics = this.now();
     if (this.runtime.metrics) {
+      const playback = this.getPlaybackSnapshot?.() || {};
+      const output = playback.outputMetrics || {};
       await this.statsStore.append({
         capturedAt: new Date(this.now()).toISOString(),
         broadcastId: videoId,
@@ -488,14 +544,50 @@ export class YouTubeService {
         views: this.runtime.metrics.views,
         likes: this.runtime.metrics.likes,
         health: this.runtime.stream?.healthStatus || "noData",
+        subscriberCount: this.runtime.channel?.subscribers ?? null,
+        videoId: playback.videoId || null,
+        videoName: playback.videoName || null,
+        queueItemId: playback.queueItemId || null,
+        positionMs: playback.positionMs || 0,
+        bitrateKbps: output.bitrateKbps ?? playback.videoBitrateKbps ?? 0,
+        fps: output.fps ?? 0,
+        droppedFrames: output.droppedFrames ?? 0,
+        cpuPercent: playback.cpuPercent ?? 0,
+        memoryPercent: playback.memoryPercent ?? 0,
+        networkOutputBytesPerSecond: playback.networkOutputBytesPerSecond ?? 0,
+        promoImpressions: playback.promoImpressions ?? 0,
+        streamStatus: playback.status || "STOPPED",
+        playbackError: playback.status === "ERROR",
+        activePromoIds: playback.activePromoIds || [],
       });
       this.runtime.history = this.statsStore.list({ hours: 24, broadcastId: videoId });
+      this.runtime.videoStats = this.statsStore.videoStatistics({ hours: 24, broadcastId: videoId });
     }
   }
 
   hasAnalyticsScope() {
     const scope = this.store?.read().tokens?.scope || "";
     return scope.split(/\s+/).includes("https://www.googleapis.com/auth/yt-analytics.readonly");
+  }
+
+  hasMonetaryAnalyticsScope() {
+    const scope = this.store?.read().tokens?.scope || "";
+    return scope.split(/\s+/).includes("https://www.googleapis.com/auth/yt-analytics-monetary.readonly");
+  }
+
+  async refreshSubscribers() {
+    const body = await this.googleApi("subscriptions", {
+      part: "id,snippet,subscriberSnippet",
+      myRecentSubscribers: "true",
+      maxResults: "50",
+    });
+    const subscribers = (body.items || []).map(subscriberFromResource).filter(Boolean);
+    const result = await this.statsStore.mergeSubscribers(subscribers, {
+      detectedAt: new Date(this.now()).toISOString(),
+    });
+    this.runtime.recentSubscribers = result.subscribers;
+    this.lastPoll.subscribers = this.now();
+    for (const subscriber of result.added) await this.onSubscriber(subscriber);
   }
 
   async refreshAnalytics() {
@@ -509,28 +601,95 @@ export class YouTubeService {
       return;
     }
     const endDate = new Date(this.now()).toISOString().slice(0, 10);
-    const startDate = new Date(this.now() - 24 * 60 * 60_000).toISOString().slice(0, 10);
-    const body = await this.googleApi("reports", {
+    const startDate = new Date(this.now() - 30 * 24 * 60 * 60_000).toISOString().slice(0, 10);
+    const coreMetrics = "views,estimatedMinutesWatched,averageViewDuration,likes,subscribersGained,subscribersLost";
+    const summaryBody = await this.googleApi("reports", {
       ids: "channel==MINE",
       startDate,
       endDate,
-      metrics: "views,estimatedMinutesWatched,averageViewDuration,likes,subscribersGained,subscribersLost",
+      metrics: coreMetrics,
     }, { root: YOUTUBE_ANALYTICS_ROOT });
-    const headers = (body.columnHeaders || []).map((header) => header.name);
-    const row = body.rows?.[0] || [];
-    const value = (name) => {
-      const index = headers.indexOf(name);
-      return index >= 0 ? Number(row[index]) || 0 : 0;
-    };
+    const summary = analyticsRows(summaryBody)[0] || {};
+    const dailyBody = await this.googleApi("reports", {
+      ids: "channel==MINE",
+      startDate,
+      endDate,
+      metrics: coreMetrics,
+      dimensions: "day",
+      sort: "day",
+    }, { root: YOUTUBE_ANALYTICS_ROOT });
+    let averageConcurrentViewers = null;
+    let peakConcurrentViewers = null;
+    let concurrentAvailable = false;
+    let concurrentError = null;
+    const broadcastId = this.runtime.selected?.id;
+    if (broadcastId) {
+      try {
+        const concurrentBody = await this.googleApi("reports", {
+          ids: "channel==MINE",
+          startDate,
+          endDate,
+          metrics: "averageConcurrentViewers,peakConcurrentViewers",
+          filters: `video==${broadcastId}`,
+        }, { root: YOUTUBE_ANALYTICS_ROOT });
+        const concurrent = analyticsRows(concurrentBody)[0] || {};
+        averageConcurrentViewers = analyticsNumber(concurrent, "averageConcurrentViewers");
+        peakConcurrentViewers = analyticsNumber(concurrent, "peakConcurrentViewers");
+        concurrentAvailable = Boolean(concurrentBody.rows?.length);
+      } catch (error) {
+        concurrentError = error instanceof Error ? error.message : "Concurrent viewers ще недоступні.";
+      }
+    }
+    let estimatedRevenue = null;
+    let revenueAvailable = false;
+    let revenueError = null;
+    const monetaryScope = this.hasMonetaryAnalyticsScope();
+    if (monetaryScope) {
+      try {
+        const revenueBody = await this.googleApi("reports", {
+          ids: "channel==MINE",
+          startDate,
+          endDate,
+          metrics: "estimatedRevenue",
+          currency: "USD",
+        }, { root: YOUTUBE_ANALYTICS_ROOT });
+        const revenue = analyticsRows(revenueBody)[0] || {};
+        estimatedRevenue = analyticsNumber(revenue, "estimatedRevenue");
+        revenueAvailable = Boolean(revenueBody.rows?.length);
+      } catch (error) {
+        revenueError = error instanceof Error ? error.message : "Revenue недоступний.";
+      }
+    }
+    const history = analyticsRows(dailyBody).map((row) => ({
+      date: row.day,
+      views: analyticsNumber(row, "views"),
+      estimatedMinutesWatched: analyticsNumber(row, "estimatedMinutesWatched"),
+      averageViewDurationSeconds: analyticsNumber(row, "averageViewDuration"),
+      likes: analyticsNumber(row, "likes"),
+      subscribersGained: analyticsNumber(row, "subscribersGained"),
+      subscribersLost: analyticsNumber(row, "subscribersLost"),
+      estimatedRevenue: null,
+    }));
+    this.runtime.analyticsHistory = await this.statsStore.replaceAnalyticsHistory(history);
     this.runtime.analytics = {
       available: true,
       reconnectRequired: false,
-      views: value("views"),
-      estimatedMinutesWatched: value("estimatedMinutesWatched"),
-      averageViewDurationSeconds: value("averageViewDuration"),
-      likes: value("likes"),
-      subscribersGained: value("subscribersGained"),
-      subscribersLost: value("subscribersLost"),
+      views: analyticsNumber(summary, "views"),
+      estimatedMinutesWatched: analyticsNumber(summary, "estimatedMinutesWatched"),
+      averageViewDurationSeconds: analyticsNumber(summary, "averageViewDuration"),
+      likes: analyticsNumber(summary, "likes"),
+      subscribersGained: analyticsNumber(summary, "subscribersGained"),
+      subscribersLost: analyticsNumber(summary, "subscribersLost"),
+      netSubscribers: analyticsNumber(summary, "subscribersGained") - analyticsNumber(summary, "subscribersLost"),
+      averageConcurrentViewers,
+      peakConcurrentViewers,
+      concurrentAvailable,
+      concurrentError,
+      estimatedRevenue,
+      revenueCurrency: "USD",
+      revenueAvailable,
+      revenueReconnectRequired: !monetaryScope,
+      revenueError,
       periodStart: startDate,
       periodEnd: endDate,
       updatedAt: new Date(this.now()).toISOString(),
@@ -591,6 +750,7 @@ export class YouTubeService {
       () => this.refreshBroadcasts(),
       () => this.refreshStream(),
       () => this.refreshMetrics(),
+      () => this.refreshSubscribers(),
       () => this.refreshAnalytics(),
       () => this.refreshDailyReport(),
     ]);
@@ -609,6 +769,7 @@ export class YouTubeService {
     schedule("stream", () => this.refreshStream());
     schedule("metrics", () => this.refreshMetrics());
     schedule("channel", () => this.refreshChannel());
+    schedule("subscribers", () => this.refreshSubscribers());
     schedule("analytics", () => this.refreshAnalytics());
     schedule("dailyReport", () => this.refreshDailyReport());
     if (!tasks.length) return Promise.resolve(this.snapshot());
@@ -628,6 +789,8 @@ export class YouTubeService {
     this.runtime.selected = selected;
     this.runtime.stream = null;
     this.runtime.metrics = null;
+    this.runtime.history = this.statsStore.list({ hours: 24, broadcastId });
+    this.runtime.videoStats = this.statsStore.videoStatistics({ hours: 24, broadcastId });
     this.ingestion = null;
     this.lastPoll.stream = 0;
     this.lastPoll.metrics = 0;
@@ -649,9 +812,61 @@ export class YouTubeService {
     return { ...this.ingestion };
   }
 
-  history({ hours = 24 } = {}) {
+  history(options = {}) {
     const selectedId = this.store?.read().selectedBroadcastId || null;
-    return this.statsStore ? this.statsStore.list({ hours, broadcastId: selectedId }) : [];
+    return this.statsStore ? this.statsStore.list({ ...options, broadcastId: selectedId }) : [];
+  }
+
+  videoStatistics(options = {}) {
+    const selectedId = this.store?.read().selectedBroadcastId || null;
+    return this.statsStore ? this.statsStore.videoStatistics({ ...options, broadcastId: selectedId }) : [];
+  }
+
+  subscribers({ limit = 50 } = {}) {
+    return this.statsStore ? this.statsStore.listSubscribers({ limit }) : [];
+  }
+
+  exportStatistics({ format = "json", ...range } = {}) {
+    const data = {
+      generatedAt: new Date(this.now()).toISOString(),
+      broadcastId: this.store?.read().selectedBroadcastId || null,
+      snapshots: this.history({ ...range, limit: 0 }),
+      videoStatistics: this.videoStatistics(range),
+      recentSubscribers: this.subscribers({ limit: 500 }),
+      analytics: this.runtime.analytics ? { ...this.runtime.analytics } : null,
+      analyticsHistory: this.statsStore?.listAnalyticsHistory({ days: 366 }) || [],
+    };
+    if (String(format).toLowerCase() === "json") {
+      return {
+        contentType: "application/json; charset=utf-8",
+        filename: `streamlab-youtube-${new Date(this.now()).toISOString().slice(0, 10)}.json`,
+        body: JSON.stringify(data, null, 2),
+      };
+    }
+    const headers = [
+      "recordType", "capturedAt", "broadcastId", "videoId", "videoName", "viewers", "views", "likes",
+      "subscriberCount", "health", "positionMs", "bitrateKbps", "fps", "droppedFrames", "activePromoIds",
+      "cpuPercent", "memoryPercent", "networkOutputBytesPerSecond", "promoImpressions",
+      "subscriptionId", "subscriberChannelId", "subscriberName", "subscribedAt", "detectedAt",
+      "playCount", "averageStartViewers", "averageEndViewers", "audienceChange", "localPeakViewers",
+      "averageWatchIntervalSeconds", "playbackErrors", "date", "estimatedMinutesWatched",
+      "averageViewDurationSeconds", "subscribersGained", "subscribersLost", "estimatedRevenue",
+    ];
+    const rows = [
+      ...data.snapshots.map((item) => ({ recordType: "snapshot", ...item })),
+      ...data.videoStatistics.map((item) => ({ recordType: "videoStatistics", ...item })),
+      ...data.recentSubscribers.map((item) => ({ recordType: "subscriber", ...item })),
+      ...data.analyticsHistory.map((item) => ({ recordType: "analytics", ...item })),
+    ];
+    const body = [
+      headers.join(","),
+      ...rows.map((row) => headers.map((header) => csvCell(row[header])).join(",")),
+    ].join("\r\n");
+    return {
+      contentType: "text/csv; charset=utf-8",
+      filename: `streamlab-youtube-${new Date(this.now()).toISOString().slice(0, 10)}.csv`,
+      body: `\uFEFF${body}`,
+    };
   }
 
   async disconnect() {
@@ -695,8 +910,11 @@ export class YouTubeService {
         : null,
       metrics: this.runtime.metrics ? { ...this.runtime.metrics } : null,
       analytics: this.runtime.analytics ? { ...this.runtime.analytics } : null,
+      analyticsHistory: this.runtime.analyticsHistory.map((item) => ({ ...item })),
       dailyReport: this.runtime.dailyReport ? { ...this.runtime.dailyReport } : null,
       history: this.runtime.history.map((item) => ({ ...item })),
+      recentSubscribers: this.runtime.recentSubscribers.map((item) => ({ ...item })),
+      videoStats: this.runtime.videoStats.map((item) => ({ ...item })),
       quota: {
         ...this.quota,
         limit: this.dailyQuota,
@@ -708,13 +926,15 @@ export class YouTubeService {
         streamSeconds: Math.round(this.pollIntervals.stream / 1_000),
         broadcastSeconds: Math.round(this.pollIntervals.broadcasts / 1_000),
         subscribersMinutes: Math.round(this.pollIntervals.channel / 60_000),
+        recentSubscribersMinutes: Math.round(this.pollIntervals.subscribers / 60_000),
         analyticsMinutes: Math.round(this.pollIntervals.analytics / 60_000),
         dailyReportHours: Math.round(this.pollIntervals.dailyReport / 3_600_000),
         estimatedDailyUnits:
           Math.round(86_400_000 / this.pollIntervals.metrics) +
           Math.round(86_400_000 / this.pollIntervals.stream) +
           Math.round(86_400_000 / this.pollIntervals.broadcasts) +
-          Math.round(86_400_000 / this.pollIntervals.channel),
+          Math.round(86_400_000 / this.pollIntervals.channel) +
+          Math.round(86_400_000 / this.pollIntervals.subscribers),
       },
       lastUpdatedAt: this.runtime.lastUpdatedAt,
       lastError: this.runtime.lastError,

@@ -238,6 +238,7 @@ export async function createMvpServer({
     });
   const corsOrigins = allowedOrigins.length ? allowedOrigins : DEFAULT_ALLOWED_ORIGINS;
   const ownerAuth = auth ?? createOwnerAuth();
+  let systemMonitor = null;
   const youtubeConfigured = [
     process.env.GOOGLE_OAUTH_CLIENT_ID,
     process.env.GOOGLE_OAUTH_CLIENT_SECRET,
@@ -251,6 +252,39 @@ export async function createMvpServer({
             store: new EncryptedYouTubeStore({ rootDir: dataDir }),
             statsStore: new YouTubeStatsStore({ rootDir: dataDir, repository: stateRepository }),
             onUpdate: (snapshot) => realtimeHub.publish("YOUTUBE_UPDATED", snapshot),
+            onSubscriber: async (subscriber) => {
+              await Promise.all([
+                realtimeHub.publish("SUBSCRIBER_DETECTED", subscriber),
+                auditStore.append({
+                  actor: "system",
+                  action: "SUBSCRIBER_DETECTED",
+                  targetType: "youtube-subscriber",
+                  targetId: subscriber.subscriptionId,
+                  details: {
+                    subscriberChannelId: subscriber.subscriberChannelId,
+                    subscribedAt: subscriber.subscribedAt,
+                    detectedAt: subscriber.detectedAt,
+                  },
+                }),
+              ]);
+            },
+            getPlaybackSnapshot: () => {
+              const snapshot = streamController.snapshot();
+              const promoSnapshot = promoIntegration.snapshot();
+              const activePromo = promoSnapshot.active;
+              const systemSnapshot = systemMonitor?.snapshot?.() || null;
+              return {
+                ...snapshot,
+                activePromoIds: activePromo?.assetId ? [activePromo.assetId] : [],
+                promoImpressions: (promoSnapshot.assets || []).reduce(
+                  (total, asset) => total + (Number(asset.impressions) || 0),
+                  0,
+                ),
+                cpuPercent: systemSnapshot?.cpu?.usagePercent ?? 0,
+                memoryPercent: systemSnapshot?.memory?.usagePercent ?? 0,
+                networkOutputBytesPerSecond: systemSnapshot?.network?.transmittedBytesPerSecond ?? 0,
+              };
+            },
           }
         : {},
     );
@@ -274,7 +308,6 @@ export async function createMvpServer({
   promoIntegration.start?.();
   await mediaProcessor.init?.();
   await youtubeIntegration.init?.();
-  youtubeIntegration.start?.();
   let telegramIntegration = telegram ?? null;
   const monitoringService =
     monitoring ??
@@ -295,7 +328,7 @@ export async function createMvpServer({
   await storageMonitor.snapshot().catch((error) => {
     console.error("StreamLab storage status failed.", error);
   });
-  const systemMonitor = system ?? new SystemMonitor({
+  systemMonitor = system ?? new SystemMonitor({
     storage: storageMonitor,
     onSnapshot: async (snapshot) => {
       await realtimeHub.publish("SYSTEM_METRICS", snapshot);
@@ -305,6 +338,7 @@ export async function createMvpServer({
   });
   await systemMonitor.init?.();
   systemMonitor.start?.();
+  youtubeIntegration.start?.();
   const captureMonitoring = async () => {
     try {
       await monitoringService.capture?.();
@@ -885,9 +919,41 @@ export async function createMvpServer({
       }
 
       if (request.method === "GET" && url.pathname === "/api/youtube/stats") {
+        const range = {
+          hours: url.searchParams.get("hours"),
+          since: url.searchParams.get("from"),
+          until: url.searchParams.get("to"),
+          all: url.searchParams.get("all") === "true",
+        };
         json(response, 200, {
-          stats: youtubeIntegration.history({ hours: url.searchParams.get("hours") }),
+          stats: youtubeIntegration.history(range),
+          videoStats: youtubeIntegration.videoStatistics(range),
         });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/youtube/subscribers") {
+        json(response, 200, {
+          subscribers: youtubeIntegration.subscribers({ limit: url.searchParams.get("limit") }),
+        });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/youtube/stats/export") {
+        const exported = youtubeIntegration.exportStatistics({
+          format: url.searchParams.get("format") || "json",
+          hours: url.searchParams.get("hours"),
+          since: url.searchParams.get("from"),
+          until: url.searchParams.get("to"),
+          all: url.searchParams.get("all") === "true",
+        });
+        response.writeHead(200, {
+          "Content-Type": exported.contentType,
+          "Content-Disposition": `attachment; filename="${exported.filename}"`,
+          "Cache-Control": "private, no-store",
+          "Content-Length": Buffer.byteLength(exported.body),
+        });
+        response.end(exported.body);
         return;
       }
 
