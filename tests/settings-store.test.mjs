@@ -12,11 +12,12 @@ test("persists the selected video bitrate", async (t) => {
   await settings.init();
   assert.equal(settings.snapshot().videoBitrateKbps, 8_000);
 
-  await settings.updateStream({ videoBitrateKbps: 6_500, fallbackVideoId: "video-1" });
+  await settings.updateStream({ videoBitrateKbps: 6_500, fallbackVideoId: "video-1", encoderMode: "GPU" });
   const restored = new SettingsStore({ rootDir: dataDir, defaultVideoBitrate: "10M" });
   await restored.init();
   assert.equal(restored.snapshot().videoBitrateKbps, 6_500);
   assert.equal(restored.snapshot().fallbackVideoId, "video-1");
+  assert.equal(restored.snapshot().encoderMode, "GPU");
   assert.ok(restored.snapshot().updatedAt);
 });
 

@@ -209,6 +209,33 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .dropzone strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .dropzone > span:last-child { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.45; }
 .upload-name-field { margin-top: 14px; margin-bottom: 0; }
+.upload-task-list { display: grid; gap: 12px; margin-top: 14px; }
+.upload-task { padding: 14px; border: 1px solid var(--border); border-radius: 14px; background: rgba(5,8,11,.32); }
+.upload-task--uploading, .upload-task--verifying { border-color: rgba(121,242,164,.28); }
+.upload-task--paused { border-color: rgba(244,201,93,.3); }
+.upload-task--failed { border-color: rgba(255,93,99,.27); }
+.upload-task-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.upload-task-heading strong, .upload-task-heading small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-task-heading > div { min-width: 0; }
+.upload-task-heading strong { font-size: 12px; }
+.upload-task-heading small { margin-top: 4px; color: var(--muted); font: 600 9px ui-monospace, monospace; }
+.upload-task-heading > span { flex: 0 0 auto; padding: 5px 7px; border-radius: 7px; background: rgba(121,242,164,.08); color: var(--green); font: 750 8px ui-monospace, monospace; letter-spacing: .05em; }
+.upload-task--paused .upload-task-heading > span { background: rgba(244,201,93,.08); color: var(--yellow); }
+.upload-task--failed .upload-task-heading > span { background: rgba(255,93,99,.08); color: var(--red); }
+.upload-task-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 13px; }
+.upload-task-fields label > span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 9px; }
+.upload-task-fields input, .upload-task-fields select, .upload-task-fields textarea { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #303842; border-radius: 9px; outline: 0; background: #0d1116; color: var(--text); font: 600 10px ui-monospace, monospace; }
+.upload-task-fields textarea { height: 70px; padding-block: 9px; resize: vertical; }
+.upload-task-fields input:focus, .upload-task-fields select:focus, .upload-task-fields textarea:focus { border-color: rgba(121,242,164,.62); box-shadow: 0 0 0 3px rgba(121,242,164,.06); }
+.upload-task-fields input:disabled, .upload-task-fields select:disabled, .upload-task-fields textarea:disabled { opacity: .62; }
+.upload-task-description { grid-column: 1 / -1; }
+.upload-delete-original { display: flex; align-items: flex-start; gap: 8px; margin-top: 11px; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.upload-delete-original input { margin-top: 1px; accent-color: var(--green); }
+.upload-task-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.upload-task-actions button { min-height: 32px; padding: 0 11px; border: 1px solid #303842; border-radius: 8px; background: #171d24; color: var(--text); font-size: 9px; font-weight: 750; }
+.upload-task-actions button:not(:disabled):hover { border-color: rgba(121,242,164,.38); color: var(--green); }
+.upload-task-actions .upload-task-cancel { border-color: rgba(255,93,99,.2); background: rgba(255,93,99,.04); color: #ff898d; }
+.upload-task-error { margin: 10px 0 0; color: #ff9296; font-size: 9px; line-height: 1.45; }
 
 .progress-block { margin: 16px 0 0; }
 .progress-copy { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 12px; }
@@ -250,6 +277,10 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .video-processing-track span { display: block; height: 100%; border-radius: inherit; background: var(--green); transition: width .2s ease; }
 .video-processing-error { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 9px 0 0 100px; color: #ff9296; font-size: 10px; line-height: 1.4; }
 .video-processing-error button { flex: 0 0 auto; border: 0; background: transparent; color: var(--green); font-family: inherit; font-size: 10px; font-weight: 700; cursor: pointer; }
+.video-verification { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px 12px; margin: 10px 0 1px 100px; padding: 10px; border: 1px solid rgba(121,242,164,.12); border-radius: 9px; background: rgba(121,242,164,.025); }
+.video-verification span { min-width: 0; overflow: hidden; color: #aeb8c3; font: 600 9px ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.video-verification b { display: block; margin-bottom: 4px; color: #6f7b88; font: 700 8px Inter, sans-serif; letter-spacing: .06em; text-transform: uppercase; }
+.video-verification .video-verification-metadata { grid-column: 1 / -1; }
 .video-library-actions { display: flex; align-items: center; flex: 0 0 auto; gap: 7px; }
 .video-add-queue, .video-delete, .video-rename { height: 36px; padding: 0 11px; border-radius: 9px; font-family: inherit; font-size: 10px; font-weight: 750; cursor: pointer; }
 .video-add-queue { min-width: 94px; border: 1px solid rgba(121,242,164,.25); background: rgba(121,242,164,.07); color: var(--green); }
@@ -808,6 +839,9 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
   .video-library-actions { width: 100%; padding-left: 100px; }
   .video-library-actions button { flex: 1; }
   .video-thumbnail-upload { grid-template-columns: 1fr; margin-left: 100px; }
+  .video-verification { grid-template-columns: 1fr 1fr; margin-left: 100px; }
+  .upload-task-fields { grid-template-columns: 1fr; }
+  .upload-task-description { grid-column: auto; }
   .video-thumbnail-button { width: 100%; justify-content: center; }
   .promo-campaign-form { grid-template-columns: 1fr; }
   .promo-campaign-form .field:first-child { grid-column: auto; }

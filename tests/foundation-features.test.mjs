@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,6 +11,10 @@ import { PlaylistStore } from "../media-server/playlist-store.mjs";
 import { SettingsStore } from "../media-server/settings-store.mjs";
 import { StorageMonitor } from "../media-server/storage-monitor.mjs";
 import { VideoStore } from "../media-server/store.mjs";
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
 
 test("resumes an interrupted upload by stable browser fingerprint", async (t) => {
   const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-resume-test-"));
@@ -32,6 +37,73 @@ test("resumes an interrupted upload by stable browser fingerprint", async (t) =>
   assert.equal(store.listActiveUploads().length, 1);
   await store.cancelUpload(created.id);
   assert.equal(store.listActiveUploads().length, 0);
+});
+
+test("writes multiple uploads concurrently and verifies every checksum", async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-parallel-upload-test-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const store = new VideoStore({ rootDir });
+  await store.init();
+  const firstData = Buffer.from("first parallel payload");
+  const secondData = Buffer.from("second parallel payload");
+  const [first, second] = await Promise.all([
+    store.createUpload({ name: "first.mp4", size: firstData.length, checksumSha256: sha256(firstData) }),
+    store.createUpload({ name: "second.mp4", size: secondData.length, checksumSha256: sha256(secondData) }),
+  ]);
+
+  await Promise.all([
+    store.appendChunk(first.id, 0, Readable.from(firstData), { checksumSha256: sha256(firstData) }),
+    store.appendChunk(second.id, 0, Readable.from(secondData), { checksumSha256: sha256(secondData) }),
+  ]);
+  const completed = await Promise.all([store.completeUpload(first.id), store.completeUpload(second.id)]);
+  assert.deepEqual(completed.map((video) => video.integrityVerified), [true, true]);
+  assert.deepEqual(completed.map((video) => video.checksumSha256), [sha256(firstData), sha256(secondData)]);
+});
+
+test("keeps the upload offset unchanged when a chunk checksum is invalid", async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-invalid-checksum-test-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const store = new VideoStore({ rootDir });
+  await store.init();
+  const data = Buffer.from("checksum payload");
+  const upload = await store.createUpload({ name: "checksum.mp4", size: data.length });
+  await assert.rejects(
+    store.appendChunk(upload.id, 0, Readable.from(data), { checksumSha256: "0".repeat(64) }),
+    /Checksum блоку не збігається/,
+  );
+  assert.equal(store.listActiveUploads()[0].uploadedBytes, 0);
+  await store.appendChunk(upload.id, 0, Readable.from(data), { checksumSha256: sha256(data) });
+  assert.equal(store.listActiveUploads()[0].uploadedBytes, data.length);
+});
+
+test("pauses an in-flight chunk before allowing the upload to resume", async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-active-pause-test-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const store = new VideoStore({ rootDir });
+  await store.init();
+  const data = Buffer.from("active chunk payload");
+  const upload = await store.createUpload({ name: "pause.mp4", size: data.length });
+  let markStarted;
+  let releaseChunk;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const release = new Promise((resolve) => { releaseChunk = resolve; });
+  const readable = Readable.from((async function* chunks() {
+    markStarted();
+    yield data.subarray(0, 6);
+    await release;
+    yield data.subarray(6);
+  })());
+  const append = store.appendChunk(upload.id, 0, readable);
+  await started;
+  const pause = store.pauseUpload(upload.id);
+  setTimeout(releaseChunk, 20);
+  await assert.rejects(append, /призупинено/);
+  const paused = await pause;
+  assert.equal(paused.uploadState, "PAUSED");
+  assert.equal(paused.uploadedBytes, 0);
+  await store.resumeUpload(upload.id);
+  await store.appendChunk(upload.id, 0, Readable.from(data), { checksumSha256: sha256(data) });
+  assert.equal(store.listActiveUploads()[0].uploadedBytes, data.length);
 });
 
 test("creates, reorders and restores named playlists", async (t) => {
@@ -57,10 +129,11 @@ test("persists the selected compression profile", async (t) => {
   t.after(() => rm(rootDir, { recursive: true, force: true }));
   const settings = new SettingsStore({ rootDir });
   await settings.init();
-  await settings.updateStream({ compressionProfile: "QUALITY" });
+  await settings.updateStream({ compressionProfile: "QUALITY", encoderMode: "CPU" });
   const restored = new SettingsStore({ rootDir });
   await restored.init();
   assert.equal(restored.snapshot().compressionProfile, "QUALITY");
+  assert.equal(restored.snapshot().encoderMode, "CPU");
   assert.equal(compressionProfile("QUALITY").videoBitrate, "8M");
   assert.equal(listCompressionProfiles().length, 3);
 });

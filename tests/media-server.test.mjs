@@ -162,6 +162,9 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
     videoCodec: "h264",
     audioCodec: "aac",
     audioSampleRate: 44_100,
+    audioChannels: 2,
+    pixelFormat: "yuv420p",
+    sizeBytes: 6,
     bitrate: 2_000_000,
     format: "mov,mp4",
   };
@@ -170,10 +173,20 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
     width: 1920,
     height: 1080,
     fps: 30,
+    audioSampleRate: 48_000,
     bitrate: 8_000_000,
   };
   const processor = new MediaProcessor({
     store,
+    detectEncodersImpl: async () => [],
+    audioAnalysisImpl: async () => ({ audioMeanVolumeDb: -17.8, audioPeakDb: -0.6 }),
+    decodeValidationImpl: async (_filePath, { mode }) => ({
+      status: "PASSED",
+      mode,
+      checkedAt: new Date().toISOString(),
+      segments: [],
+    }),
+    hashFileImpl: async () => "a".repeat(64),
     probeImpl: async (filePath) => filePath.endsWith(".processing.tmp.mp4") ? streamMedia : sourceMedia,
     transcodeImpl: async ({ inputPath, outputPath, onProgress }) => {
       onProgress(50);
@@ -288,16 +301,61 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
       Cookie: session.cookie,
       "X-CSRF-Token": session.csrfToken,
     },
-    body: JSON.stringify({ name: "demo.mp4", size: 6, mimeType: "video/mp4" }),
+    body: JSON.stringify({
+      name: "demo.mp4",
+      size: 6,
+      mimeType: "video/mp4",
+      description: "Night broadcast loop",
+      tags: ["night", "ambient"],
+      musicType: "Ambient",
+      album: "Night Sessions",
+      year: 2026,
+      encoderMode: "CPU",
+      checksumSha256: "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721",
+    }),
   });
   assert.equal(createResponse.status, 201);
   const created = await createResponse.json();
+
+  const encodersResponse = await fetch(`${baseUrl}/api/media/encoders`, {
+    headers: { Cookie: session.cookie },
+  });
+  assert.equal(encodersResponse.status, 200);
+  assert.deepEqual((await encodersResponse.json()).encoders.hardware, []);
+
+  const pauseResponse = await fetch(`${baseUrl}/api/uploads/${created.upload.id}/pause`, {
+    method: "POST",
+    headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+  });
+  assert.equal(pauseResponse.status, 200);
+  assert.equal((await pauseResponse.json()).upload.uploadState, "PAUSED");
+
+  const pausedChunk = await fetch(
+    `${baseUrl}/api/uploads/${created.upload.id}/chunks?offset=0`,
+    {
+      method: "PUT",
+      headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+      body: Buffer.from("abc"),
+    },
+  );
+  assert.equal(pausedChunk.status, 409);
+
+  const resumeResponse = await fetch(`${baseUrl}/api/uploads/${created.upload.id}/resume`, {
+    method: "POST",
+    headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+  });
+  assert.equal(resumeResponse.status, 200);
+  assert.equal((await resumeResponse.json()).upload.uploadState, "ACTIVE");
 
   const firstChunk = await fetch(
     `${baseUrl}/api/uploads/${created.upload.id}/chunks?offset=0`,
     {
       method: "PUT",
-      headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+      headers: {
+        Cookie: session.cookie,
+        "X-CSRF-Token": session.csrfToken,
+        "X-Chunk-SHA256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+      },
       body: Buffer.from("abc"),
     },
   );
@@ -307,7 +365,11 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
     `${baseUrl}/api/uploads/${created.upload.id}/chunks?offset=3`,
     {
       method: "PUT",
-      headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+      headers: {
+        Cookie: session.cookie,
+        "X-CSRF-Token": session.csrfToken,
+        "X-Chunk-SHA256": "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34",
+      },
       body: Buffer.from("def"),
     },
   );
@@ -323,6 +385,8 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(completeResponse.status, 202);
   const processingVideo = await completeResponse.json();
   assert.equal(processingVideo.video.status, "ANALYZING");
+  assert.equal(processingVideo.video.integrityVerified, true);
+  assert.equal(processingVideo.video.checksumSha256, "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721");
   await processor.waitForIdle();
 
   const videosResponse = await fetch(`${baseUrl}/api/videos`, {
@@ -335,6 +399,18 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   assert.equal(videos.videos[0].processingProgress, 100);
   assert.equal(videos.videos[0].media.width, 1920);
   assert.equal(videos.videos[0].preparedSize, 6);
+  assert.equal(videos.videos[0].description, "Night broadcast loop");
+  assert.deepEqual(videos.videos[0].tags, ["night", "ambient"]);
+  assert.equal(videos.videos[0].musicType, "Ambient");
+  assert.equal(videos.videos[0].album, "Night Sessions");
+  assert.equal(videos.videos[0].year, 2026);
+  assert.equal(videos.videos[0].encoder, "CPU · libx264");
+  assert.equal(videos.videos[0].validation.mode, "FULL");
+  assert.equal(videos.videos[0].preparedChecksumSha256, "a".repeat(64));
+  assert.equal(videos.videos[0].sourceMedia.audioMeanVolumeDb, -17.8);
+  assert.equal(videos.videos[0].sourceMedia.audioPeakDb, -0.6);
+  assert.equal(videos.videos[0].sourceMedia.decodeValidation.mode, "SAMPLE");
+  assert.equal(videos.videos[0].sourceMedia.corruptionDetected, false);
   assert.ok((await readdir(path.join(dataDir, "uploads"))).every((name) => !name.includes(".source.")));
 
   const renameResponse = await fetch(`${baseUrl}/api/videos/${created.upload.id}`, {
@@ -405,6 +481,7 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
   const defaultSettings = (await settingsResponse.json()).settings;
   assert.equal(defaultSettings.videoBitrateKbps, 8_000);
   assert.equal(defaultSettings.fallbackVideoId, null);
+  assert.equal(defaultSettings.encoderMode, "AUTO");
 
   const updateSettingsResponse = await fetch(`${baseUrl}/api/settings/stream`, {
     method: "PATCH",
@@ -416,9 +493,11 @@ test("uploads a video in chunks and starts the queue stream", async (t) => {
     body: JSON.stringify({
       videoBitrateKbps: 7_500,
       fallbackVideoId: created.upload.id,
+      encoderMode: "CPU",
     }),
   });
   assert.equal(updateSettingsResponse.status, 200);
+  assert.equal((await updateSettingsResponse.json()).settings.encoderMode, "CPU");
 
   const startResponse = await fetch(`${baseUrl}/api/stream/start`, {
     method: "POST",

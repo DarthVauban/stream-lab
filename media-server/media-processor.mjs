@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { ApiError } from "./api-error.mjs";
 import { compressionProfile } from "./compression-profiles.mjs";
 import { convertImageToWebp } from "./image-processor.mjs";
+import { hashFileSha256 } from "./store.mjs";
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024 * 1024;
 const ALLOWED_PRESETS = new Set([
@@ -13,6 +14,17 @@ const ALLOWED_PRESETS = new Set([
   "medium",
   "slow",
 ]);
+const HARDWARE_ENCODERS = Object.freeze([
+  { id: "NVIDIA_NVENC", codec: "h264_nvenc", label: "NVIDIA NVENC" },
+  { id: "INTEL_QSV", codec: "h264_qsv", label: "Intel Quick Sync" },
+  { id: "AMD_AMF", codec: "h264_amf", label: "AMD AMF" },
+  { id: "APPLE_VIDEOTOOLBOX", codec: "h264_videotoolbox", label: "Apple VideoToolbox" },
+]);
+
+export function normalizeEncoderMode(value, fallback = "AUTO") {
+  const mode = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return ["AUTO", "CPU", "GPU"].includes(mode) ? mode : fallback;
+}
 
 class MediaProcessingError extends Error {
   constructor(message, publicMessage = message) {
@@ -109,11 +121,178 @@ export function parseProbeResult(payload) {
     height: Number(video.height) || null,
     fps: parseRate(video.avg_frame_rate || video.r_frame_rate),
     videoCodec: video.codec_name || null,
+    videoBitrate: finiteNumber(video.bit_rate),
     audioCodec: audio.codec_name || null,
+    audioBitrate: finiteNumber(audio.bit_rate),
     audioSampleRate: finiteNumber(audio.sample_rate),
+    audioChannels: finiteNumber(audio.channels),
+    audioChannelLayout: audio.channel_layout || null,
+    pixelFormat: video.pix_fmt || null,
+    fieldOrder: video.field_order || null,
+    progressive: !video.field_order || ["progressive", "unknown"].includes(video.field_order),
+    rotation: finiteNumber(
+      Math.abs(Number(video.tags?.rotate)) ||
+      Math.abs(Number(video.side_data_list?.find((item) => Number.isFinite(Number(item.rotation)))?.rotation)),
+    ) ?? 0,
+    colorSpace: video.color_space || null,
+    colorPrimaries: video.color_primaries || null,
+    colorTransfer: video.color_transfer || null,
+    sizeBytes: finiteNumber(payload?.format?.size),
     bitrate: finiteNumber(payload?.format?.bit_rate),
     format: payload?.format?.format_name || null,
   };
+}
+
+export function parseVolumeDetect(output) {
+  const meanMatch = String(output).match(/mean_volume:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB/i);
+  const peakMatch = String(output).match(/max_volume:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB/i);
+  const number = (match) => {
+    if (!match) return null;
+    if (match[1].toLowerCase().includes("inf")) return Number.NEGATIVE_INFINITY;
+    const value = Number(match[1]);
+    return Number.isFinite(value) ? value : null;
+  };
+  return { audioMeanVolumeDb: number(meanMatch), audioPeakDb: number(peakMatch) };
+}
+
+export async function analyzeAudioLevels(inputPath, {
+  ffmpegPath = "ffmpeg",
+  spawnImpl = spawn,
+  signal,
+} = {}) {
+  const { stderr } = await collectProcess(
+    ffmpegPath,
+    [
+      "-hide_banner",
+      "-nostats",
+      "-i",
+      inputPath,
+      "-map",
+      "0:a:0",
+      "-vn",
+      "-sn",
+      "-dn",
+      "-af",
+      "volumedetect",
+      "-f",
+      "null",
+      "-",
+    ],
+    { spawnImpl, signal },
+  );
+  return parseVolumeDetect(stderr);
+}
+
+export function buildDecodeValidationArgs(inputPath, {
+  startSeconds = null,
+  durationSeconds = null,
+} = {}) {
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-xerror",
+    "-err_detect",
+    "explode",
+    ...(Number.isFinite(startSeconds) ? ["-ss", Math.max(0, startSeconds).toFixed(3)] : []),
+    "-i",
+    inputPath,
+    ...(Number.isFinite(durationSeconds) ? ["-t", Math.max(0.1, durationSeconds).toFixed(3)] : []),
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0",
+    "-sn",
+    "-dn",
+    "-f",
+    "null",
+    "-",
+  ];
+}
+
+function decodeSegments(durationSeconds, segmentSeconds = 5) {
+  const duration = Math.max(0.1, Number(durationSeconds) || 0.1);
+  const length = Math.min(segmentSeconds, duration);
+  const starts = [0, Math.max(0, duration / 2 - length / 2), Math.max(0, duration - length)];
+  return [...new Set(starts.map((value) => Number(value.toFixed(3))))]
+    .map((startSeconds) => ({ startSeconds, durationSeconds: length }));
+}
+
+export async function validateMediaDecode(inputPath, {
+  ffmpegPath = "ffmpeg",
+  durationSeconds = null,
+  mode = "FULL",
+  spawnImpl = spawn,
+  signal,
+} = {}) {
+  const normalizedMode = String(mode).toUpperCase() === "SAMPLE" ? "SAMPLE" : "FULL";
+  const segments = normalizedMode === "SAMPLE"
+    ? decodeSegments(durationSeconds)
+    : [{ startSeconds: null, durationSeconds: null }];
+  for (const segment of segments) {
+    await collectProcess(
+      ffmpegPath,
+      buildDecodeValidationArgs(inputPath, segment),
+      { spawnImpl, signal },
+    );
+  }
+  return {
+    status: "PASSED",
+    mode: normalizedMode,
+    checkedAt: new Date().toISOString(),
+    segments: segments.map((segment) => ({ ...segment })),
+  };
+}
+
+export async function detectHardwareEncoders({
+  ffmpegPath = "ffmpeg",
+  spawnImpl = spawn,
+  signal,
+} = {}) {
+  const available = [];
+  for (const candidate of HARDWARE_ENCODERS) {
+    try {
+      await collectProcess(
+        ffmpegPath,
+        [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-f",
+          "lavfi",
+          "-i",
+          "color=c=black:s=128x128:r=1:d=0.1",
+          "-frames:v",
+          "1",
+          "-an",
+          "-c:v",
+          candidate.codec,
+          "-f",
+          "null",
+          "-",
+        ],
+        { spawnImpl, signal },
+      );
+      available.push({ ...candidate });
+    } catch {
+      // A compiled encoder is only advertised when a real one-frame encode
+      // also succeeds with the GPU/device exposed to this process.
+    }
+  }
+  return available;
+}
+
+export function selectVideoEncoder(mode, available = []) {
+  const normalizedMode = normalizeEncoderMode(mode);
+  if (normalizedMode === "CPU") return { id: "CPU", codec: "libx264", label: "CPU · libx264" };
+  if (available.length) return { ...available[0] };
+  if (normalizedMode === "GPU") {
+    throw new MediaProcessingError(
+      "GPU encoder requested, but no hardware encoder passed the runtime test.",
+      "Обрано GPU, але доступний апаратний H.264 encoder не знайдено.",
+    );
+  }
+  return { id: "CPU", codec: "libx264", label: "CPU · libx264" };
 }
 
 export async function probeMedia(inputPath, {
@@ -145,14 +324,22 @@ export async function probeMedia(inputPath, {
   }
 }
 
-export function validateStreamMedia(media) {
+export function validateStreamMedia(media, { sourceDurationSeconds = null } = {}) {
+  const durationTolerance = sourceDurationSeconds
+    ? Math.max(1, Number(sourceDurationSeconds) * 0.005)
+    : null;
   if (
     media.videoCodec !== "h264" ||
     media.audioCodec !== "aac" ||
     media.width !== 1920 ||
     media.height !== 1080 ||
     !media.fps ||
-    Math.abs(media.fps - 30) > 0.2
+    Math.abs(media.fps - 30) > 0.2 ||
+    media.pixelFormat !== "yuv420p" ||
+    media.audioSampleRate !== 48_000 ||
+    media.audioChannels !== 2 ||
+    !media.sizeBytes ||
+    (durationTolerance !== null && Math.abs(media.durationSeconds - sourceDurationSeconds) > durationTolerance)
   ) {
     throw new MediaProcessingError(
       `Вихідний профіль не пройшов перевірку: ${JSON.stringify(media)}`,
@@ -168,8 +355,20 @@ export function buildTranscodeArgs({
   videoBitrate = "8M",
   audioBitrate = "128k",
   preset = "veryfast",
+  encoder = { id: "CPU", codec: "libx264" },
 }) {
   const safePreset = ALLOWED_PRESETS.has(preset) ? preset : "veryfast";
+  const encoderId = encoder?.id || "CPU";
+  const codec = encoder?.codec || "libx264";
+  const codecArgs = encoderId === "NVIDIA_NVENC"
+    ? ["-c:v", codec, "-preset", "p4", "-rc", "cbr"]
+    : encoderId === "INTEL_QSV"
+      ? ["-c:v", codec, "-preset", "medium"]
+      : encoderId === "AMD_AMF"
+        ? ["-c:v", codec, "-quality", "speed", "-rc", "cbr"]
+        : encoderId === "APPLE_VIDEOTOOLBOX"
+          ? ["-c:v", codec, "-realtime", "0"]
+          : ["-c:v", "libx264", "-preset", safePreset];
   return [
     "-hide_banner",
     "-loglevel",
@@ -187,10 +386,7 @@ export function buildTranscodeArgs({
     "30",
     "-fps_mode",
     "cfr",
-    "-c:v",
-    "libx264",
-    "-preset",
-    safePreset,
+    ...codecArgs,
     "-profile:v",
     "high",
     "-level",
@@ -212,7 +408,7 @@ export function buildTranscodeArgs({
     "-b:a",
     audioBitrate,
     "-ar",
-    "44100",
+    "48000",
     "-ac",
     "2",
     "-movflags",
@@ -294,6 +490,7 @@ export function transcodeMedia({
   videoBitrate = "8M",
   audioBitrate = "128k",
   preset = "veryfast",
+  encoder,
   spawnImpl = spawn,
   signal,
   onProgress = () => {},
@@ -304,6 +501,7 @@ export function transcodeMedia({
     videoBitrate,
     audioBitrate,
     preset,
+    encoder,
   });
 
   return new Promise((resolve, reject) => {
@@ -373,6 +571,10 @@ export class MediaProcessor {
     audioBitrate = process.env.MVP_AUDIO_BITRATE || "128k",
     preset = process.env.MEDIA_TRANSCODE_PRESET || "veryfast",
     keepOriginalUploads = process.env.MEDIA_KEEP_ORIGINAL_UPLOADS === "true",
+    detectEncodersImpl = detectHardwareEncoders,
+    audioAnalysisImpl = analyzeAudioLevels,
+    decodeValidationImpl = validateMediaDecode,
+    hashFileImpl = hashFileSha256,
     probeImpl = probeMedia,
     transcodeImpl = transcodeMedia,
     thumbnailImpl = generateThumbnail,
@@ -388,6 +590,10 @@ export class MediaProcessor {
     this.audioBitrate = audioBitrate;
     this.preset = preset;
     this.keepOriginalUploads = keepOriginalUploads;
+    this.detectEncodersImpl = detectEncodersImpl;
+    this.audioAnalysisImpl = audioAnalysisImpl;
+    this.decodeValidationImpl = decodeValidationImpl;
+    this.hashFileImpl = hashFileImpl;
     this.probeImpl = probeImpl;
     this.transcodeImpl = transcodeImpl;
     this.thumbnailImpl = thumbnailImpl;
@@ -402,9 +608,20 @@ export class MediaProcessor {
     this.idleWaiters = [];
     this.shuttingDown = false;
     this.lastError = null;
+    this.hardwareEncoders = [];
+    this.encoderDetectionError = null;
   }
 
   async init() {
+    try {
+      this.hardwareEncoders = await this.detectEncodersImpl({
+        ffmpegPath: this.ffmpegPath,
+      });
+      this.encoderDetectionError = null;
+    } catch (error) {
+      this.hardwareEncoders = [];
+      this.encoderDetectionError = String(error?.message || error);
+    }
     for (const videoId of this.store.listPendingProcessingIds()) this.enqueue(videoId);
     for (const videoId of this.store.listMissingThumbnailIds?.() || []) this.enqueueThumbnail(videoId);
   }
@@ -497,17 +714,37 @@ export class MediaProcessor {
   }
 
   async processOne(videoId, signal) {
+    const processingStartedAt = Date.now();
     try {
       await this.onEvent("VIDEO_PROCESSING_STARTED", { videoId });
       await this.store.beginAnalysis(videoId);
       const paths = this.store.getProcessingPaths(videoId);
       const profile = compressionProfile(paths.compressionProfile);
-      const sourceMedia = await this.probeImpl(paths.sourcePath, {
+      const probedSourceMedia = await this.probeImpl(paths.sourcePath, {
         ffprobePath: this.ffprobePath,
         signal,
       });
+      const [audioLevels, sourceDecodeValidation] = await Promise.all([
+        this.audioAnalysisImpl(paths.sourcePath, {
+          ffmpegPath: this.ffmpegPath,
+          signal,
+        }),
+        this.decodeValidationImpl(paths.sourcePath, {
+          ffmpegPath: this.ffmpegPath,
+          durationSeconds: probedSourceMedia.durationSeconds,
+          mode: "SAMPLE",
+          signal,
+        }),
+      ]);
+      const sourceMedia = {
+        ...probedSourceMedia,
+        ...audioLevels,
+        corruptionDetected: false,
+        decodeValidation: sourceDecodeValidation,
+      };
       await this.store.beginTranscode(videoId, sourceMedia);
-      await this.transcodeImpl({
+      let encoder = selectVideoEncoder(paths.encoderMode, this.hardwareEncoders);
+      const transcode = () => this.transcodeImpl({
         inputPath: paths.sourcePath,
         outputPath: paths.tempOutputPath,
         durationSeconds: sourceMedia.durationSeconds,
@@ -515,15 +752,40 @@ export class MediaProcessor {
         videoBitrate: profile?.videoBitrate || this.videoBitrate,
         audioBitrate: profile?.audioBitrate || this.audioBitrate,
         preset: profile?.preset || this.preset,
+        encoder,
         signal,
         onProgress: (progress) => void this.store.updateProcessingProgress(videoId, progress),
       });
+      try {
+        await transcode();
+      } catch (error) {
+        if (normalizeEncoderMode(paths.encoderMode) !== "AUTO" || encoder.id === "CPU" || signal.aborted) {
+          throw error;
+        }
+        this.logger.warn?.(`Апаратний encoder ${encoder.label} не зміг обробити ${videoId}; повторюємо через CPU.`);
+        await this.onEvent("VIDEO_ENCODER_FALLBACK", {
+          videoId,
+          failedEncoder: encoder.label,
+          fallbackEncoder: "CPU · libx264",
+        });
+        encoder = selectVideoEncoder("CPU", []);
+        await transcode();
+      }
+      await this.store.beginValidation(videoId, { encoder: encoder.label });
       const streamMedia = validateStreamMedia(
         await this.probeImpl(paths.tempOutputPath, {
           ffprobePath: this.ffprobePath,
           signal,
         }),
+        { sourceDurationSeconds: sourceMedia.durationSeconds },
       );
+      const validation = await this.decodeValidationImpl(paths.tempOutputPath, {
+        ffmpegPath: this.ffmpegPath,
+        durationSeconds: streamMedia.durationSeconds,
+        mode: "FULL",
+        signal,
+      });
+      const preparedChecksumSha256 = await this.hashFileImpl(paths.tempOutputPath);
       await this.thumbnailImpl({
         inputPath: paths.tempOutputPath,
         outputPath: paths.tempThumbnailPath,
@@ -532,9 +794,20 @@ export class MediaProcessor {
         signal,
       });
       await this.store.completeProcessing(videoId, streamMedia, {
-        keepOriginal: this.keepOriginalUploads,
+        keepOriginal: this.keepOriginalUploads || !paths.deleteOriginal,
+        encoder: encoder.label,
+        validation,
+        preparedChecksumSha256,
+        processingResult: {
+          durationSeconds: Number(((Date.now() - processingStartedAt) / 1_000).toFixed(3)),
+          encoder: encoder.label,
+          profile: paths.compressionProfile,
+          sourceSize: sourceMedia.sizeBytes,
+          preparedSize: streamMedia.sizeBytes,
+          warnings: [],
+        },
       });
-      await this.onEvent("VIDEO_READY", { videoId });
+      await this.onEvent("VIDEO_READY", { videoId, encoder: encoder.label });
       this.lastError = null;
     } catch (error) {
       if (this.shuttingDown && (signal.aborted || error?.name === "AbortError")) return;
@@ -613,6 +886,12 @@ export class MediaProcessor {
       activeVideoId: this.activeVideoId,
       queued: this.queue.length,
       lastError: this.lastError,
+      encoders: {
+        modes: ["AUTO", "CPU", "GPU"],
+        cpu: { id: "CPU", codec: "libx264", label: "CPU · libx264" },
+        hardware: this.hardwareEncoders.map((encoder) => ({ ...encoder })),
+        detectionError: this.encoderDetectionError,
+      },
     };
   }
 

@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { createWriteStream } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, open, readFile, readdir, rename, rm, stat, truncate, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Transform } from "node:stream";
@@ -9,6 +9,41 @@ import { normalizeCompressionProfile } from "./compression-profiles.mjs";
 
 const ALLOWED_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".webm", ".m4v"]);
 const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024 * 1024;
+const CHECKSUM_PATTERN = /^[a-f0-9]{64}$/i;
+
+function cleanText(value, maximum = 500) {
+  return typeof value === "string" ? value.trim().slice(0, maximum) : "";
+}
+
+function cleanTags(value) {
+  const tags = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
+  return [...new Set(tags.map((tag) => cleanText(tag, 50)).filter(Boolean))].slice(0, 30);
+}
+
+function cleanYear(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const year = Number(value);
+  const maximum = new Date().getUTCFullYear() + 1;
+  if (!Number.isInteger(year) || year < 1900 || year > maximum) {
+    throw new ApiError(400, "INVALID_VIDEO_YEAR", `Рік має бути від 1900 до ${maximum}.`);
+  }
+  return year;
+}
+
+function normalizeChecksum(value, { required = false } = {}) {
+  const checksum = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!checksum && !required) return null;
+  if (!CHECKSUM_PATTERN.test(checksum)) {
+    throw new ApiError(400, "INVALID_CHECKSUM", "SHA-256 checksum має містити 64 hex-символи.");
+  }
+  return checksum;
+}
+
+export async function hashFileSha256(filePath) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
+}
 
 function defaultThumbnailPosition(durationSeconds) {
   const duration = Number(durationSeconds) || 0;
@@ -33,6 +68,21 @@ function publicRecord(record) {
     processedAt: record.processedAt ?? null,
     media: record.mediaInfo ?? record.sourceMediaInfo ?? null,
     compressionProfile: normalizeCompressionProfile(record.compressionProfile),
+    encoderMode: record.encoderMode || "AUTO",
+    encoder: record.encoder ?? null,
+    uploadState: record.uploadState || (record.status === "UPLOADING" ? "ACTIVE" : null),
+    checksumSha256: record.checksumSha256 ?? null,
+    preparedChecksumSha256: record.preparedChecksumSha256 ?? null,
+    integrityVerified: Boolean(record.integrityVerified),
+    description: record.description || "",
+    tags: [...(record.tags || [])],
+    musicType: record.musicType || "",
+    album: record.album || "",
+    year: record.year ?? null,
+    deleteOriginal: record.deleteOriginal !== false,
+    sourceMedia: record.sourceMediaInfo ?? null,
+    validation: record.validation ? { ...record.validation } : null,
+    processingResult: record.processingResult ? { ...record.processingResult } : null,
     fingerprint: record.fingerprint ?? null,
     thumbnailUrl: record.thumbnailStoredName
       ? `/api/videos/${record.id}/thumbnail?v=${encodeURIComponent(thumbnailVersion)}`
@@ -201,6 +251,20 @@ export class VideoStore {
       thumbnailError: null,
       fingerprint: validated.fingerprint || null,
       compressionProfile: normalizeCompressionProfile(input?.compressionProfile),
+      encoderMode: ["AUTO", "CPU", "GPU"].includes(String(input?.encoderMode || "").toUpperCase())
+        ? String(input.encoderMode).toUpperCase()
+        : "AUTO",
+      uploadState: "ACTIVE",
+      checksumSha256: null,
+      preparedChecksumSha256: null,
+      integrityVerified: false,
+      expectedChecksumSha256: normalizeChecksum(input?.checksumSha256),
+      description: cleanText(input?.description, 2_000),
+      tags: cleanTags(input?.tags),
+      musicType: cleanText(input?.musicType, 100),
+      album: cleanText(input?.album, 200),
+      year: cleanYear(input?.year),
+      deleteOriginal: input?.deleteOriginal !== false,
       processingProgress: 0,
       processingError: null,
       createdAt: now,
@@ -213,7 +277,7 @@ export class VideoStore {
     return publicRecord(record);
   }
 
-  async appendChunk(id, requestedOffset, readable) {
+  async appendChunk(id, requestedOffset, readable, { checksumSha256 = null } = {}) {
     const record = this.requireUpload(id);
     if (record.status !== "UPLOADING") {
       throw new ApiError(409, "UPLOAD_NOT_ACTIVE", "Завантаження вже завершено.");
@@ -224,6 +288,9 @@ export class VideoStore {
         "OFFSET_MISMATCH",
         `Очікуваний offset: ${record.uploadedBytes}.`,
       );
+    }
+    if (record.uploadState === "PAUSED") {
+      throw new ApiError(409, "UPLOAD_PAUSED", "Завантаження призупинено.");
     }
     if (this.activeWrites.has(id)) {
       throw new ApiError(409, "CHUNK_IN_PROGRESS", "Попередній блок ще записується.");
@@ -241,13 +308,20 @@ export class VideoStore {
 
     this.activeWrites.add(id);
     let received = 0;
+    const expectedChunkChecksum = normalizeChecksum(checksumSha256);
+    const chunkHash = createHash("sha256");
     const limiter = new Transform({
       transform: (chunk, _encoding, callback) => {
+        if (record.uploadState === "PAUSED") {
+          callback(new ApiError(409, "UPLOAD_PAUSED", "Завантаження призупинено."));
+          return;
+        }
         received += chunk.length;
         if (requestedOffset + received > record.size) {
           callback(new ApiError(413, "UPLOAD_TOO_LARGE", "Отримано більше байтів, ніж заявлено."));
           return;
         }
+        chunkHash.update(chunk);
         callback(null, chunk);
       },
     });
@@ -260,6 +334,10 @@ export class VideoStore {
       );
       if (received === 0) {
         throw new ApiError(400, "EMPTY_CHUNK", "Порожній блок завантаження.");
+      }
+      const actualChunkChecksum = chunkHash.digest("hex");
+      if (expectedChunkChecksum && actualChunkChecksum !== expectedChunkChecksum) {
+        throw new ApiError(422, "CHUNK_CHECKSUM_MISMATCH", "Checksum блоку не збігається. Повторіть передачу.");
       }
       record.uploadedBytes = requestedOffset + received;
       await this.persist();
@@ -282,9 +360,22 @@ export class VideoStore {
         `Завантажено ${record.uploadedBytes} із ${record.size} байтів.`,
       );
     }
+    if (record.uploadState === "PAUSED") {
+      throw new ApiError(409, "UPLOAD_PAUSED", "Продовжіть завантаження перед завершенням.");
+    }
+
+    const checksumSha256 = await hashFileSha256(this.partialPath(record));
+    if (record.expectedChecksumSha256 && checksumSha256 !== record.expectedChecksumSha256) {
+      record.integrityVerified = false;
+      await this.persist();
+      throw new ApiError(422, "UPLOAD_CHECKSUM_MISMATCH", "Checksum файлу не збігається з очікуваним.");
+    }
 
     await rename(this.partialPath(record), this.sourcePath(record));
     record.status = "ANALYZING";
+    record.uploadState = null;
+    record.checksumSha256 = checksumSha256;
+    record.integrityVerified = true;
     record.completedAt = new Date().toISOString();
     record.processingProgress = 0;
     record.processingError = null;
@@ -299,6 +390,41 @@ export class VideoStore {
     }
     await rm(this.partialPath(record), { force: true });
     this.records.splice(this.records.indexOf(record), 1);
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  async pauseUpload(id) {
+    const record = this.requireUpload(id);
+    if (record.status !== "UPLOADING") {
+      throw new ApiError(409, "UPLOAD_NOT_ACTIVE", "Завантаження вже завершено.");
+    }
+    record.uploadState = "PAUSED";
+    await this.persist();
+    const deadline = Date.now() + 15_000;
+    while (this.activeWrites.has(id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (this.activeWrites.has(id)) {
+      throw new ApiError(409, "UPLOAD_PAUSE_PENDING", "Очікуємо зупинки активного блоку. Спробуйте ще раз.");
+    }
+    const actualSize = await stat(this.partialPath(record)).then((value) => value.size).catch(() => 0);
+    record.uploadedBytes = Math.min(record.size, actualSize);
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  async resumeUpload(id) {
+    const record = this.requireUpload(id);
+    if (record.status !== "UPLOADING") {
+      throw new ApiError(409, "UPLOAD_NOT_ACTIVE", "Завантаження вже завершено.");
+    }
+    if (this.activeWrites.has(id)) {
+      throw new ApiError(409, "UPLOAD_PAUSE_PENDING", "Активний блок ще зупиняється.");
+    }
+    const actualSize = await stat(this.partialPath(record)).then((value) => value.size).catch(() => 0);
+    record.uploadedBytes = Math.min(record.size, actualSize);
+    record.uploadState = "ACTIVE";
     await this.persist();
     return publicRecord(record);
   }
@@ -319,7 +445,7 @@ export class VideoStore {
 
   listPendingProcessingIds() {
     return this.records
-      .filter((record) => ["ANALYZING", "PROCESSING"].includes(record.status))
+      .filter((record) => ["ANALYZING", "PROCESSING", "VALIDATING"].includes(record.status))
       .map((record) => record.id);
   }
 
@@ -331,7 +457,7 @@ export class VideoStore {
 
   async beginAnalysis(id) {
     const record = this.requireUpload(id);
-    if (!["ANALYZING", "PROCESSING"].includes(record.status)) {
+    if (!["ANALYZING", "PROCESSING", "VALIDATING"].includes(record.status)) {
       throw new ApiError(409, "VIDEO_NOT_PROCESSABLE", "Відео не очікує обробки.");
     }
     record.status = "ANALYZING";
@@ -365,9 +491,27 @@ export class VideoStore {
     await this.persist();
   }
 
-  async completeProcessing(id, mediaInfo, { keepOriginal = false } = {}) {
+  async beginValidation(id, { encoder = null } = {}) {
     const record = this.requireUpload(id);
     if (record.status !== "PROCESSING") {
+      throw new ApiError(409, "VIDEO_NOT_PROCESSING", "Відео зараз не обробляється.");
+    }
+    record.status = "VALIDATING";
+    record.processingProgress = 99;
+    record.encoder = encoder;
+    await this.persist();
+    return publicRecord(record);
+  }
+
+  async completeProcessing(id, mediaInfo, {
+    keepOriginal = false,
+    encoder = null,
+    validation = null,
+    processingResult = null,
+    preparedChecksumSha256 = null,
+  } = {}) {
+    const record = this.requireUpload(id);
+    if (!["PROCESSING", "VALIDATING"].includes(record.status)) {
       throw new ApiError(409, "VIDEO_NOT_PROCESSING", "Відео зараз не обробляється.");
     }
     await rm(this.outputPath(record), { force: true }).catch(() => {});
@@ -385,6 +529,10 @@ export class VideoStore {
     record.preparedSize = (await stat(this.outputPath(record))).size;
     record.storedName = record.streamStoredName;
     record.mediaInfo = mediaInfo;
+    record.encoder = encoder;
+    record.validation = validation;
+    record.processingResult = processingResult;
+    record.preparedChecksumSha256 = preparedChecksumSha256;
     record.status = "READY";
     record.processingProgress = 100;
     record.processingError = null;
@@ -436,6 +584,9 @@ export class VideoStore {
       tempThumbnailPath: this.tempThumbnailPath(record),
       thumbnailPath: this.thumbnailPath(record),
       compressionProfile: normalizeCompressionProfile(record.compressionProfile),
+      encoderMode: record.encoderMode || "AUTO",
+      deleteOriginal: record.deleteOriginal !== false,
+      checksumSha256: record.checksumSha256 ?? null,
     };
   }
 
@@ -593,7 +744,7 @@ export class VideoStore {
 
   async deleteVideo(id) {
     const record = this.requireUpload(id);
-    if (this.activeWrites.has(id) || ["UPLOADING", "ANALYZING", "PROCESSING"].includes(record.status)) {
+    if (this.activeWrites.has(id) || ["UPLOADING", "ANALYZING", "PROCESSING", "VALIDATING"].includes(record.status)) {
       throw new ApiError(
         409,
         "VIDEO_BUSY",

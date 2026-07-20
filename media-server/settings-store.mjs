@@ -11,6 +11,11 @@ function parseEnvironmentBitrate(value) {
   return Number.isFinite(numeric) ? Math.round(numeric) : 8_000;
 }
 
+function normalizeEncoderMode(value, fallback = "AUTO") {
+  const mode = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return ["AUTO", "CPU", "GPU"].includes(mode) ? mode : fallback;
+}
+
 export class SettingsStore {
   constructor({
     rootDir,
@@ -27,6 +32,7 @@ export class SettingsStore {
       videoBitrateKbps: normalizeVideoBitrateKbps(parseEnvironmentBitrate(defaultVideoBitrate)),
       fallbackVideoId: null,
       compressionProfile: normalizeCompressionProfile(process.env.MEDIA_COMPRESSION_PROFILE),
+      encoderMode: normalizeEncoderMode(process.env.MEDIA_ENCODER_MODE),
       updatedAt: null,
     };
     this.persistQueue = Promise.resolve();
@@ -57,6 +63,7 @@ export class SettingsStore {
           parsed?.compressionProfile,
           this.state.compressionProfile,
         ),
+        encoderMode: normalizeEncoderMode(parsed?.encoderMode, this.state.encoderMode),
         updatedAt: typeof parsed?.updatedAt === "string" ? parsed.updatedAt : null,
       };
     }
@@ -86,6 +93,7 @@ export class SettingsStore {
     videoBitrateKbps = this.state.videoBitrateKbps,
     fallbackVideoId = this.state.fallbackVideoId,
     compressionProfile = this.state.compressionProfile,
+    encoderMode = this.state.encoderMode,
   }) {
     const bitrate = Number(videoBitrateKbps);
     if (!Number.isInteger(bitrate)) {
@@ -101,6 +109,7 @@ export class SettingsStore {
       compressionProfile,
       this.state.compressionProfile,
     );
+    this.state.encoderMode = normalizeEncoderMode(encoderMode, this.state.encoderMode);
     this.state.updatedAt = new Date().toISOString();
     await this.persist();
     return this.snapshot();

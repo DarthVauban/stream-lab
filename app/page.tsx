@@ -15,6 +15,27 @@ const CHUNK_SIZE = 8 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024 * 1024;
 const ALLOWED_VIDEO_EXTENSIONS = new Set(["mp4", "mov", "mkv", "webm", "m4v"]);
 
+type MediaMetadata = {
+  durationSeconds: number;
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+  videoCodec: string | null;
+  audioCodec: string | null;
+  videoBitrate: number | null;
+  audioBitrate: number | null;
+  audioSampleRate: number | null;
+  audioChannels: number | null;
+  pixelFormat: string | null;
+  rotation: number;
+  format: string | null;
+  sizeBytes: number | null;
+  audioMeanVolumeDb?: number | null;
+  audioPeakDb?: number | null;
+  corruptionDetected?: boolean;
+  decodeValidation?: { status: "PASSED" | "FAILED"; mode: "FULL" | "SAMPLE"; checkedAt: string } | null;
+};
+
 type Video = {
   id: string;
   name: string;
@@ -22,23 +43,36 @@ type Video = {
   size: number;
   preparedSize: number | null;
   uploadedBytes: number;
-  status: "UPLOADING" | "ANALYZING" | "PROCESSING" | "READY" | "FAILED";
+  status: "UPLOADING" | "ANALYZING" | "PROCESSING" | "VALIDATING" | "READY" | "FAILED";
+  uploadState: "ACTIVE" | "PAUSED" | null;
   createdAt: string;
   completedAt: string | null;
   processingProgress: number;
   processingError: string | null;
   processingStartedAt: string | null;
   processedAt: string | null;
-  media: {
-    durationSeconds: number;
-    width: number | null;
-    height: number | null;
-    fps: number | null;
-    videoCodec: string | null;
-    audioCodec: string | null;
-  } | null;
+  media: MediaMetadata | null;
+  sourceMedia: MediaMetadata | null;
   compressionProfile: "ECONOMY" | "STANDARD" | "QUALITY";
   fingerprint: string | null;
+  checksumSha256: string | null;
+  preparedChecksumSha256: string | null;
+  integrityVerified: boolean;
+  description: string;
+  tags: string[];
+  musicType: string;
+  album: string;
+  year: number | null;
+  deleteOriginal: boolean;
+  encoderMode: "AUTO" | "CPU" | "GPU";
+  encoder: string | null;
+  validation: { status: "PASSED" | "FAILED"; mode: "FULL" | "SAMPLE"; checkedAt: string } | null;
+  processingResult: {
+    status: string;
+    durationDifferenceSeconds?: number | null;
+    sourceSize?: number | null;
+    preparedSize?: number | null;
+  } | null;
   thumbnailUrl: string | null;
   thumbnailPositionSeconds: number | null;
   thumbnailUpdatedAt: string | null;
@@ -77,7 +111,38 @@ type StreamSettings = {
   videoBitrateKbps: number;
   fallbackVideoId: string | null;
   compressionProfile: "ECONOMY" | "STANDARD" | "QUALITY";
+  encoderMode: "AUTO" | "CPU" | "GPU";
   updatedAt: string | null;
+};
+
+type EncoderStatus = {
+  modes: Array<"AUTO" | "CPU" | "GPU">;
+  cpu: { id: string; codec: string; label: string };
+  hardware: Array<{ id: string; codec: string; label: string }>;
+  detectionError: string | null;
+};
+
+type UploadTaskStatus = "READY" | "UPLOADING" | "PAUSED" | "VERIFYING" | "COMPLETE" | "FAILED";
+
+type UploadTask = {
+  id: string;
+  file: File;
+  fingerprint: string;
+  uploadId: string | null;
+  status: UploadTaskStatus;
+  uploadedBytes: number;
+  speedBytesPerSecond: number;
+  etaSeconds: number | null;
+  error: string | null;
+  name: string;
+  description: string;
+  tags: string;
+  musicType: string;
+  album: string;
+  year: string;
+  deleteOriginal: boolean;
+  compressionProfile: CompressionProfile["id"];
+  encoderMode: "AUTO" | "CPU" | "GPU";
 };
 
 type CompressionProfile = {
@@ -642,6 +707,7 @@ function formatEventTime(value: string) {
 function videoStatusLabel(video: Video) {
   if (video.status === "ANALYZING") return "аналіз файлу";
   if (video.status === "PROCESSING") return `підготовка ${video.processingProgress}%`;
+  if (video.status === "VALIDATING") return "повна decode-перевірка";
   if (video.status === "FAILED") return "помилка обробки";
   return "готово до ефіру";
 }
@@ -710,12 +776,11 @@ export default function Home() {
   const [fallbackVideoDraft, setFallbackVideoDraft] = useState("");
   const [compressionProfiles, setCompressionProfiles] = useState<CompressionProfile[]>([]);
   const [compressionProfileDraft, setCompressionProfileDraft] = useState<CompressionProfile["id"]>("STANDARD");
+  const [encoderModeDraft, setEncoderModeDraft] = useState<"AUTO" | "CPU" | "GPU">("AUTO");
+  const [encoderStatus, setEncoderStatus] = useState<EncoderStatus | null>(null);
   const [settingsAction, setSettingsAction] = useState(false);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [uploadName, setUploadName] = useState("");
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [uploadSpeedBytesPerSecond, setUploadSpeedBytesPerSecond] = useState(0);
-  const [uploading, setUploading] = useState(false);
+  const [uploadTasks, setUploadTasks] = useState<UploadTask[]>([]);
+  const [uploadBatchAction, setUploadBatchAction] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [processingAction, setProcessingAction] = useState("");
   const [queueAction, setQueueAction] = useState("");
@@ -775,6 +840,11 @@ export default function Home() {
   const [now, setNow] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
+  const uploadControlsRef = useRef(new Map<string, {
+    paused: boolean;
+    cancelled: boolean;
+    controller: AbortController | null;
+  }>());
   const promoDragRef = useRef<{ offsetX: number; offsetY: number; pointerId: number } | null>(null);
 
   const refresh = useCallback(async () => {
@@ -1002,13 +1072,16 @@ export default function Home() {
       api<{ presets: StreamPresetSummary[] }>("/api/stream-presets"),
       api<{ telegram: TelegramStatus }>("/api/telegram/status"),
       api<{ profiles: CompressionProfile[] }>("/api/compression-profiles"),
+      api<{ encoders: EncoderStatus }>("/api/media/encoders"),
     ])
-      .then(([{ settings }, { presets }, { telegram }, { profiles }]) => {
+      .then(([{ settings }, { presets }, { telegram }, { profiles }, { encoders }]) => {
         if (cancelled) return;
         setStreamSettings(settings);
         setBitrateDraft(settings.videoBitrateKbps);
         setFallbackVideoDraft(settings.fallbackVideoId ?? "");
         setCompressionProfileDraft(settings.compressionProfile);
+        setEncoderModeDraft(settings.encoderMode);
+        setEncoderStatus(encoders);
         setStreamPresets(presets);
         setTelegram(telegram);
         setTelegramWebhookUrl(telegram.webhook?.url || `${window.location.origin}/api/telegram/webhook`);
@@ -1291,8 +1364,10 @@ export default function Home() {
       setActiveTab("stream");
       setFailedChannelAvatarUrl("");
       setThumbnailAction("");
-      setUploadName("");
-      setUploadSpeedBytesPerSecond(0);
+      for (const control of uploadControlsRef.current.values()) control.controller?.abort();
+      uploadControlsRef.current.clear();
+      setUploadTasks([]);
+      setUploadBatchAction(false);
       setRenamingVideoId("");
       setVideoNameDraft("");
       setVideoRenameAction("");
@@ -1300,46 +1375,63 @@ export default function Home() {
     }
   }
 
-  function selectFile(file: File | null) {
-    if (file) {
+  function patchUploadTask(taskId: string, patch: Partial<UploadTask>) {
+    setUploadTasks((current) => current.map((task) => task.id === taskId ? { ...task, ...patch } : task));
+  }
+
+  function selectFiles(files: File[]) {
+    const accepted: UploadTask[] = [];
+    const rejected: string[] = [];
+    for (const file of files) {
       const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
       if (!ALLOWED_VIDEO_EXTENSIONS.has(extension)) {
-        setSelectedFile(null);
-        setUploadName("");
-        setUploadProgress(0);
-        setUploadSpeedBytesPerSecond(0);
-        setNotice({ type: "error", text: "Оберіть відео у форматі MP4, MOV, MKV, WEBM або M4V." });
-        if (fileInputRef.current) fileInputRef.current.value = "";
-        return;
+        rejected.push(`${file.name}: непідтримуваний формат`);
+        continue;
       }
       if (file.size <= 0 || file.size > MAX_UPLOAD_BYTES) {
-        setSelectedFile(null);
-        setUploadName("");
-        setUploadProgress(0);
-        setUploadSpeedBytesPerSecond(0);
-        setNotice({ type: "error", text: "Файл має бути непорожнім і не перевищувати 50 ГБ." });
-        if (fileInputRef.current) fileInputRef.current.value = "";
-        return;
+        rejected.push(`${file.name}: файл порожній або перевищує 50 ГБ`);
+        continue;
       }
+      const fingerprint = `${file.name}:${file.size}:${file.lastModified}`;
+      const resumable = activeUploads.find((upload) => upload.fingerprint === fingerprint);
+      accepted.push({
+        id: crypto.randomUUID(),
+        file,
+        fingerprint,
+        uploadId: resumable?.id || null,
+        status: resumable?.uploadState === "PAUSED" ? "PAUSED" : "READY",
+        uploadedBytes: resumable?.uploadedBytes || 0,
+        speedBytesPerSecond: 0,
+        etaSeconds: null,
+        error: null,
+        name: resumable?.name || file.name,
+        description: resumable?.description || "",
+        tags: resumable?.tags.join(", ") || "",
+        musicType: resumable?.musicType || "",
+        album: resumable?.album || "",
+        year: resumable?.year ? String(resumable.year) : "",
+        deleteOriginal: resumable?.deleteOriginal ?? true,
+        compressionProfile: resumable?.compressionProfile || compressionProfileDraft,
+        encoderMode: resumable?.encoderMode || encoderModeDraft,
+      });
     }
-
-    setSelectedFile(file);
-    const fingerprint = file ? `${file.name}:${file.size}:${file.lastModified}` : "";
-    const resumableUpload = activeUploads.find((upload) => upload.fingerprint === fingerprint);
-    setUploadName(file ? resumableUpload?.name || file.name : "");
-    setUploadProgress(0);
-    setUploadSpeedBytesPerSecond(0);
-    setNotice(null);
+    setUploadTasks((current) => {
+      const fingerprints = new Set(current.map((task) => task.fingerprint));
+      return [...current, ...accepted.filter((task) => !fingerprints.has(task.fingerprint))];
+    });
+    setNotice(rejected.length
+      ? { type: "error", text: rejected.slice(0, 3).join(" · ") }
+      : null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
   function handleFile(event: ChangeEvent<HTMLInputElement>) {
-    selectFile(event.target.files?.[0] ?? null);
+    selectFiles(Array.from(event.target.files || []));
   }
 
   function handleDragEnter(event: ReactDragEvent<HTMLLabelElement>) {
     event.preventDefault();
     event.stopPropagation();
-    if (uploading) return;
     dragDepthRef.current += 1;
     setDragActive(true);
   }
@@ -1347,13 +1439,12 @@ export default function Home() {
   function handleDragOver(event: ReactDragEvent<HTMLLabelElement>) {
     event.preventDefault();
     event.stopPropagation();
-    if (!uploading) event.dataTransfer.dropEffect = "copy";
+    event.dataTransfer.dropEffect = "copy";
   }
 
   function handleDragLeave(event: ReactDragEvent<HTMLLabelElement>) {
     event.preventDefault();
     event.stopPropagation();
-    if (uploading) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDragActive(false);
   }
@@ -1363,76 +1454,218 @@ export default function Home() {
     event.stopPropagation();
     dragDepthRef.current = 0;
     setDragActive(false);
-    if (uploading) return;
-    selectFile(event.dataTransfer.files?.[0] ?? null);
+    selectFiles(Array.from(event.dataTransfer.files || []));
   }
 
-  async function uploadVideo() {
-    if (!selectedFile || uploading) return;
-    const resolvedName = normalizeVideoFileName(selectedFile, uploadName);
-    setUploading(true);
-    setNotice(null);
-    setUploadProgress(0);
-    setUploadSpeedBytesPerSecond(0);
+  async function sha256Blob(blob: Blob) {
+    const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function runUploadTask(task: UploadTask) {
+    if (uploadControlsRef.current.has(task.id)) return;
+    const control = { paused: false, cancelled: false, controller: null as AbortController | null };
+    uploadControlsRef.current.set(task.id, control);
+    patchUploadTask(task.id, { status: "UPLOADING", error: null });
     try {
       const created = await api<{ upload: Video }>("/api/uploads", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: resolvedName,
-          size: selectedFile.size,
-          mimeType: selectedFile.type,
-          fingerprint: `${selectedFile.name}:${selectedFile.size}:${selectedFile.lastModified}`,
-          compressionProfile: compressionProfileDraft,
+          name: normalizeVideoFileName(task.file, task.name),
+          size: task.file.size,
+          mimeType: task.file.type,
+          fingerprint: task.fingerprint,
+          compressionProfile: task.compressionProfile,
+          encoderMode: task.encoderMode,
+          description: task.description,
+          tags: task.tags,
+          musicType: task.musicType,
+          album: task.album,
+          year: task.year || null,
+          deleteOriginal: task.deleteOriginal,
         }),
       }, csrfToken);
 
+      const uploadId = created.upload.id;
       let offset = created.upload.uploadedBytes;
       const initialOffset = offset;
       const uploadStartedAt = performance.now();
-      setUploadProgress(Math.round((offset / selectedFile.size) * 100));
-      while (offset < selectedFile.size) {
-        const chunk = selectedFile.slice(offset, Math.min(offset + CHUNK_SIZE, selectedFile.size));
+      patchUploadTask(task.id, { uploadId, uploadedBytes: offset });
+      if (control.cancelled) {
+        await api(`/api/uploads/${uploadId}`, { method: "DELETE" }, csrfToken);
+        return;
+      }
+      if (created.upload.uploadState === "PAUSED") {
+        await api(`/api/uploads/${uploadId}/resume`, { method: "POST" }, csrfToken);
+      }
+      if (control.paused) {
+        await api(`/api/uploads/${uploadId}/pause`, { method: "POST" }, csrfToken);
+        patchUploadTask(task.id, { status: "PAUSED", uploadId, uploadedBytes: offset });
+        return;
+      }
+      while (offset < task.file.size) {
+        if (control.paused || control.cancelled) return;
+        const chunk = task.file.slice(offset, Math.min(offset + CHUNK_SIZE, task.file.size));
+        const checksumSha256 = await sha256Blob(chunk);
+        if (control.paused || control.cancelled) return;
+        control.controller = new AbortController();
         const result = await api<{ upload: Video }>(
-          `/api/uploads/${created.upload.id}/chunks?offset=${offset}`,
-          { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: chunk },
+          `/api/uploads/${uploadId}/chunks?offset=${offset}`,
+          {
+            method: "PUT",
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "X-Chunk-SHA256": checksumSha256,
+            },
+            body: chunk,
+            signal: control.controller.signal,
+          },
           csrfToken,
         );
+        control.controller = null;
         offset = result.upload.uploadedBytes;
         const elapsedSeconds = Math.max(0.001, (performance.now() - uploadStartedAt) / 1_000);
-        setUploadSpeedBytesPerSecond((offset - initialOffset) / elapsedSeconds);
-        setUploadProgress(Math.round((offset / selectedFile.size) * 100));
+        const speedBytesPerSecond = (offset - initialOffset) / elapsedSeconds;
+        patchUploadTask(task.id, {
+          uploadedBytes: offset,
+          speedBytesPerSecond,
+          etaSeconds: speedBytesPerSecond > 0 ? (task.file.size - offset) / speedBytesPerSecond : null,
+        });
       }
 
+      patchUploadTask(task.id, { status: "VERIFYING", uploadedBytes: offset, etaSeconds: null });
       const completed = await api<{ video: Video }>(
-        `/api/uploads/${created.upload.id}/complete`,
+        `/api/uploads/${uploadId}/complete`,
         { method: "POST" },
         csrfToken,
       );
-      setSelectedFile(null);
-      setUploadName("");
-      if (fileInputRef.current) fileInputRef.current.value = "";
-      setUploadProgress(100);
+      patchUploadTask(task.id, {
+        status: "COMPLETE",
+        uploadedBytes: task.file.size,
+        speedBytesPerSecond: 0,
+        etaSeconds: null,
+      });
       setNotice({
         type: "success",
-        text: completed.video.status === "READY"
-          ? "Відео завантажено й готове до трансляції."
-          : "Відео завантажено. Почалася автоматична підготовка до трансляції.",
+        text: `«${completed.video.name}» завантажено, SHA-256 перевірено. Почалася підготовка.`,
       });
       await refresh();
     } catch (error) {
-      setNotice({
-        type: "error",
-        text: error instanceof Error ? error.message : "Не вдалося завантажити відео.",
+      if (control.paused || control.cancelled || (error instanceof DOMException && error.name === "AbortError")) return;
+      patchUploadTask(task.id, {
+        status: "FAILED",
+        speedBytesPerSecond: 0,
+        etaSeconds: null,
+        error: error instanceof Error ? error.message : "Не вдалося завантажити відео.",
       });
     } finally {
-      setUploading(false);
-      setUploadSpeedBytesPerSecond(0);
+      uploadControlsRef.current.delete(task.id);
+    }
+  }
+
+  async function uploadVideo() {
+    if (uploadBatchAction) return;
+    const pending = uploadTasks.filter((task) => ["READY", "FAILED"].includes(task.status));
+    if (!pending.length) return;
+    setUploadBatchAction(true);
+    setNotice(null);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(3, pending.length) }, async () => {
+      while (cursor < pending.length) {
+        const task = pending[cursor];
+        cursor += 1;
+        await runUploadTask(task);
+      }
+    });
+    await Promise.all(workers);
+    setUploadBatchAction(false);
+  }
+
+  async function pauseUploadTask(task: UploadTask) {
+    const control = uploadControlsRef.current.get(task.id);
+    if (control) {
+      control.paused = true;
+      control.controller?.abort();
+    }
+    if (task.uploadId) {
+      try {
+        const result = await api<{ upload: Video }>(
+          `/api/uploads/${task.uploadId}/pause`,
+          { method: "POST" },
+          csrfToken,
+        );
+        patchUploadTask(task.id, {
+          status: "PAUSED",
+          uploadedBytes: result.upload.uploadedBytes,
+          speedBytesPerSecond: 0,
+          etaSeconds: null,
+        });
+        return;
+      } catch (error) {
+        patchUploadTask(task.id, { status: "FAILED", error: error instanceof Error ? error.message : "Не вдалося призупинити upload." });
+        return;
+      }
+    }
+    patchUploadTask(task.id, { status: "PAUSED", speedBytesPerSecond: 0, etaSeconds: null });
+  }
+
+  async function resumeUploadTask(task: UploadTask) {
+    try {
+      let resumedTask = { ...task, status: "READY" as UploadTaskStatus, error: null };
+      if (task.uploadId) {
+        const result = await api<{ upload: Video }>(
+          `/api/uploads/${task.uploadId}/resume`,
+          { method: "POST" },
+          csrfToken,
+        );
+        resumedTask = { ...resumedTask, uploadedBytes: result.upload.uploadedBytes };
+      }
+      patchUploadTask(task.id, resumedTask);
+      await runUploadTask(resumedTask);
+    } catch (error) {
+      patchUploadTask(task.id, {
+        status: "FAILED",
+        error: error instanceof Error ? error.message : "Не вдалося відновити upload.",
+      });
+    }
+  }
+
+  async function cancelUploadTask(task: UploadTask) {
+    const control = uploadControlsRef.current.get(task.id);
+    if (control) {
+      control.cancelled = true;
+      control.controller?.abort();
+    }
+    try {
+      if (task.uploadId) {
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          try {
+            const result = await api<{ uploads: Video[] }>(
+              `/api/uploads/${task.uploadId}`,
+              { method: "DELETE" },
+              csrfToken,
+            );
+            setActiveUploads(result.uploads);
+            break;
+          } catch (error) {
+            if (!(error instanceof ApiRequestError) || error.status !== 409 || attempt === 4) throw error;
+            await new Promise((resolve) => window.setTimeout(resolve, 120));
+          }
+        }
+      }
+      uploadControlsRef.current.delete(task.id);
+      setUploadTasks((current) => current.filter((item) => item.id !== task.id));
+    } catch (error) {
+      patchUploadTask(task.id, {
+        status: "FAILED",
+        error: error instanceof Error ? error.message : "Не вдалося скасувати upload.",
+      });
     }
   }
 
   async function cancelInterruptedUpload(upload: Video) {
-    if (uploading || !window.confirm(`Скасувати завантаження «${upload.name}» і видалити отримані дані?`)) return;
+    if (!window.confirm(`Скасувати завантаження «${upload.name}» і видалити отримані дані?`)) return;
     try {
       const result = await api<{ uploads: Video[] }>(`/api/uploads/${upload.id}`, { method: "DELETE" }, csrfToken);
       setActiveUploads(result.uploads);
@@ -1822,12 +2055,14 @@ export default function Home() {
           videoBitrateKbps: bitrateDraft,
           fallbackVideoId: fallbackVideoDraft || null,
           compressionProfile: compressionProfileDraft,
+          encoderMode: encoderModeDraft,
         }),
       }, csrfToken);
       setStreamSettings(result.settings);
       setBitrateDraft(result.settings.videoBitrateKbps);
       setFallbackVideoDraft(result.settings.fallbackVideoId ?? "");
       setCompressionProfileDraft(result.settings.compressionProfile);
+      setEncoderModeDraft(result.settings.encoderMode);
       if (showNotice) {
         setNotice({ type: "success", text: "Профіль ефіру збережено для наступного запуску." });
       }
@@ -1852,7 +2087,8 @@ export default function Home() {
       if (
         streamSettings?.videoBitrateKbps !== bitrateDraft ||
         (streamSettings?.fallbackVideoId ?? "") !== fallbackVideoDraft ||
-        streamSettings?.compressionProfile !== compressionProfileDraft
+        streamSettings?.compressionProfile !== compressionProfileDraft ||
+        streamSettings?.encoderMode !== encoderModeDraft
       ) {
         const saved = await saveStreamSettings(false);
         if (!saved) return;
@@ -2592,11 +2828,10 @@ export default function Home() {
           </div>
 
           <label className="field compression-profile-field">
-            <span>Профіль підготовки</span>
+            <span>Профіль для нових файлів</span>
             <select
               value={compressionProfileDraft}
               onChange={(event) => setCompressionProfileDraft(event.target.value as CompressionProfile["id"])}
-              disabled={uploading}
             >
               {compressionProfiles.map((profile) => (
                 <option key={profile.id} value={profile.id}>{profile.label} · {profile.videoBitrate}</option>
@@ -2606,19 +2841,18 @@ export default function Home() {
           </label>
 
           <label
-            className={`dropzone ${selectedFile ? "dropzone--selected" : ""} ${dragActive ? "dropzone--dragging" : ""}`}
+            className={`dropzone ${uploadTasks.length ? "dropzone--selected" : ""} ${dragActive ? "dropzone--dragging" : ""}`}
             onDragEnter={handleDragEnter}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
-            aria-disabled={uploading}
           >
             <input
               ref={fileInputRef}
               type="file"
               accept="video/mp4,video/quicktime,video/x-matroska,video/webm,.m4v"
+              multiple
               onChange={handleFile}
-              disabled={uploading}
             />
             <span className="upload-glyph" aria-hidden="true">↑</span>
             {dragActive ? (
@@ -2626,55 +2860,119 @@ export default function Home() {
                 <strong>Відпустіть файл, щоб додати його</strong>
                 <span>Підтримуються MP4, MOV, MKV, WEBM і M4V</span>
               </>
-            ) : selectedFile ? (
+            ) : uploadTasks.length ? (
               <>
-                <strong>{selectedFile.name}</strong>
-                <span>{humanSize(selectedFile.size)}</span>
+                <strong>Вибрано файлів: {uploadTasks.length}</strong>
+                <span>Можна додати ще — до трьох upload-ів виконуються одночасно</span>
               </>
             ) : (
               <>
-                <strong>Перетягніть відео сюди</strong>
-                <span>або натисніть, щоб вибрати MP4, MOV, MKV чи WEBM</span>
+                <strong>Перетягніть одне або декілька відео сюди</strong>
+                <span>або натисніть, щоб вибрати MP4, MOV, MKV, WEBM чи M4V</span>
               </>
             )}
           </label>
 
-          {selectedFile && (
-            <label className="field upload-name-field">
-              <span>Назва відео після завантаження</span>
-              <input
-                value={uploadName}
-                onChange={(event) => setUploadName(event.target.value)}
-                maxLength={255}
-                disabled={uploading}
-                placeholder={selectedFile.name}
-              />
-              <small>Формат файлу буде збережено: {normalizeVideoFileName(selectedFile, uploadName)}</small>
-            </label>
-          )}
+          {uploadTasks.length > 0 && (
+            <div className="upload-task-list">
+              {uploadTasks.map((task) => {
+                const progress = Math.round((task.uploadedBytes / task.file.size) * 100);
+                const locked = !["READY", "FAILED"].includes(task.status) || Boolean(task.uploadId);
+                return (
+                  <article className={`upload-task upload-task--${task.status.toLowerCase()}`} key={task.id}>
+                    <div className="upload-task-heading">
+                      <div>
+                        <strong>{task.file.name}</strong>
+                        <small>{humanSize(task.file.size)} · SHA-256 кожного chunk</small>
+                      </div>
+                      <span>{task.status === "VERIFYING" ? "CHECKSUM" : task.status}</span>
+                    </div>
 
-          {(uploading || uploadProgress > 0) && (
-            <div className="progress-block">
-              <div className="progress-copy">
-                <span>
-                  {uploading ? "Завантаження" : "Готово"}
-                  {uploading && uploadSpeedBytesPerSecond > 0 && <b> · {formatRate(uploadSpeedBytesPerSecond)}</b>}
-                </span>
-                <strong>{uploadProgress}%</strong>
-              </div>
-              <div className="progress-track" role="progressbar" aria-valuenow={uploadProgress} aria-valuemin={0} aria-valuemax={100}>
-                <span style={{ width: `${uploadProgress}%` }} />
-              </div>
+                    <div className="upload-task-fields">
+                      <label>
+                        <span>Назва</span>
+                        <input value={task.name} maxLength={255} disabled={locked} onChange={(event) => patchUploadTask(task.id, { name: event.target.value })} />
+                      </label>
+                      <label>
+                        <span>Тип музики</span>
+                        <input value={task.musicType} maxLength={100} disabled={locked} placeholder="Ambient, Jazz…" onChange={(event) => patchUploadTask(task.id, { musicType: event.target.value })} />
+                      </label>
+                      <label>
+                        <span>Альбом</span>
+                        <input value={task.album} maxLength={200} disabled={locked} onChange={(event) => patchUploadTask(task.id, { album: event.target.value })} />
+                      </label>
+                      <label>
+                        <span>Рік</span>
+                        <input value={task.year} type="number" min={1900} max={new Date().getFullYear() + 1} disabled={locked} onChange={(event) => patchUploadTask(task.id, { year: event.target.value })} />
+                      </label>
+                      <label>
+                        <span>Теги</span>
+                        <input value={task.tags} maxLength={500} disabled={locked} placeholder="ніч, lounge, instrumental" onChange={(event) => patchUploadTask(task.id, { tags: event.target.value })} />
+                      </label>
+                      <label>
+                        <span>Профіль</span>
+                        <select value={task.compressionProfile} disabled={locked} onChange={(event) => patchUploadTask(task.id, { compressionProfile: event.target.value as CompressionProfile["id"] })}>
+                          {compressionProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.label}</option>)}
+                        </select>
+                      </label>
+                      <label>
+                        <span>Encoder</span>
+                        <select value={task.encoderMode} disabled={locked} onChange={(event) => patchUploadTask(task.id, { encoderMode: event.target.value as UploadTask["encoderMode"] })}>
+                          <option value="AUTO">Auto</option>
+                          <option value="CPU">CPU · libx264</option>
+                          <option value="GPU">GPU{encoderStatus?.hardware.length ? ` · ${encoderStatus.hardware[0].label}` : " · недоступний"}</option>
+                        </select>
+                      </label>
+                      <label className="upload-task-description">
+                        <span>Опис</span>
+                        <textarea value={task.description} maxLength={2000} disabled={locked} onChange={(event) => patchUploadTask(task.id, { description: event.target.value })} />
+                      </label>
+                    </div>
+
+                    <label className="upload-delete-original">
+                      <input type="checkbox" checked={task.deleteOriginal} disabled={locked} onChange={(event) => patchUploadTask(task.id, { deleteOriginal: event.target.checked })} />
+                      <span>Видалити оригінал тільки після повної decode-перевірки</span>
+                    </label>
+
+                    <div className="progress-block">
+                      <div className="progress-copy">
+                        <span>
+                          {humanSize(task.uploadedBytes)} з {humanSize(task.file.size)}
+                          {task.speedBytesPerSecond > 0 && <b> · {formatRate(task.speedBytesPerSecond)}</b>}
+                          {task.etaSeconds !== null && <b> · ≈ {formatMediaTime(task.etaSeconds * 1_000)}</b>}
+                        </span>
+                        <strong>{task.status === "VERIFYING" ? "SHA-256" : `${progress}%`}</strong>
+                      </div>
+                      <div className="progress-track" role="progressbar" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}>
+                        <span style={{ width: `${task.status === "COMPLETE" ? 100 : progress}%` }} />
+                      </div>
+                    </div>
+
+                    {task.error && <p className="upload-task-error" role="alert">{task.error}</p>}
+                    <div className="upload-task-actions">
+                      {task.status === "UPLOADING" && <button type="button" onClick={() => void pauseUploadTask(task)}>Пауза</button>}
+                      {task.status === "PAUSED" && <button type="button" onClick={() => void resumeUploadTask(task)}>Продовжити</button>}
+                      {task.status === "FAILED" && <button type="button" onClick={() => void runUploadTask(task)}>Повторити</button>}
+                      {!["VERIFYING", "COMPLETE"].includes(task.status) && (
+                        <button className="upload-task-cancel" type="button" onClick={() => void cancelUploadTask(task)}>Скасувати</button>
+                      )}
+                      {task.status === "COMPLETE" && (
+                        <button type="button" onClick={() => setUploadTasks((current) => current.filter((item) => item.id !== task.id))}>Прибрати</button>
+                      )}
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           )}
 
-          {activeUploads.length > 0 && !uploading && (
+          {activeUploads.length > 0 && (
             <div className="interrupted-uploads" role="status">
               <strong>Незавершені завантаження</strong>
               {activeUploads.map((upload) => (
                 <div key={upload.id}>
                   <span><b>{upload.name}</b><small>{Math.round((upload.uploadedBytes / upload.size) * 100)}% · {humanSize(upload.uploadedBytes)} з {humanSize(upload.size)}</small></span>
-                  <span>Оберіть цей самий файл, щоб продовжити</span>
+                  <span>{upload.uploadState === "PAUSED" ? "На паузі · оберіть той самий файл" : "Оберіть цей самий файл, щоб продовжити"}</span>
                   <button type="button" onClick={() => cancelInterruptedUpload(upload)}>Скасувати</button>
                 </div>
               ))}
@@ -2685,9 +2983,9 @@ export default function Home() {
             className="button button--secondary button--full"
             type="button"
             onClick={uploadVideo}
-            disabled={!selectedFile || uploading || !health}
+            disabled={!uploadTasks.some((task) => ["READY", "FAILED"].includes(task.status)) || uploadBatchAction || !health}
           >
-            {uploading ? "Завантажуємо…" : "Завантажити відео"}
+            {uploadBatchAction ? "Завантажуємо паралельно…" : "Запустити вибрані upload-и"}
           </button>
 
           <div className="video-list-heading">
@@ -2700,7 +2998,8 @@ export default function Home() {
             ) : (
               videos.map((video) => {
                 const ready = video.status === "READY";
-                const processing = ["ANALYZING", "PROCESSING"].includes(video.status);
+                const processing = ["ANALYZING", "PROCESSING", "VALIDATING"].includes(video.status);
+                const analyzedMedia = video.sourceMedia || video.media;
                 return (
                   <div
                     className={`video-row video-row--${video.status.toLowerCase()}`}
@@ -2809,6 +3108,25 @@ export default function Home() {
                         >
                           {processingAction === video.id ? "Запускаємо…" : "Повторити"}
                         </button>
+                      </div>
+                    )}
+                    {ready && (
+                      <div className="video-verification">
+                        <span><b>SHA-256 source</b>{video.checksumSha256 ? `${video.checksumSha256.slice(0, 12)}…` : "—"}</span>
+                        <span><b>SHA-256 stream</b>{video.preparedChecksumSha256 ? `${video.preparedChecksumSha256.slice(0, 12)}…` : "—"}</span>
+                        <span><b>Encoder</b>{video.encoder || "CPU · libx264"}</span>
+                        <span><b>Decode</b>{video.validation?.status === "PASSED" && video.validation.mode === "FULL" ? "FULL · PASSED" : "—"}</span>
+                        <span><b>Контейнер</b>{analyzedMedia?.format || "—"}</span>
+                        <span><b>Джерело</b>{analyzedMedia ? `${formatMetric(analyzedMedia.width)}×${formatMetric(analyzedMedia.height)} · ${formatMetric(analyzedMedia.fps, " FPS", 2)} · rot ${formatMetric(analyzedMedia.rotation, "°")}` : "—"}</span>
+                        <span><b>Video</b>{analyzedMedia ? `${analyzedMedia.videoCodec || "—"} · ${analyzedMedia.pixelFormat || "—"} · ${formatMetric(analyzedMedia.videoBitrate ? analyzedMedia.videoBitrate / 1_000 : null, " Кбіт/с")}` : "—"}</span>
+                        <span><b>Audio</b>{analyzedMedia ? `${analyzedMedia.audioCodec || "—"} · ${formatMetric(analyzedMedia.audioBitrate ? analyzedMedia.audioBitrate / 1_000 : null, " Кбіт/с")} · ${formatMetric(analyzedMedia.audioSampleRate, " Hz")} · ${formatMetric(analyzedMedia.audioChannels, " ch")}` : "—"}</span>
+                        <span><b>Гучність mean / peak</b>{analyzedMedia ? `${formatMetric(analyzedMedia.audioMeanVolumeDb, " dB", 1)} / ${formatMetric(analyzedMedia.audioPeakDb, " dB", 1)}` : "—"}</span>
+                        {(video.description || video.tags.length || video.musicType || video.album || video.year) && (
+                          <span className="video-verification-metadata">
+                            <b>Метадані</b>
+                            {[video.musicType, video.album, video.year, video.tags.join(", ")].filter(Boolean).join(" · ") || video.description}
+                          </span>
+                        )}
                       </div>
                     )}
                     {ready && (
@@ -2975,6 +3293,24 @@ export default function Home() {
               <small>Зміна не перекодовує вже готові файли й застосовується до наступних завантажень.</small>
             </label>
 
+            <label className="field">
+              <span>Encoder для нових відео</span>
+              <select
+                value={encoderModeDraft}
+                onChange={(event) => setEncoderModeDraft(event.target.value as StreamSettings["encoderMode"])}
+                disabled={active || settingsAction}
+              >
+                <option value="AUTO">Auto · GPU з автоматичним fallback на CPU</option>
+                <option value="CPU">CPU · libx264</option>
+                <option value="GPU" disabled={!encoderStatus?.hardware.length}>GPU · апаратне кодування</option>
+              </select>
+              <small>
+                {encoderStatus?.hardware.length
+                  ? `Доступно: ${encoderStatus.hardware.map((encoder) => encoder.label).join(", ")}.`
+                  : "Апаратний H.264 encoder не пройшов runtime-перевірку; Auto використає CPU."}
+              </small>
+            </label>
+
             <div className="bitrate-control">
               <label className="field" htmlFor="video-bitrate">
                 <span>Відеобітрейт</span>
@@ -3006,7 +3342,8 @@ export default function Home() {
                   (
                     streamSettings?.videoBitrateKbps === bitrateDraft &&
                     (streamSettings?.fallbackVideoId ?? "") === fallbackVideoDraft &&
-                    streamSettings?.compressionProfile === compressionProfileDraft
+                    streamSettings?.compressionProfile === compressionProfileDraft &&
+                    streamSettings?.encoderMode === encoderModeDraft
                   )
                 }
               >

@@ -653,9 +653,15 @@ export async function createMvpServer({
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/api/media/encoders") {
+        json(response, 200, { encoders: mediaProcessor.snapshot().encoders });
+        return;
+      }
+
       const activeUploadMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)$/);
       if (request.method === "DELETE" && activeUploadMatch) {
         const upload = await videoStore.cancelUpload(activeUploadMatch[1]);
+        await realtimeHub.publish("UPLOAD_CANCELLED", { uploadId: upload.id });
         json(response, 200, { upload, uploads: videoStore.listActiveUploads() });
         return;
       }
@@ -978,7 +984,7 @@ export async function createMvpServer({
         try {
           const video = videoStore.getVideo(videoId);
           if (!video) throw new ApiError(404, "UPLOAD_NOT_FOUND", "Відео не знайдено.");
-          if (["UPLOADING", "ANALYZING", "PROCESSING"].includes(video.status)) {
+          if (["UPLOADING", "ANALYZING", "PROCESSING", "VALIDATING"].includes(video.status)) {
             throw new ApiError(
               409,
               "VIDEO_BUSY",
@@ -1125,15 +1131,40 @@ export async function createMvpServer({
         const upload = await videoStore.createUpload({
           ...body,
           compressionProfile: body.compressionProfile || settingsStore.snapshot().compressionProfile,
+          encoderMode: body.encoderMode || settingsStore.snapshot().encoderMode,
         });
+        await realtimeHub.publish("UPLOAD_CREATED", { upload });
         json(response, 201, { upload });
+        return;
+      }
+
+      const pauseUploadMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)\/pause$/);
+      if (request.method === "POST" && pauseUploadMatch) {
+        const upload = await videoStore.pauseUpload(pauseUploadMatch[1]);
+        await realtimeHub.publish("UPLOAD_PAUSED", { upload });
+        json(response, 200, { upload });
+        return;
+      }
+
+      const resumeUploadMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)\/resume$/);
+      if (request.method === "POST" && resumeUploadMatch) {
+        const upload = await videoStore.resumeUpload(resumeUploadMatch[1]);
+        await realtimeHub.publish("UPLOAD_RESUMED", { upload });
+        json(response, 200, { upload });
         return;
       }
 
       const chunkMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)\/chunks$/);
       if (request.method === "PUT" && chunkMatch) {
         const offset = Number(url.searchParams.get("offset"));
-        const upload = await videoStore.appendChunk(chunkMatch[1], offset, request);
+        const upload = await videoStore.appendChunk(chunkMatch[1], offset, request, {
+          checksumSha256: request.headers["x-chunk-sha256"],
+        });
+        await realtimeHub.publish("UPLOAD_PROGRESS", {
+          uploadId: upload.id,
+          uploadedBytes: upload.uploadedBytes,
+          size: upload.size,
+        });
         json(response, 200, { upload });
         return;
       }
@@ -1141,7 +1172,8 @@ export async function createMvpServer({
       const completeMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)\/complete$/);
       if (request.method === "POST" && completeMatch) {
         const video = await videoStore.completeUpload(completeMatch[1]);
-        if (["ANALYZING", "PROCESSING"].includes(video.status)) mediaProcessor.enqueue(video.id);
+        if (["ANALYZING", "PROCESSING", "VALIDATING"].includes(video.status)) mediaProcessor.enqueue(video.id);
+        await realtimeHub.publish("UPLOAD_COMPLETED", { videoId: video.id, checksumSha256: video.checksumSha256 });
         json(response, video.status === "READY" ? 200 : 202, { video });
         return;
       }
