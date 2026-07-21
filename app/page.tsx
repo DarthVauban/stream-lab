@@ -961,6 +961,7 @@ export default function Home() {
   const [soakTestAction, setSoakTestAction] = useState("");
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("stream");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [failedChannelAvatarUrl, setFailedChannelAvatarUrl] = useState("");
   const [thumbnailAction, setThumbnailAction] = useState("");
   const [realtimeConnected, setRealtimeConnected] = useState(false);
@@ -1080,6 +1081,25 @@ export default function Home() {
     }, 0);
     return () => window.clearTimeout(restorePreference);
   }, []);
+
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMobileNavOpen(false);
+    };
+    const closeOnDesktop = () => {
+      if (window.innerWidth > 720) setMobileNavOpen(false);
+    };
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("resize", closeOnDesktop);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("resize", closeOnDesktop);
+    };
+  }, [mobileNavOpen]);
 
   useEffect(() => {
     youtubeRangeRef.current = {
@@ -3033,13 +3053,21 @@ export default function Home() {
   }
 
   return (
-    <div className={`dashboard-shell ${sidebarCollapsed ? "dashboard-shell--collapsed" : ""}`}>
-      <aside className="app-sidebar" aria-label="Основна навігація">
+    <div className={`dashboard-shell ${sidebarCollapsed ? "dashboard-shell--collapsed" : ""} ${mobileNavOpen ? "dashboard-shell--mobile-nav-open" : ""}`}>
+      <aside id="app-sidebar" className="app-sidebar" aria-label="Основна навігація">
         <div className="sidebar-header">
           <div className="sidebar-brand" aria-label="StreamLab">
             <span className="brand-mark" aria-hidden="true"><span /></span>
             <span className="sidebar-brand-copy"><strong>StreamLab</strong><small>24/7 Manager</small></span>
           </div>
+          <button
+            className="mobile-sidebar-close"
+            type="button"
+            onClick={() => setMobileNavOpen(false)}
+            aria-label="Закрити навігацію"
+          >
+            ×
+          </button>
           <button
             className="sidebar-toggle"
             type="button"
@@ -3057,7 +3085,10 @@ export default function Home() {
               className={activeTab === item.id ? "sidebar-nav-item sidebar-nav-item--active" : "sidebar-nav-item"}
               key={item.id}
               type="button"
-              onClick={() => setActiveTab(item.id)}
+              onClick={() => {
+                setActiveTab(item.id);
+                setMobileNavOpen(false);
+              }}
               aria-current={activeTab === item.id ? "page" : undefined}
               aria-label={item.label}
               title={sidebarCollapsed ? item.label : undefined}
@@ -3081,7 +3112,10 @@ export default function Home() {
           <button
             className={activeTab === "profile" ? "sidebar-profile sidebar-profile--active" : "sidebar-profile"}
             type="button"
-            onClick={() => setActiveTab("profile")}
+            onClick={() => {
+              setActiveTab("profile");
+              setMobileNavOpen(false);
+            }}
             aria-current={activeTab === "profile" ? "page" : undefined}
             aria-label="Профіль"
             title={sidebarCollapsed ? "Профіль" : undefined}
@@ -3093,12 +3127,37 @@ export default function Home() {
         </div>
       </aside>
 
-      <main className="app-main">
+      {mobileNavOpen && (
+        <button
+          className="mobile-nav-backdrop"
+          type="button"
+          aria-label="Закрити навігацію"
+          onClick={() => setMobileNavOpen(false)}
+        />
+      )}
+
+      <main
+        className="app-main"
+        aria-hidden={mobileNavOpen || undefined}
+        inert={mobileNavOpen || undefined}
+      >
         <header className="page-header">
-          <div className="page-heading">
-            <p className="eyebrow">{pageMeta.eyebrow}</p>
-            <h1>{pageMeta.title}</h1>
-            <p>{pageMeta.description}</p>
+          <div className="page-heading-row">
+            <button
+              className="mobile-nav-toggle"
+              type="button"
+              aria-label={mobileNavOpen ? "Закрити навігацію" : "Відкрити навігацію"}
+              aria-expanded={mobileNavOpen}
+              aria-controls="app-sidebar"
+              onClick={() => setMobileNavOpen((open) => !open)}
+            >
+              <span aria-hidden="true">{mobileNavOpen ? "×" : "☰"}</span>
+            </button>
+            <div className="page-heading">
+              <p className="eyebrow">{pageMeta.eyebrow}</p>
+              <h1>{pageMeta.title}</h1>
+              <p>{pageMeta.description}</p>
+            </div>
           </div>
           <div className="page-status">
             {active && (
