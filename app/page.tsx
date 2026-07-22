@@ -767,8 +767,16 @@ function formatEventTime(value: string) {
 }
 
 function formatChartTime(value: string) {
-  const date = new Date(value);
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
+  const date = new Date(dateOnly ? `${value}T12:00:00.000Z` : value);
   if (!Number.isFinite(date.getTime())) return "—";
+  if (dateOnly) {
+    return date.toLocaleDateString("uk-UA", {
+      day: "2-digit",
+      month: "long",
+      year: "numeric",
+    });
+  }
   return date.toLocaleString("uk-UA", {
     day: "2-digit",
     month: "2-digit",
@@ -827,6 +835,34 @@ function youtubeGraphTooltipDetails(
   if (graphId === "promos") details.push(`Усього показів: ${item.promoImpressions.toLocaleString("uk-UA")}`, `Активні промо: ${item.activePromoIds.length}`);
   if (item.videoName) details.push(`Відео: ${item.videoName}`);
   return details;
+}
+
+function youtubeAnalyticsTooltipDetails(
+  graphId: string,
+  item: YouTubeStatus["analyticsHistory"][number] | undefined,
+) {
+  if (!item) return [];
+  const netSubscribers = item.subscribersGained - item.subscribersLost;
+  if (graphId === "analytics-views") {
+    return [`Watch time: ${formatMetric(item.estimatedMinutesWatched, " хв")}`, `Likes: ${item.likes.toLocaleString("uk-UA")}`];
+  }
+  if (graphId === "analytics-watch-time") {
+    return [`Середній перегляд: ${formatMediaTime(item.averageViewDurationSeconds * 1_000)}`, `Перегляди: ${item.views.toLocaleString("uk-UA")}`];
+  }
+  if (graphId === "analytics-average-view") {
+    return [`Watch time: ${formatMetric(item.estimatedMinutesWatched, " хв")}`, `Перегляди: ${item.views.toLocaleString("uk-UA")}`];
+  }
+  if (graphId === "analytics-likes") return [`Перегляди: ${item.views.toLocaleString("uk-UA")}`];
+  if (graphId === "analytics-subscribers-gained") {
+    return [`Втрачено: −${item.subscribersLost.toLocaleString("uk-UA")}`, `Чистий приріст: ${netSubscribers >= 0 ? "+" : ""}${netSubscribers.toLocaleString("uk-UA")}`];
+  }
+  if (graphId === "analytics-subscribers-lost") {
+    return [`Отримано: +${item.subscribersGained.toLocaleString("uk-UA")}`, `Чистий приріст: ${netSubscribers >= 0 ? "+" : ""}${netSubscribers.toLocaleString("uk-UA")}`];
+  }
+  if (graphId === "analytics-revenue") {
+    return [`Перегляди: ${item.views.toLocaleString("uk-UA")}`, `Watch time: ${formatMetric(item.estimatedMinutesWatched, " хв")}`];
+  }
+  return [`Отримано: +${item.subscribersGained.toLocaleString("uk-UA")}`, `Втрачено: −${item.subscribersLost.toLocaleString("uk-UA")}`];
 }
 
 function videoStatusLabel(video: Video) {
@@ -1323,6 +1359,7 @@ export default function Home() {
     ? Math.min(100, Math.max(0, (stream.positionMs / stream.durationMs) * 100))
     : 0;
   const youtubeChart = youtube?.history ?? [];
+  const youtubeAnalyticsChart = youtube?.analyticsHistory ?? [];
   const firstYoutubeSnapshot = youtubeChart[0] || null;
   const subscriberBaseline = youtubeChart.find((item) => item.subscriberCount !== null)?.subscriberCount ?? 0;
   const promoImpressionBaseline = youtubeChart[0]?.promoImpressions ?? 0;
@@ -1381,6 +1418,60 @@ export default function Home() {
       values: youtubeChart.map((item) => Math.max(0, item.promoImpressions - promoImpressionBaseline)),
       format: (value: number) => `+${Math.round(value).toLocaleString("uk-UA")}`,
     },
+  ].map((series) => ({
+    ...series,
+    maximum: Math.max(1, ...series.values.map((value) => Math.abs(value))),
+    current: series.values.at(-1) || 0,
+  }));
+  const youtubeAnalyticsGraphSeries = [
+    {
+      id: "analytics-views",
+      label: "Перегляди за день",
+      values: youtubeAnalyticsChart.map((item) => item.views),
+      format: (value: number) => Math.round(value).toLocaleString("uk-UA"),
+    },
+    {
+      id: "analytics-watch-time",
+      label: "Watch time за день",
+      values: youtubeAnalyticsChart.map((item) => item.estimatedMinutesWatched),
+      format: (value: number) => `${Math.round(value).toLocaleString("uk-UA")} хв`,
+    },
+    {
+      id: "analytics-average-view",
+      label: "Середній перегляд",
+      values: youtubeAnalyticsChart.map((item) => item.averageViewDurationSeconds),
+      format: (value: number) => formatMediaTime(value * 1_000),
+    },
+    {
+      id: "analytics-likes",
+      label: "Вподобання за день",
+      values: youtubeAnalyticsChart.map((item) => item.likes),
+      format: (value: number) => Math.round(value).toLocaleString("uk-UA"),
+    },
+    {
+      id: "analytics-subscribers-gained",
+      label: "Нові підписники",
+      values: youtubeAnalyticsChart.map((item) => item.subscribersGained),
+      format: (value: number) => `+${Math.round(value).toLocaleString("uk-UA")}`,
+    },
+    {
+      id: "analytics-subscribers-lost",
+      label: "Втрачені підписники",
+      values: youtubeAnalyticsChart.map((item) => item.subscribersLost),
+      format: (value: number) => `−${Math.round(value).toLocaleString("uk-UA")}`,
+    },
+    {
+      id: "analytics-subscribers-net",
+      label: "Чистий приріст",
+      values: youtubeAnalyticsChart.map((item) => item.subscribersGained - item.subscribersLost),
+      format: (value: number) => `${value >= 0 ? "+" : ""}${Math.round(value).toLocaleString("uk-UA")}`,
+    },
+    ...(youtubeAnalyticsChart.some((item) => item.estimatedRevenue !== null) ? [{
+      id: "analytics-revenue",
+      label: "Estimated revenue",
+      values: youtubeAnalyticsChart.map((item) => item.estimatedRevenue ?? 0),
+      format: (value: number) => `${value.toLocaleString("uk-UA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${youtube?.analytics?.revenueCurrency || "USD"}`,
+    }] : []),
   ].map((series) => ({
     ...series,
     maximum: Math.max(1, ...series.values.map((value) => Math.abs(value))),
@@ -4506,6 +4597,36 @@ export default function Home() {
                 {youtube.lastUpdatedAt && <span> Остання синхронізація: {new Date(youtube.lastUpdatedAt).toLocaleString("uk-UA")}.</span>}
               </div>
 
+              <div className="youtube-diagnostics" aria-label="Статус джерел даних YouTube">
+                <article className={`youtube-diagnostic-card youtube-diagnostic-card--${youtube.channel ? "ready" : "warning"}`}>
+                  <span>YouTube Data API v3</span>
+                  <strong>{youtube.channel ? "Канал синхронізовано" : "Очікуємо дані каналу"}</strong>
+                  <small>OAuth 2.0 · окремий API key не потрібний</small>
+                </article>
+                <article className={`youtube-diagnostic-card youtube-diagnostic-card--${youtube.selected ? "ready" : "warning"}`}>
+                  <span>Поточний ефір</span>
+                  <strong>{youtube.selected?.title || "Активний ефір не знайдено"}</strong>
+                  <small>{youtube.selected ? `Статус: ${youtube.selected.lifeCycleStatus}` : "Live-графіки з’являться після вибору трансляції"}</small>
+                </article>
+                <article className={`youtube-diagnostic-card youtube-diagnostic-card--${youtubeChart.length ? "ready" : "warning"}`}>
+                  <span>Live snapshots</span>
+                  <strong>{youtubeChart.length.toLocaleString("uk-UA")} точок</strong>
+                  <small>{youtubeChart.at(-1)?.capturedAt ? `Остання: ${formatChartTime(youtubeChart.at(-1)?.capturedAt || "")}` : "Ще не накопичено жодної точки"}</small>
+                </article>
+                <article className={`youtube-diagnostic-card youtube-diagnostic-card--${youtube.analytics?.available ? "ready" : youtube.analytics?.reconnectRequired ? "error" : "warning"}`}>
+                  <span>YouTube Analytics API</span>
+                  <strong>{youtubeAnalyticsChart.length.toLocaleString("uk-UA")} денних точок</strong>
+                  <small>{youtube.analytics?.reconnectRequired ? "Потрібне повторне OAuth-підключення" : youtube.analytics?.updatedAt ? `Оновлено: ${formatChartTime(youtube.analytics.updatedAt)}` : "Очікуємо першу синхронізацію"}</small>
+                </article>
+              </div>
+
+              {youtube.lastError && (
+                <div className="youtube-api-error" role="alert">
+                  <strong>Не вдалося оновити дані YouTube</strong>
+                  <span>{youtube.lastError}</span>
+                </div>
+              )}
+
               <div className="youtube-stats-toolbar">
                 <div className="youtube-range" aria-label="Період статистики YouTube">
                   {([
@@ -4572,44 +4693,56 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="youtube-graph-grid">
-                {youtubeGraphSeries.map((series) => (
-                  <article className="youtube-chart-card" key={series.id}>
-                    <div className="youtube-card-heading">
-                      <div><span>{series.label}</span><strong>{series.format(series.current)}</strong></div>
-                      <span>max {series.format(series.maximum)}</span>
-                    </div>
-                    {series.values.length > 1 ? (
-                      <div className="youtube-chart" aria-label={`Графік: ${series.label}`}>
-                        {series.values.map((value, index) => {
-                          const snapshot = youtubeChart[index];
-                          const capturedAt = snapshot?.capturedAt || "";
-                          const formattedValue = series.format(value);
-                          return (
-                            <span
-                              className={chartPointClassName("youtube-chart-point", index, series.values.length)}
-                              key={`${series.id}-${capturedAt || index}`}
-                              style={{ height: `${Math.max(4, (Math.abs(value) / series.maximum) * 100)}%` }}
-                              tabIndex={0}
-                              aria-label={`${series.label}: ${formattedValue}. ${formatChartTime(capturedAt)}`}
-                            >
-                              <i
-                                className={`youtube-chart-bar${value < 0 ? " youtube-chart-bar--negative" : ""}`}
-                              />
-                              <ChartTooltip
-                                label={series.label}
-                                value={formattedValue}
-                                capturedAt={capturedAt}
-                                details={youtubeGraphTooltipDetails(series.id, snapshot)}
-                              />
-                            </span>
-                          );
-                        })}
-                      </div>
-                    ) : <p className="youtube-chart-empty">Потрібно щонайменше два snapshots.</p>}
-                  </article>
-                ))}
-              </div>
+              <section className="youtube-chart-section" aria-labelledby="youtube-live-charts-title">
+                <div className="youtube-section-heading">
+                  <div>
+                    <span>Поточна трансляція</span>
+                    <h3 id="youtube-live-charts-title">Live snapshots</h3>
+                  </div>
+                  <span>{youtubeChart.length ? `${youtubeChart.length.toLocaleString("uk-UA")} точок` : `кожні ${youtube.polling.metricsSeconds} с`}</span>
+                </div>
+                {youtubeChart.length ? (
+                  <div className="youtube-graph-grid">
+                    {youtubeGraphSeries.map((series) => (
+                      <article className="youtube-chart-card" key={series.id}>
+                        <div className="youtube-card-heading">
+                          <div><span>{series.label}</span><strong>{series.format(series.current)}</strong></div>
+                          <span>max {series.format(series.maximum)}</span>
+                        </div>
+                        <div className="youtube-chart" aria-label={`Графік: ${series.label}`}>
+                          {series.values.map((value, index) => {
+                            const snapshot = youtubeChart[index];
+                            const capturedAt = snapshot?.capturedAt || "";
+                            const formattedValue = series.format(value);
+                            return (
+                              <span
+                                className={chartPointClassName("youtube-chart-point", index, series.values.length)}
+                                key={`${series.id}-${capturedAt || index}`}
+                                style={{ height: `${Math.max(4, (Math.abs(value) / series.maximum) * 100)}%` }}
+                                tabIndex={0}
+                                aria-label={`${series.label}: ${formattedValue}. ${formatChartTime(capturedAt)}`}
+                              >
+                                <i className={`youtube-chart-bar${value < 0 ? " youtube-chart-bar--negative" : ""}`} />
+                                <ChartTooltip
+                                  label={series.label}
+                                  value={formattedValue}
+                                  capturedAt={capturedAt}
+                                  details={youtubeGraphTooltipDetails(series.id, snapshot)}
+                                />
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="youtube-chart-section-empty" role="status">
+                    <strong>{youtube.selected ? "Очікуємо перший snapshot" : "Активний або запланований ефір не знайдено"}</strong>
+                    <span>{youtube.selected ? "Натисніть «Оновити зараз» або зачекайте наступної автоматичної синхронізації." : "YouTube Data API має повернути трансляцію, перш ніж StreamLab зможе збирати live-метрики."}</span>
+                  </div>
+                )}
+              </section>
 
               <section className="youtube-analytics-panel" aria-labelledby="youtube-analytics-title">
                 <div className="youtube-section-heading">
@@ -4643,6 +4776,62 @@ export default function Home() {
                       </p>
                     )}
                   </>
+                )}
+              </section>
+
+              <section className="youtube-chart-section" aria-labelledby="youtube-analytics-charts-title">
+                <div className="youtube-section-heading">
+                  <div>
+                    <span>Історія за днями</span>
+                    <h3 id="youtube-analytics-charts-title">Динаміка YouTube Analytics</h3>
+                  </div>
+                  <span>{youtube.analytics?.periodStart && youtube.analytics?.periodEnd ? `${youtube.analytics.periodStart} — ${youtube.analytics.periodEnd}` : `кожні ${youtube.polling.analyticsMinutes} хв`}</span>
+                </div>
+                {youtube.analytics?.reconnectRequired ? (
+                  <div className="youtube-chart-section-empty youtube-chart-section-empty--error" role="status">
+                    <strong>Analytics-доступ не надано</strong>
+                    <span>Перепідключіть YouTube у профілі та підтвердьте read-only доступ до YouTube Analytics.</span>
+                  </div>
+                ) : youtubeAnalyticsChart.length ? (
+                  <div className="youtube-graph-grid">
+                    {youtubeAnalyticsGraphSeries.map((series) => (
+                      <article className="youtube-chart-card" key={series.id}>
+                        <div className="youtube-card-heading">
+                          <div><span>{series.label}</span><strong>{series.format(series.current)}</strong></div>
+                          <span>max {series.format(series.maximum)}</span>
+                        </div>
+                        <div className="youtube-chart" aria-label={`Графік: ${series.label}`}>
+                          {series.values.map((value, index) => {
+                            const snapshot = youtubeAnalyticsChart[index];
+                            const capturedAt = snapshot?.date || "";
+                            const formattedValue = series.format(value);
+                            return (
+                              <span
+                                className={chartPointClassName("youtube-chart-point", index, series.values.length)}
+                                key={`${series.id}-${capturedAt || index}`}
+                                style={{ height: `${Math.max(4, (Math.abs(value) / series.maximum) * 100)}%` }}
+                                tabIndex={0}
+                                aria-label={`${series.label}: ${formattedValue}. ${formatChartTime(capturedAt)}`}
+                              >
+                                <i className={`youtube-chart-bar youtube-chart-bar--analytics${value < 0 ? " youtube-chart-bar--negative" : ""}`} />
+                                <ChartTooltip
+                                  label={series.label}
+                                  value={formattedValue}
+                                  capturedAt={capturedAt}
+                                  details={youtubeAnalyticsTooltipDetails(series.id, snapshot)}
+                                />
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="youtube-chart-section-empty" role="status">
+                    <strong>Історичні дані ще не отримані</strong>
+                    <span>Увімкніть YouTube Analytics API в тому самому Google Cloud OAuth-проєкті. Перші дані можуть з’явитися із затримкою YouTube.</span>
+                  </div>
                 )}
               </section>
 
@@ -4713,7 +4902,6 @@ export default function Home() {
                   </ul>
                 </div>
               ) : null}
-              {youtube.lastError && <p className="youtube-error">{youtube.lastError}</p>}
             </div>
           )}
         </section>

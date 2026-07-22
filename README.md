@@ -68,7 +68,8 @@ npm run stream:secret --silent
 
 ## Підключення YouTube
 
-У Google Cloud Console увімкніть **YouTube Data API v3**, створіть OAuth Client типу
+У Google Cloud Console в одному проєкті увімкніть **YouTube Data API v3** та
+**YouTube Analytics API**, створіть OAuth Client типу
 **Web application** і додайте точний Authorized redirect URI:
 
 ```text

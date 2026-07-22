@@ -301,6 +301,49 @@ test("keeps a successful OAuth connection when the first data refresh fails", as
   assert.equal(service.snapshot().lastError, "Некоректний запит списку трансляцій YouTube.");
 });
 
+test("reports a separately disabled YouTube Analytics API", async (t) => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-youtube-analytics-disabled-test-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const store = new EncryptedYouTubeStore({
+    rootDir,
+    secret: "streamlab-youtube-disabled-secret-32-characters",
+  });
+  const service = new YouTubeService({
+    clientId: "client-id",
+    clientSecret: "client-secret",
+    redirectUri: "https://stream.example.test/api/youtube/oauth/callback",
+    store,
+    statsStore: new YouTubeStatsStore({ rootDir }),
+    now: () => new Date("2026-07-20T12:00:00.000Z").getTime(),
+    fetchImpl: async () => Response.json({
+      error: {
+        status: "PERMISSION_DENIED",
+        details: [{
+          "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+          reason: "SERVICE_DISABLED",
+          domain: "googleapis.com",
+          metadata: { service: "youtubeanalytics.googleapis.com" },
+        }],
+      },
+    }, { status: 403 }),
+  });
+  await service.init();
+  await store.saveTokens({
+    accessToken: "analytics-access-token",
+    refreshToken: "analytics-refresh-token",
+    expiryDate: new Date("2026-07-20T13:00:00.000Z").getTime(),
+    scope: "https://www.googleapis.com/auth/yt-analytics.readonly",
+    tokenType: "Bearer",
+  });
+
+  await assert.rejects(
+    service.googleApi("reports", { ids: "channel==MINE" }, { root: "https://youtubeanalytics.googleapis.com/v2" }),
+    (error) => error.code === "YOUTUBE_ANALYTICS_API_DISABLED"
+      && error.message === "У Google Cloud потрібно ввімкнути YouTube Analytics API для цього OAuth-проєкту.",
+  );
+  assert.equal(service.snapshot().quota.used, 0);
+});
+
 test("collects all required Analytics metrics and exports statistics", async (t) => {
   const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-youtube-analytics-test-"));
   t.after(() => rm(rootDir, { recursive: true, force: true }));
@@ -362,6 +405,12 @@ test("collects all required Analytics metrics and exports statistics", async (t)
           });
         }
         if (metrics === "estimatedRevenue") {
+          if (url.searchParams.get("dimensions") === "day") {
+            return Response.json({
+              columnHeaders: [{ name: "day" }, { name: "estimatedRevenue" }],
+              rows: [["2026-07-19", 4.56], ["2026-07-20", 7.78]],
+            });
+          }
           return Response.json({ columnHeaders: [{ name: "estimatedRevenue" }], rows: [[12.34]] });
         }
         const headers = [
@@ -408,6 +457,8 @@ test("collects all required Analytics metrics and exports statistics", async (t)
   assert.equal(snapshot.analytics.peakConcurrentViewers, 37);
   assert.equal(snapshot.analytics.estimatedRevenue, 12.34);
   assert.equal(snapshot.analyticsHistory.length, 2);
+  assert.equal(snapshot.analyticsHistory[0].estimatedRevenue, 4.56);
+  assert.equal(snapshot.analyticsHistory[1].estimatedRevenue, 7.78);
   assert.equal(snapshot.videoStats[0].officialYouTubeMetric, false);
 
   const jsonExport = service.exportStatistics({ format: "json", all: true });

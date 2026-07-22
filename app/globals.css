@@ -649,6 +649,7 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .youtube-chart { height: 74px; display: flex; align-items: end; gap: 2px; margin-top: 16px; overflow: visible; }
 .youtube-chart-point { min-width: 2px; min-height: 4px; flex: 1; display: block; }
 .youtube-chart-bar { width: 100%; height: 100%; display: block; border-radius: 2px 2px 0 0; background: linear-gradient(to top, rgba(121,242,164,.35), var(--green)); }
+.youtube-chart-bar--analytics { background: linear-gradient(to top, rgba(77,151,255,.34), #72aaff); }
 .youtube-chart-empty { height: 74px; display: grid; place-items: center; margin: 16px 0 0; color: var(--muted); font-size: 10px; text-align: center; }
 .youtube-quota-track { height: 6px; margin-top: 24px; overflow: hidden; border-radius: 99px; background: #242a31; }
 .youtube-quota-track span { display: block; height: 100%; border-radius: inherit; background: var(--green); }
@@ -670,6 +671,28 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .youtube-custom-range input { width: 100%; height: 36px; padding: 0 10px; border: 1px solid #303842; border-radius: 8px; outline: 0; background: #0d1116; color: var(--text); color-scheme: dark; font: 600 10px ui-monospace, monospace; }
 .youtube-graph-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .youtube-chart-bar--negative { background: linear-gradient(to top, rgba(255,93,99,.3), var(--red)) !important; }
+.youtube-diagnostics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.youtube-diagnostic-card { min-width: 0; padding: 12px 13px; border: 1px solid var(--border); border-radius: 12px; background: rgba(0,0,0,.13); }
+.youtube-diagnostic-card::before { width: 6px; height: 6px; display: block; margin-bottom: 9px; border-radius: 50%; background: var(--muted); content: ""; }
+.youtube-diagnostic-card--ready::before { background: var(--green); box-shadow: 0 0 0 4px rgba(121,242,164,.08); }
+.youtube-diagnostic-card--warning::before { background: var(--yellow); box-shadow: 0 0 0 4px rgba(244,201,93,.08); }
+.youtube-diagnostic-card--error { border-color: rgba(255,93,99,.22); }
+.youtube-diagnostic-card--error::before { background: var(--red); box-shadow: 0 0 0 4px rgba(255,93,99,.08); }
+.youtube-diagnostic-card span, .youtube-diagnostic-card strong, .youtube-diagnostic-card small { display: block; overflow: hidden; text-overflow: ellipsis; }
+.youtube-diagnostic-card span { color: var(--muted); font-size: 8px; font-weight: 750; letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
+.youtube-diagnostic-card strong { margin-top: 5px; font-size: 11px; white-space: nowrap; }
+.youtube-diagnostic-card small { margin-top: 5px; color: #7f8995; font-size: 8px; line-height: 1.45; }
+.youtube-api-error { display: grid; gap: 4px; padding: 12px 14px; border: 1px solid rgba(255,93,99,.28); border-radius: 12px; background: rgba(255,93,99,.07); }
+.youtube-api-error strong { color: #ff898d; font-size: 11px; }
+.youtube-api-error span { color: #d6a1a3; font-size: 10px; line-height: 1.5; }
+.youtube-chart-section { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 14px; background: rgba(0,0,0,.13); }
+.youtube-chart-section .youtube-graph-grid { margin-top: 14px; }
+.youtube-chart-section-empty { min-height: 104px; display: grid; place-content: center; gap: 6px; margin-top: 14px; padding: 18px; border: 1px dashed rgba(255,255,255,.09); border-radius: 11px; color: var(--muted); text-align: center; }
+.youtube-chart-section-empty strong, .youtube-chart-section-empty span { display: block; }
+.youtube-chart-section-empty strong { color: #b7c0ca; font-size: 11px; }
+.youtube-chart-section-empty span { max-width: 620px; font-size: 9px; line-height: 1.55; }
+.youtube-chart-section-empty--error { border-color: rgba(255,93,99,.22); background: rgba(255,93,99,.035); }
+.youtube-chart-section-empty--error strong { color: #ff898d; }
 .youtube-analytics-panel, .youtube-subscribers-panel, .youtube-video-stats { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 14px; background: rgba(0,0,0,.13); }
 .youtube-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .youtube-section-heading span, .youtube-section-heading h3 { display: block; }
@@ -821,6 +844,7 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
   .promo-campaign-form .field:first-child { grid-column: span 2; }
   .promo-campaign-form .button { width: 100%; }
   .youtube-graph-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .youtube-diagnostics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .youtube-analytics-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
@@ -897,7 +921,7 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
   .youtube-broadcast-row { grid-template-columns: 1fr; }
   .youtube-preset-button { width: 100%; }
   .youtube-metrics { grid-template-columns: repeat(2, 1fr); }
-  .youtube-graph-grid, .youtube-analytics-metrics, .youtube-subscriber-list { grid-template-columns: 1fr; }
+  .youtube-graph-grid, .youtube-diagnostics, .youtube-analytics-metrics, .youtube-subscriber-list { grid-template-columns: 1fr; }
   .monitoring-heading { align-items: flex-start; flex-direction: column; }
   .monitoring-range { width: 100%; }
   .monitoring-range button { flex: 1; }
@@ -1166,8 +1190,8 @@ footer { min-height: 86px; display: flex; align-items: center; justify-content: 
   .youtube-range, .youtube-export-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
   .youtube-range button, .youtube-export-actions button, .youtube-custom-range button { min-height: 44px; }
   .youtube-custom-range { align-items: stretch; flex-direction: column; }
-  .youtube-graph-grid, .youtube-analytics-metrics, .youtube-subscriber-list { grid-template-columns: 1fr; }
-  .youtube-chart-card, .youtube-quota-card, .youtube-analytics-panel, .youtube-subscribers-panel, .youtube-video-stats { padding: 13px; }
+  .youtube-graph-grid, .youtube-diagnostics, .youtube-analytics-metrics, .youtube-subscriber-list { grid-template-columns: 1fr; }
+  .youtube-chart-card, .youtube-chart-section, .youtube-quota-card, .youtube-analytics-panel, .youtube-subscribers-panel, .youtube-video-stats { padding: 13px; }
   .youtube-section-heading, .youtube-card-heading { gap: 10px; }
   .youtube-section-heading > span, .youtube-card-heading > span { text-align: right; }
   .youtube-video-stats-scroll { margin-inline: -13px; padding-inline: 13px; scrollbar-color: #3b4652 transparent; }

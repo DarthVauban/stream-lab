@@ -368,6 +368,8 @@ export class YouTubeService {
   }
 
   async googleApi(resource, parameters, { retry = true, units = 1, root = YOUTUBE_API_ROOT } = {}) {
+    const analyticsRequest = root === YOUTUBE_ANALYTICS_ROOT;
+    const quotaUnits = analyticsRequest ? 0 : units;
     const token = await this.getAccessToken();
     const url = new URL(`${root}/${resource}`);
     url.search = new URLSearchParams(
@@ -382,7 +384,7 @@ export class YouTubeService {
     } catch {
       throw new ApiError(502, "YOUTUBE_API_UNAVAILABLE", "YouTube API тимчасово недоступний.");
     } finally {
-      this.addQuota(units);
+      this.addQuota(quotaUnits);
     }
     if (response.status === 401 && retry) {
       await this.getAccessToken({ force: true });
@@ -390,28 +392,35 @@ export class YouTubeService {
     }
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const reason = body?.error?.errors?.[0]?.reason;
-      if (reason === "quotaExceeded") {
+      const reason = body?.error?.errors?.[0]?.reason
+        || body?.error?.details?.find((detail) => typeof detail?.reason === "string")?.reason
+        || "";
+      const normalizedReason = String(reason).replace(/[^a-z0-9]/gi, "").toLowerCase();
+      if (normalizedReason === "quotaexceeded") {
         throw new ApiError(429, "YOUTUBE_QUOTA_EXCEEDED", "Денну квоту YouTube API вичерпано.");
       }
-      if (reason === "liveStreamingNotEnabled") {
+      if (normalizedReason === "livestreamingnotenabled") {
         throw new ApiError(403, "YOUTUBE_LIVE_DISABLED", "Для цього каналу не ввімкнені прямі трансляції.");
       }
-      if (["insufficientLivePermissions", "insufficientPermissions"].includes(reason)) {
+      if (["insufficientlivepermissions", "insufficientpermissions", "accesstokenscopeinsufficient"].includes(normalizedReason)) {
         throw new ApiError(
           403,
-          "YOUTUBE_LIVE_PERMISSION_MISSING",
-          "YouTube не дозволив читати прямі трансляції цього каналу. Перевірте доступ до live streaming.",
+          analyticsRequest ? "YOUTUBE_ANALYTICS_PERMISSION_MISSING" : "YOUTUBE_LIVE_PERMISSION_MISSING",
+          analyticsRequest
+            ? "YouTube не надав доступ до Analytics. Перепідключіть канал і підтвердьте read-only дозвіл YouTube Analytics."
+            : "YouTube не дозволив читати прямі трансляції цього каналу. Перевірте доступ до live streaming.",
         );
       }
-      if (["accessNotConfigured", "serviceDisabled"].includes(reason)) {
+      if (["accessnotconfigured", "servicedisabled"].includes(normalizedReason)) {
         throw new ApiError(
           503,
-          "YOUTUBE_API_DISABLED",
-          "У Google Cloud потрібно ввімкнути YouTube Data API v3 для цього OAuth-проєкту.",
+          analyticsRequest ? "YOUTUBE_ANALYTICS_API_DISABLED" : "YOUTUBE_API_DISABLED",
+          analyticsRequest
+            ? "У Google Cloud потрібно ввімкнути YouTube Analytics API для цього OAuth-проєкту."
+            : "У Google Cloud потрібно ввімкнути YouTube Data API v3 для цього OAuth-проєкту.",
         );
       }
-      if (reason === "invalidFilters") {
+      if (normalizedReason === "invalidfilters") {
         throw new ApiError(502, "YOUTUBE_INVALID_FILTERS", "Некоректний запит списку трансляцій YouTube.");
       }
       throw new ApiError(502, "YOUTUBE_API_FAILED", "YouTube API не зміг оновити дані каналу.");
@@ -653,6 +662,7 @@ export class YouTubeService {
     let estimatedRevenue = null;
     let revenueAvailable = false;
     let revenueError = null;
+    let dailyRevenueByDate = new Map();
     const monetaryScope = this.hasMonetaryAnalyticsScope();
     if (monetaryScope) {
       try {
@@ -669,6 +679,24 @@ export class YouTubeService {
       } catch (error) {
         revenueError = error instanceof Error ? error.message : "Revenue недоступний.";
       }
+      try {
+        const dailyRevenueBody = await this.googleApi("reports", {
+          ids: "channel==MINE",
+          startDate,
+          endDate,
+          metrics: "estimatedRevenue",
+          dimensions: "day",
+          sort: "day",
+          currency: "USD",
+        }, { root: YOUTUBE_ANALYTICS_ROOT });
+        dailyRevenueByDate = new Map(
+          analyticsRows(dailyRevenueBody)
+            .filter((row) => row.day)
+            .map((row) => [row.day, analyticsNumber(row, "estimatedRevenue")]),
+        );
+      } catch (error) {
+        revenueError ||= error instanceof Error ? error.message : "Денна статистика revenue недоступна.";
+      }
     }
     const history = analyticsRows(dailyBody).map((row) => ({
       date: row.day,
@@ -678,7 +706,7 @@ export class YouTubeService {
       likes: analyticsNumber(row, "likes"),
       subscribersGained: analyticsNumber(row, "subscribersGained"),
       subscribersLost: analyticsNumber(row, "subscribersLost"),
-      estimatedRevenue: null,
+      estimatedRevenue: dailyRevenueByDate.get(row.day) ?? null,
     }));
     this.runtime.analyticsHistory = await this.statsStore.replaceAnalyticsHistory(history);
     this.runtime.analytics = {
