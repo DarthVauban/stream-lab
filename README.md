@@ -85,9 +85,8 @@ GOOGLE_OAUTH_REDIRECT_URI='https://stream.mt-panel.sbs/api/youtube/oauth/callbac
 ```
 
 Після перезапуску контейнерів увійдіть у StreamLab і натисніть «Підключити YouTube».
-Панель запитує лише read-only scopes `youtube.readonly`, `yt-analytics.readonly` і
-`yt-analytics-monetary.readonly`: вона не може створювати, змінювати або видаляти
-відео чи трансляції. OAuth-токени зберігаються у
+Панель запитує лише read-only scopes `youtube.readonly` і `yt-analytics.readonly`:
+вона не може створювати, змінювати або видаляти відео чи трансляції. OAuth-токени зберігаються у
 `data/youtube-oauth.enc.json` із шифруванням AES-256-GCM. Окремий
 `YOUTUBE_TOKEN_SECRET` необов’язковий; якщо він порожній, використовується
 `STREAM_CONFIG_SECRET`.
@@ -95,6 +94,9 @@ GOOGLE_OAUTH_REDIRECT_URI='https://stream.mt-panel.sbs/api/youtube/oauth/callbac
 Окремий YouTube API key не потрібний: запити до власного каналу, трансляцій і
 stream key авторизуються OAuth access token користувача. API key не замінює цей
 доступ і не додається до `.env`.
+
+`estimatedRevenue` відображається як `N/A`: YouTube Analytics API наразі не
+підтримує monetary metrics для channel reports навіть із monetary scope.
 
 Для постійної роботи переведіть зовнішній OAuth-застосунок зі статусу **Testing**
 у **Production**. У режимі Testing Google зазвичай обмежує refresh token сімома
@@ -126,18 +128,17 @@ Recent subscribers зберігаються за ID підписки й кана
 повний приріст, втрати й чиста зміна беруться з агрегованої Analytics-статистики.
 
 YouTube Analytics показує середню та пікову одночасну аудиторію вибраного ефіру,
-watch time, середню тривалість перегляду, gained/lost/net subscribers, likes, views
-і estimated revenue, якщо канал та OAuth-дозвіл надають фінансові дані. Окрема
+watch time, середню тривалість перегляду, gained/lost/net subscribers, likes і views.
+`estimatedRevenue` позначається як `N/A`, оскільки targeted channel reports наразі
+не повертають monetary metrics. Окрема
 локальна статистика за відео рахує запуски, середню аудиторію на початку й наприкінці,
 зміну аудиторії, локальний пік, інтервал перегляду, промо та playback-помилки. Ці
 показники корелюють timeline StreamLab зі snapshots і не видаються за офіційний
 YouTube-звіт.
 
-Для YouTube Analytics використовуються додаткові read-only scopes
-`yt-analytics.readonly` і `yt-analytics-monetary.readonly`. Вже підключений до старої
-версії канал потрібно один раз відключити й підключити повторно, а scopes мають бути
-додані на OAuth consent screen. Якщо monetary scope або revenue недоступні, решта
-Analytics-метрик продовжує оновлюватися.
+Для YouTube Analytics одночасно використовуються read-only scopes `youtube.readonly`
+і `yt-analytics.readonly`. Вже підключений до старої версії канал потрібно один раз
+перепідключити, а scopes мають бути додані на OAuth consent screen.
 
 ## Підключення Telegram
 

@@ -734,6 +734,7 @@ test("returns actionable storage errors without exposing filesystem details", ()
 test("protects YouTube controls while allowing the state-validated OAuth callback", async (t) => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "streamlab-youtube-api-test-"));
   let callbackCount = 0;
+  let analyticsRefreshCount = 0;
   const youtube = {
     async init() {},
     start() {},
@@ -753,6 +754,13 @@ test("protects YouTube controls while allowing the state-validated OAuth callbac
       assert.equal(code, "oauth-code");
       assert.equal(state, "oauth-state");
       callbackCount += 1;
+    },
+    async refreshAnalyticsNow() {
+      analyticsRefreshCount += 1;
+      return {
+        ...this.snapshot(),
+        analytics: { available: true, reconnectRequired: false, views: 120 },
+      };
     },
     getSelectedIngestion() {
       return {
@@ -800,6 +808,20 @@ test("protects YouTube controls while allowing the state-validated OAuth callbac
   });
   assert.equal(oauthStart.status, 200);
   assert.match((await oauthStart.json()).authorizationUrl, /^https:\/\/accounts\.google\.com\//);
+
+  const analyticsMissingCsrf = await fetch(`${baseUrl}/api/youtube/analytics/refresh`, {
+    method: "POST",
+    headers: { Cookie: session.cookie },
+  });
+  assert.equal(analyticsMissingCsrf.status, 403);
+
+  const analyticsRefresh = await fetch(`${baseUrl}/api/youtube/analytics/refresh`, {
+    method: "POST",
+    headers: { Cookie: session.cookie, "X-CSRF-Token": session.csrfToken },
+  });
+  assert.equal(analyticsRefresh.status, 200);
+  assert.equal((await analyticsRefresh.json()).youtube.analytics.views, 120);
+  assert.equal(analyticsRefreshCount, 1);
 
   const presetResponse = await fetch(`${baseUrl}/api/youtube/stream-preset`, {
     method: "POST",

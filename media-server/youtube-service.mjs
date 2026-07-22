@@ -9,8 +9,9 @@ const OAUTH_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
 const OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/youtube.readonly",
   "https://www.googleapis.com/auth/yt-analytics.readonly",
-  "https://www.googleapis.com/auth/yt-analytics-monetary.readonly",
 ];
+const ANALYTICS_REQUIRED_SCOPES = [...OAUTH_SCOPES];
+const ANALYTICS_RETRY_INTERVAL = 5 * 60_000;
 const DEFAULT_POLL_INTERVALS = Object.freeze({
   metrics: 30_000,
   stream: 45_000,
@@ -584,14 +585,18 @@ export class YouTubeService {
     }
   }
 
-  hasAnalyticsScope() {
+  grantedScopes() {
     const scope = this.store?.read().tokens?.scope || "";
-    return scope.split(/\s+/).includes("https://www.googleapis.com/auth/yt-analytics.readonly");
+    return [...new Set(scope.split(/\s+/).filter(Boolean))];
   }
 
-  hasMonetaryAnalyticsScope() {
-    const scope = this.store?.read().tokens?.scope || "";
-    return scope.split(/\s+/).includes("https://www.googleapis.com/auth/yt-analytics-monetary.readonly");
+  missingAnalyticsScopes() {
+    const granted = new Set(this.grantedScopes());
+    return ANALYTICS_REQUIRED_SCOPES.filter((scope) => !granted.has(scope));
+  }
+
+  hasAnalyticsScope() {
+    return this.missingAnalyticsScopes().length === 0;
   }
 
   async refreshSubscribers() {
@@ -610,128 +615,130 @@ export class YouTubeService {
   }
 
   async refreshAnalytics() {
+    const attemptedAt = new Date(this.now()).toISOString();
+    const endDate = attemptedAt.slice(0, 10);
+    const startDate = new Date(this.now() - 30 * 24 * 60 * 60_000).toISOString().slice(0, 10);
+    const previousAnalytics = this.runtime.analytics;
+    const missingScopes = this.missingAnalyticsScopes();
     this.lastPoll.analytics = this.now();
-    if (!this.hasAnalyticsScope()) {
+    if (missingScopes.length) {
       this.runtime.analytics = {
+        ...(previousAnalytics || {}),
         available: false,
         reconnectRequired: true,
-        updatedAt: null,
+        stale: Boolean(previousAnalytics?.available),
+        errorCode: "YOUTUBE_ANALYTICS_SCOPES_MISSING",
+        errorMessage: "Перепідключіть YouTube і надайте доступ до YouTube Analytics та YouTube Data API.",
+        missingScopes,
+        periodStart: startDate,
+        periodEnd: endDate,
+        lastAttemptAt: attemptedAt,
+        updatedAt: previousAnalytics?.updatedAt || null,
       };
       return;
     }
-    const endDate = new Date(this.now()).toISOString().slice(0, 10);
-    const startDate = new Date(this.now() - 30 * 24 * 60 * 60_000).toISOString().slice(0, 10);
-    const coreMetrics = "views,estimatedMinutesWatched,averageViewDuration,likes,subscribersGained,subscribersLost";
-    const summaryBody = await this.googleApi("reports", {
-      ids: "channel==MINE",
-      startDate,
-      endDate,
-      metrics: coreMetrics,
-    }, { root: YOUTUBE_ANALYTICS_ROOT });
-    const summary = analyticsRows(summaryBody)[0] || {};
-    const dailyBody = await this.googleApi("reports", {
-      ids: "channel==MINE",
-      startDate,
-      endDate,
-      metrics: coreMetrics,
-      dimensions: "day",
-      sort: "day",
-    }, { root: YOUTUBE_ANALYTICS_ROOT });
-    let averageConcurrentViewers = null;
-    let peakConcurrentViewers = null;
-    let concurrentAvailable = false;
-    let concurrentError = null;
-    const broadcastId = this.runtime.selected?.id;
-    if (broadcastId) {
-      try {
-        const concurrentBody = await this.googleApi("reports", {
-          ids: "channel==MINE",
-          startDate,
-          endDate,
-          metrics: "averageConcurrentViewers,peakConcurrentViewers",
-          filters: `video==${broadcastId}`,
-        }, { root: YOUTUBE_ANALYTICS_ROOT });
-        const concurrent = analyticsRows(concurrentBody)[0] || {};
-        averageConcurrentViewers = analyticsNumber(concurrent, "averageConcurrentViewers");
-        peakConcurrentViewers = analyticsNumber(concurrent, "peakConcurrentViewers");
-        concurrentAvailable = Boolean(concurrentBody.rows?.length);
-      } catch (error) {
-        concurrentError = error instanceof Error ? error.message : "Concurrent viewers ще недоступні.";
+    try {
+      const coreMetrics = "views,estimatedMinutesWatched,averageViewDuration,likes,subscribersGained,subscribersLost";
+      const summaryBody = await this.googleApi("reports", {
+        ids: "channel==MINE",
+        startDate,
+        endDate,
+        metrics: coreMetrics,
+      }, { root: YOUTUBE_ANALYTICS_ROOT });
+      const summary = analyticsRows(summaryBody)[0] || {};
+      const dailyBody = await this.googleApi("reports", {
+        ids: "channel==MINE",
+        startDate,
+        endDate,
+        metrics: coreMetrics,
+        dimensions: "day",
+        sort: "day",
+      }, { root: YOUTUBE_ANALYTICS_ROOT });
+      let averageConcurrentViewers = null;
+      let peakConcurrentViewers = null;
+      let concurrentAvailable = false;
+      let concurrentError = null;
+      const broadcastId = this.runtime.selected?.id;
+      if (broadcastId) {
+        try {
+          const concurrentBody = await this.googleApi("reports", {
+            ids: "channel==MINE",
+            startDate,
+            endDate,
+            metrics: "averageConcurrentViewers,peakConcurrentViewers",
+            filters: `video==${broadcastId}`,
+          }, { root: YOUTUBE_ANALYTICS_ROOT });
+          const concurrent = analyticsRows(concurrentBody)[0] || {};
+          averageConcurrentViewers = analyticsNumber(concurrent, "averageConcurrentViewers");
+          peakConcurrentViewers = analyticsNumber(concurrent, "peakConcurrentViewers");
+          concurrentAvailable = Boolean(concurrentBody.rows?.length);
+        } catch (error) {
+          concurrentError = error instanceof Error ? error.message : "Concurrent viewers ще недоступні.";
+        }
       }
+      const revenueError = "YouTube Analytics API наразі не підтримує estimated revenue для звітів каналу.";
+      const history = analyticsRows(dailyBody).map((row) => ({
+        date: row.day,
+        views: analyticsNumber(row, "views"),
+        estimatedMinutesWatched: analyticsNumber(row, "estimatedMinutesWatched"),
+        averageViewDurationSeconds: analyticsNumber(row, "averageViewDuration"),
+        likes: analyticsNumber(row, "likes"),
+        subscribersGained: analyticsNumber(row, "subscribersGained"),
+        subscribersLost: analyticsNumber(row, "subscribersLost"),
+        estimatedRevenue: null,
+      }));
+      this.runtime.analyticsHistory = await this.statsStore.replaceAnalyticsHistory(history);
+      this.runtime.analytics = {
+        available: true,
+        reconnectRequired: false,
+        stale: false,
+        errorCode: null,
+        errorMessage: null,
+        missingScopes: [],
+        views: analyticsNumber(summary, "views"),
+        estimatedMinutesWatched: analyticsNumber(summary, "estimatedMinutesWatched"),
+        averageViewDurationSeconds: analyticsNumber(summary, "averageViewDuration"),
+        likes: analyticsNumber(summary, "likes"),
+        subscribersGained: analyticsNumber(summary, "subscribersGained"),
+        subscribersLost: analyticsNumber(summary, "subscribersLost"),
+        netSubscribers: analyticsNumber(summary, "subscribersGained") - analyticsNumber(summary, "subscribersLost"),
+        averageConcurrentViewers,
+        peakConcurrentViewers,
+        concurrentAvailable,
+        concurrentError,
+        estimatedRevenue: null,
+        revenueCurrency: "USD",
+        revenueAvailable: false,
+        revenueReconnectRequired: false,
+        revenueError,
+        periodStart: startDate,
+        periodEnd: endDate,
+        lastAttemptAt: attemptedAt,
+        updatedAt: attemptedAt,
+      };
+    } catch (error) {
+      const errorCode = typeof error?.code === "string" ? error.code : "YOUTUBE_ANALYTICS_REFRESH_FAILED";
+      const reconnectRequired = [
+        "YOUTUBE_ANALYTICS_PERMISSION_MISSING",
+        "YOUTUBE_ANALYTICS_SCOPES_MISSING",
+      ].includes(errorCode);
+      this.runtime.analytics = {
+        ...(previousAnalytics || {}),
+        available: Boolean(previousAnalytics?.available),
+        reconnectRequired,
+        stale: Boolean(previousAnalytics?.available),
+        errorCode,
+        errorMessage: error instanceof Error ? error.message : "Не вдалося оновити YouTube Analytics.",
+        missingScopes: this.missingAnalyticsScopes(),
+        periodStart: startDate,
+        periodEnd: endDate,
+        lastAttemptAt: attemptedAt,
+        updatedAt: previousAnalytics?.updatedAt || null,
+      };
+      const retryDelay = Math.min(ANALYTICS_RETRY_INTERVAL, this.pollIntervals.analytics);
+      this.lastPoll.analytics = this.now() - this.pollIntervals.analytics + retryDelay;
+      throw error;
     }
-    let estimatedRevenue = null;
-    let revenueAvailable = false;
-    let revenueError = null;
-    let dailyRevenueByDate = new Map();
-    const monetaryScope = this.hasMonetaryAnalyticsScope();
-    if (monetaryScope) {
-      try {
-        const revenueBody = await this.googleApi("reports", {
-          ids: "channel==MINE",
-          startDate,
-          endDate,
-          metrics: "estimatedRevenue",
-          currency: "USD",
-        }, { root: YOUTUBE_ANALYTICS_ROOT });
-        const revenue = analyticsRows(revenueBody)[0] || {};
-        estimatedRevenue = analyticsNumber(revenue, "estimatedRevenue");
-        revenueAvailable = Boolean(revenueBody.rows?.length);
-      } catch (error) {
-        revenueError = error instanceof Error ? error.message : "Revenue недоступний.";
-      }
-      try {
-        const dailyRevenueBody = await this.googleApi("reports", {
-          ids: "channel==MINE",
-          startDate,
-          endDate,
-          metrics: "estimatedRevenue",
-          dimensions: "day",
-          sort: "day",
-          currency: "USD",
-        }, { root: YOUTUBE_ANALYTICS_ROOT });
-        dailyRevenueByDate = new Map(
-          analyticsRows(dailyRevenueBody)
-            .filter((row) => row.day)
-            .map((row) => [row.day, analyticsNumber(row, "estimatedRevenue")]),
-        );
-      } catch (error) {
-        revenueError ||= error instanceof Error ? error.message : "Денна статистика revenue недоступна.";
-      }
-    }
-    const history = analyticsRows(dailyBody).map((row) => ({
-      date: row.day,
-      views: analyticsNumber(row, "views"),
-      estimatedMinutesWatched: analyticsNumber(row, "estimatedMinutesWatched"),
-      averageViewDurationSeconds: analyticsNumber(row, "averageViewDuration"),
-      likes: analyticsNumber(row, "likes"),
-      subscribersGained: analyticsNumber(row, "subscribersGained"),
-      subscribersLost: analyticsNumber(row, "subscribersLost"),
-      estimatedRevenue: dailyRevenueByDate.get(row.day) ?? null,
-    }));
-    this.runtime.analyticsHistory = await this.statsStore.replaceAnalyticsHistory(history);
-    this.runtime.analytics = {
-      available: true,
-      reconnectRequired: false,
-      views: analyticsNumber(summary, "views"),
-      estimatedMinutesWatched: analyticsNumber(summary, "estimatedMinutesWatched"),
-      averageViewDurationSeconds: analyticsNumber(summary, "averageViewDuration"),
-      likes: analyticsNumber(summary, "likes"),
-      subscribersGained: analyticsNumber(summary, "subscribersGained"),
-      subscribersLost: analyticsNumber(summary, "subscribersLost"),
-      netSubscribers: analyticsNumber(summary, "subscribersGained") - analyticsNumber(summary, "subscribersLost"),
-      averageConcurrentViewers,
-      peakConcurrentViewers,
-      concurrentAvailable,
-      concurrentError,
-      estimatedRevenue,
-      revenueCurrency: "USD",
-      revenueAvailable,
-      revenueReconnectRequired: !monetaryScope,
-      revenueError,
-      periodStart: startDate,
-      periodEnd: endDate,
-      updatedAt: new Date(this.now()).toISOString(),
-    };
   }
 
   async refreshDailyReport() {
@@ -787,7 +794,8 @@ export class YouTubeService {
     return this.refreshPromise;
   }
 
-  refreshAll() {
+  async refreshAll() {
+    if (this.refreshPromise) await this.refreshPromise.catch(() => {});
     return this.runRefresh([
       () => this.refreshChannel(),
       () => this.refreshBroadcasts(),
@@ -796,7 +804,14 @@ export class YouTubeService {
       () => this.refreshSubscribers(),
       () => this.refreshAnalytics(),
       () => this.refreshDailyReport(),
-    ]);
+    ], { continueOnError: true });
+  }
+
+  async refreshAnalyticsNow() {
+    if (this.refreshPromise) await this.refreshPromise.catch(() => {});
+    return this.runRefresh([
+      () => this.refreshAnalytics(),
+    ], { continueOnError: true });
   }
 
   refreshDue() {
@@ -949,11 +964,19 @@ export class YouTubeService {
   snapshot() {
     this.resetQuotaIfNeeded();
     const saved = this.store?.read() || {};
+    const missingAnalyticsScopes = saved.tokens ? this.missingAnalyticsScopes() : [...ANALYTICS_REQUIRED_SCOPES];
     return {
       configured: this.configured,
       connected: Boolean(saved.tokens),
       connectedAt: saved.connectedAt || null,
       scopes: this.configured ? [...OAUTH_SCOPES] : [],
+      analyticsAccess: {
+        ready: Boolean(saved.tokens) && missingAnalyticsScopes.length === 0,
+        missingScopes: missingAnalyticsScopes,
+        errorCode: this.runtime.analytics?.errorCode || null,
+        errorMessage: this.runtime.analytics?.errorMessage || null,
+        lastAttemptAt: this.runtime.analytics?.lastAttemptAt || null,
+      },
       channel: this.runtime.channel ? { ...this.runtime.channel } : null,
       broadcasts: this.runtime.broadcasts.map((item) => ({ ...item })),
       selected: this.runtime.selected ? { ...this.runtime.selected } : null,

@@ -911,6 +911,12 @@ export async function createMvpServer({
         return;
       }
 
+      if (request.method === "POST" && url.pathname === "/api/youtube/analytics/refresh") {
+        const snapshot = await youtubeIntegration.refreshAnalyticsNow();
+        json(response, 200, { youtube: snapshot });
+        return;
+      }
+
       if (request.method === "POST" && url.pathname === "/api/youtube/broadcast/select") {
         const body = await readJson(request, 8 * 1024);
         const snapshot = await youtubeIntegration.selectBroadcast(body.broadcastId);

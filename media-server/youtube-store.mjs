@@ -251,7 +251,9 @@ function normalizeAnalyticsStat(value) {
     likes: Math.max(0, Number(value.likes) || 0),
     subscribersGained: Math.max(0, Number(value.subscribersGained) || 0),
     subscribersLost: Math.max(0, Number(value.subscribersLost) || 0),
-    estimatedRevenue: Number.isFinite(Number(value.estimatedRevenue))
+    estimatedRevenue: value.estimatedRevenue !== null
+      && value.estimatedRevenue !== undefined
+      && Number.isFinite(Number(value.estimatedRevenue))
       ? Math.max(0, Number(value.estimatedRevenue))
       : null,
   };

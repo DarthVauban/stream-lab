@@ -345,6 +345,13 @@ type YouTubeStatus = {
   configured: boolean;
   connected: boolean;
   connectedAt: string | null;
+  analyticsAccess: {
+    ready: boolean;
+    missingScopes: string[];
+    errorCode: string | null;
+    errorMessage: string | null;
+    lastAttemptAt: string | null;
+  };
   channel: {
     id: string;
     title: string;
@@ -381,6 +388,11 @@ type YouTubeStatus = {
   analytics: {
     available: boolean;
     reconnectRequired: boolean;
+    stale?: boolean;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+    missingScopes?: string[];
+    lastAttemptAt?: string | null;
     views?: number;
     estimatedMinutesWatched?: number;
     averageViewDurationSeconds?: number;
@@ -1360,6 +1372,10 @@ export default function Home() {
     : 0;
   const youtubeChart = youtube?.history ?? [];
   const youtubeAnalyticsChart = youtube?.analyticsHistory ?? [];
+  const youtubeAnalyticsError = youtube?.analytics?.errorMessage || youtube?.analyticsAccess?.errorMessage || "";
+  const youtubeAnalyticsNeedsReconnect = Boolean(
+    youtube?.analytics?.reconnectRequired || (youtube?.connected && youtube?.analyticsAccess && !youtube.analyticsAccess.ready),
+  );
   const firstYoutubeSnapshot = youtubeChart[0] || null;
   const subscriberBaseline = youtubeChart.find((item) => item.subscriberCount !== null)?.subscriberCount ?? 0;
   const promoImpressionBaseline = youtubeChart[0]?.promoImpressions ?? 0;
@@ -2975,11 +2991,38 @@ export default function Home() {
       }
       setYoutube(refreshed);
       setFailedChannelAvatarUrl("");
-      setNotice({ type: "success", text: "Дані YouTube оновлено поза автоматичним графіком." });
+      setNotice(result.youtube.lastError
+        ? { type: "error", text: result.youtube.lastError }
+        : { type: "success", text: "Дані YouTube оновлено поза автоматичним графіком." });
     } catch (error) {
       setNotice({
         type: "error",
         text: error instanceof Error ? error.message : "Не вдалося оновити YouTube.",
+      });
+    } finally {
+      setYoutubeAction("");
+    }
+  }
+
+  async function refreshYouTubeAnalytics() {
+    if (youtubeAction) return;
+    setYoutubeAction("analytics");
+    setNotice(null);
+    try {
+      const result = await api<{ youtube: YouTubeStatus }>(
+        "/api/youtube/analytics/refresh",
+        { method: "POST" },
+        csrfToken,
+      );
+      setYoutube(result.youtube);
+      const analyticsError = result.youtube.analytics?.errorMessage || result.youtube.analyticsAccess.errorMessage;
+      setNotice(analyticsError
+        ? { type: "error", text: analyticsError }
+        : { type: "success", text: "YouTube Analytics успішно оновлено." });
+    } catch (error) {
+      setNotice({
+        type: "error",
+        text: error instanceof Error ? error.message : "Не вдалося оновити YouTube Analytics.",
       });
     } finally {
       setYoutubeAction("");
@@ -4613,10 +4656,10 @@ export default function Home() {
                   <strong>{youtubeChart.length.toLocaleString("uk-UA")} точок</strong>
                   <small>{youtubeChart.at(-1)?.capturedAt ? `Остання: ${formatChartTime(youtubeChart.at(-1)?.capturedAt || "")}` : "Ще не накопичено жодної точки"}</small>
                 </article>
-                <article className={`youtube-diagnostic-card youtube-diagnostic-card--${youtube.analytics?.available ? "ready" : youtube.analytics?.reconnectRequired ? "error" : "warning"}`}>
+                <article className={`youtube-diagnostic-card youtube-diagnostic-card--${youtube.analytics?.available && !youtubeAnalyticsError ? "ready" : youtubeAnalyticsError || youtubeAnalyticsNeedsReconnect ? "error" : "warning"}`}>
                   <span>YouTube Analytics API</span>
-                  <strong>{youtubeAnalyticsChart.length.toLocaleString("uk-UA")} денних точок</strong>
-                  <small>{youtube.analytics?.reconnectRequired ? "Потрібне повторне OAuth-підключення" : youtube.analytics?.updatedAt ? `Оновлено: ${formatChartTime(youtube.analytics.updatedAt)}` : "Очікуємо першу синхронізацію"}</small>
+                  <strong>{youtube.analytics?.available ? `${youtubeAnalyticsChart.length.toLocaleString("uk-UA")} денних точок` : youtubeAnalyticsNeedsReconnect ? "Потрібне перепідключення" : youtubeAnalyticsError ? "Синхронізація не вдалася" : "Очікуємо першу синхронізацію"}</strong>
+                  <small>{youtubeAnalyticsError || (youtube.analytics?.updatedAt ? `Оновлено: ${formatChartTime(youtube.analytics.updatedAt)}` : "Окремий API key не потрібний")}</small>
                 </article>
               </div>
 
@@ -4752,9 +4795,23 @@ export default function Home() {
                   </div>
                   <span>{youtube.analytics?.periodStart && youtube.analytics?.periodEnd ? `${youtube.analytics.periodStart} — ${youtube.analytics.periodEnd}` : `кожні ${youtube.polling.analyticsMinutes} хв`}</span>
                 </div>
-                {youtube.analytics?.reconnectRequired ? (
-                  <p className="youtube-analytics-note">Перепідключіть YouTube у профілі, щоб надати read-only доступ до Analytics.</p>
-                ) : (
+                {youtubeAnalyticsNeedsReconnect ? (
+                  <div className="youtube-analytics-status youtube-analytics-status--error" role="status">
+                    <strong>OAuth-токен не має всіх потрібних дозволів</strong>
+                    <span>{youtubeAnalyticsError || "Повторно підтвердьте доступ до YouTube Data API та YouTube Analytics."}</span>
+                    <button type="button" onClick={connectYouTube} disabled={Boolean(youtubeAction)}>
+                      {youtubeAction === "connect" ? "Переходимо до Google…" : "Перепідключити YouTube"}
+                    </button>
+                  </div>
+                ) : youtubeAnalyticsError && !youtube.analytics?.available ? (
+                  <div className="youtube-analytics-status youtube-analytics-status--error" role="alert">
+                    <strong>Офіційні метрики не вдалося отримати</strong>
+                    <span>{youtubeAnalyticsError}</span>
+                    <button type="button" onClick={refreshYouTubeAnalytics} disabled={Boolean(youtubeAction)}>
+                      {youtubeAction === "analytics" ? "Оновлюємо…" : "Повторити Analytics"}
+                    </button>
+                  </div>
+                ) : youtube.analytics?.available ? (
                   <>
                     <div className="youtube-analytics-metrics">
                       <div><span>Average concurrent</span><strong>{formatMetric(youtube.analytics?.averageConcurrentViewers)}</strong></div>
@@ -4766,16 +4823,19 @@ export default function Home() {
                       <div><span>Net subscribers</span><strong>{youtube.analytics?.netSubscribers === undefined ? "—" : `${youtube.analytics.netSubscribers >= 0 ? "+" : ""}${formatMetric(youtube.analytics.netSubscribers)}`}</strong></div>
                       <div><span>Likes</span><strong>{formatMetric(youtube.analytics?.likes)}</strong></div>
                       <div><span>Views</span><strong>{formatMetric(youtube.analytics?.views)}</strong></div>
-                      <div><span>Estimated revenue</span><strong>{youtube.analytics?.revenueAvailable ? `${formatMetric(youtube.analytics.estimatedRevenue, "", 2)} ${youtube.analytics.revenueCurrency || "USD"}` : "—"}</strong></div>
+                      <div><span>Estimated revenue</span><strong>{youtube.analytics?.revenueAvailable ? `${formatMetric(youtube.analytics.estimatedRevenue, "", 2)} ${youtube.analytics.revenueCurrency || "USD"}` : "N/A"}</strong></div>
                     </div>
-                    {(youtube.analytics?.concurrentError || youtube.analytics?.revenueReconnectRequired || youtube.analytics?.revenueError) && (
-                      <p className="youtube-analytics-note">
-                        {youtube.analytics.concurrentError || (youtube.analytics.revenueReconnectRequired
-                          ? "Revenue потребує окремого monetary read-only дозволу; перепідключіть канал."
-                          : youtube.analytics.revenueError)}
-                      </p>
-                    )}
+                    {youtube.analytics?.concurrentError && <p className="youtube-analytics-note">{youtube.analytics.concurrentError}</p>}
+                    {youtube.analytics?.revenueError && <p className="youtube-analytics-note">{youtube.analytics.revenueError}</p>}
                   </>
+                ) : (
+                  <div className="youtube-analytics-status" role="status">
+                    <strong>Очікуємо першу синхронізацію</strong>
+                    <span>Запустіть окреме оновлення Analytics — воно не залежить від live-метрик або recent subscribers.</span>
+                    <button type="button" onClick={refreshYouTubeAnalytics} disabled={Boolean(youtubeAction)}>
+                      {youtubeAction === "analytics" ? "Оновлюємо…" : "Оновити Analytics"}
+                    </button>
+                  </div>
                 )}
               </section>
 
@@ -4787,50 +4847,73 @@ export default function Home() {
                   </div>
                   <span>{youtube.analytics?.periodStart && youtube.analytics?.periodEnd ? `${youtube.analytics.periodStart} — ${youtube.analytics.periodEnd}` : `кожні ${youtube.polling.analyticsMinutes} хв`}</span>
                 </div>
-                {youtube.analytics?.reconnectRequired ? (
+                {youtubeAnalyticsNeedsReconnect && !youtubeAnalyticsChart.length ? (
                   <div className="youtube-chart-section-empty youtube-chart-section-empty--error" role="status">
                     <strong>Analytics-доступ не надано</strong>
-                    <span>Перепідключіть YouTube у профілі та підтвердьте read-only доступ до YouTube Analytics.</span>
+                    <span>{youtubeAnalyticsError || "Перепідключіть YouTube та підтвердьте read-only доступ до YouTube Data API і YouTube Analytics."}</span>
+                    <button type="button" onClick={connectYouTube} disabled={Boolean(youtubeAction)}>
+                      {youtubeAction === "connect" ? "Переходимо до Google…" : "Перепідключити YouTube"}
+                    </button>
                   </div>
                 ) : youtubeAnalyticsChart.length ? (
-                  <div className="youtube-graph-grid">
-                    {youtubeAnalyticsGraphSeries.map((series) => (
-                      <article className="youtube-chart-card" key={series.id}>
-                        <div className="youtube-card-heading">
-                          <div><span>{series.label}</span><strong>{series.format(series.current)}</strong></div>
-                          <span>max {series.format(series.maximum)}</span>
-                        </div>
-                        <div className="youtube-chart" aria-label={`Графік: ${series.label}`}>
-                          {series.values.map((value, index) => {
-                            const snapshot = youtubeAnalyticsChart[index];
-                            const capturedAt = snapshot?.date || "";
-                            const formattedValue = series.format(value);
-                            return (
-                              <span
-                                className={chartPointClassName("youtube-chart-point", index, series.values.length)}
-                                key={`${series.id}-${capturedAt || index}`}
-                                style={{ height: `${Math.max(4, (Math.abs(value) / series.maximum) * 100)}%` }}
-                                tabIndex={0}
-                                aria-label={`${series.label}: ${formattedValue}. ${formatChartTime(capturedAt)}`}
-                              >
-                                <i className={`youtube-chart-bar youtube-chart-bar--analytics${value < 0 ? " youtube-chart-bar--negative" : ""}`} />
-                                <ChartTooltip
-                                  label={series.label}
-                                  value={formattedValue}
-                                  capturedAt={capturedAt}
-                                  details={youtubeAnalyticsTooltipDetails(series.id, snapshot)}
-                                />
-                              </span>
-                            );
-                          })}
-                        </div>
-                      </article>
-                    ))}
+                  <>
+                    <div className="youtube-graph-grid">
+                      {youtubeAnalyticsGraphSeries.map((series) => (
+                        <article className="youtube-chart-card" key={series.id}>
+                          <div className="youtube-card-heading">
+                            <div><span>{series.label}</span><strong>{series.format(series.current)}</strong></div>
+                            <span>max {series.format(series.maximum)}</span>
+                          </div>
+                          <div className="youtube-chart" aria-label={`Графік: ${series.label}`}>
+                            {series.values.map((value, index) => {
+                              const snapshot = youtubeAnalyticsChart[index];
+                              const capturedAt = snapshot?.date || "";
+                              const formattedValue = series.format(value);
+                              return (
+                                <span
+                                  className={chartPointClassName("youtube-chart-point", index, series.values.length)}
+                                  key={`${series.id}-${capturedAt || index}`}
+                                  style={{ height: `${Math.max(4, (Math.abs(value) / series.maximum) * 100)}%` }}
+                                  tabIndex={0}
+                                  aria-label={`${series.label}: ${formattedValue}. ${formatChartTime(capturedAt)}`}
+                                >
+                                  <i className={`youtube-chart-bar youtube-chart-bar--analytics${value < 0 ? " youtube-chart-bar--negative" : ""}`} />
+                                  <ChartTooltip
+                                    label={series.label}
+                                    value={formattedValue}
+                                    capturedAt={capturedAt}
+                                    details={youtubeAnalyticsTooltipDetails(series.id, snapshot)}
+                                  />
+                                </span>
+                              );
+                            })}
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                    {youtubeAnalyticsError && (
+                      <div className="youtube-analytics-status youtube-analytics-status--warning" role="status">
+                        <strong>Показано останні збережені дані</strong>
+                        <span>{youtubeAnalyticsError}</span>
+                        <button type="button" onClick={refreshYouTubeAnalytics} disabled={Boolean(youtubeAction)}>Повторити Analytics</button>
+                      </div>
+                    )}
+                  </>
+                ) : youtubeAnalyticsError ? (
+                  <div className="youtube-chart-section-empty youtube-chart-section-empty--error" role="alert">
+                    <strong>Історичні дані не вдалося отримати</strong>
+                    <span>{youtubeAnalyticsError}</span>
+                    <button type="button" onClick={refreshYouTubeAnalytics} disabled={Boolean(youtubeAction)}>
+                      {youtubeAction === "analytics" ? "Оновлюємо…" : "Повторити Analytics"}
+                    </button>
                   </div>
                 ) : (
                   <div className="youtube-chart-section-empty" role="status">
                     <strong>Історичні дані ще не отримані</strong>
-                    <span>Увімкніть YouTube Analytics API в тому самому Google Cloud OAuth-проєкті. Перші дані можуть з’явитися із затримкою YouTube.</span>
+                    <span>API підключено, але YouTube ще не повернув завершених денних даних. Вони з’являться після обробки статистики на стороні YouTube.</span>
+                    <button type="button" onClick={refreshYouTubeAnalytics} disabled={Boolean(youtubeAction)}>
+                      {youtubeAction === "analytics" ? "Оновлюємо…" : "Перевірити ще раз"}
+                    </button>
                   </div>
                 )}
               </section>

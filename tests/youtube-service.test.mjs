@@ -183,6 +183,12 @@ test("connects YouTube, hides credentials and records live snapshots", async (t)
   assert.equal(synchronized.history.length, 1);
   assert.equal(synchronized.recentSubscribers.length, 1);
   assert.equal(synchronized.recentSubscribers[0].subscriberName, "First Listener");
+  assert.equal(synchronized.analytics.reconnectRequired, true);
+  assert.equal(synchronized.analytics.errorCode, "YOUTUBE_ANALYTICS_SCOPES_MISSING");
+  assert.equal(synchronized.analyticsAccess.ready, false);
+  assert.deepEqual(synchronized.analyticsAccess.missingScopes, [
+    "https://www.googleapis.com/auth/yt-analytics.readonly",
+  ]);
   assert.equal(synchronized.videoStats[0].videoId, "local-video-1");
   assert.equal(synchronized.quota.used, 5);
   assert.deepEqual(detectedSubscribers, []);
@@ -293,12 +299,12 @@ test("keeps a successful OAuth connection when the first data refresh fails", as
   assert.equal(snapshot.connected, true);
   assert.equal(snapshot.channel, null);
   assert.equal(snapshot.lastError, null);
-  await assert.rejects(
-    service.refreshAll(),
-    (error) => error.code === "YOUTUBE_INVALID_FILTERS",
-  );
+  const refreshed = await service.refreshAll();
   assert.equal(service.snapshot().channel.title, "Connected channel");
-  assert.equal(service.snapshot().lastError, "Некоректний запит списку трансляцій YouTube.");
+  assert.equal(refreshed.lastError, "Некоректний запит списку трансляцій YouTube.");
+  assert.equal(refreshed.analytics.reconnectRequired, false);
+  assert.equal(refreshed.analytics.errorCode, "YOUTUBE_API_UNAVAILABLE");
+  assert.ok(Number.isFinite(Date.parse(refreshed.analytics.lastAttemptAt)));
 });
 
 test("reports a separately disabled YouTube Analytics API", async (t) => {
@@ -332,21 +338,28 @@ test("reports a separately disabled YouTube Analytics API", async (t) => {
     accessToken: "analytics-access-token",
     refreshToken: "analytics-refresh-token",
     expiryDate: new Date("2026-07-20T13:00:00.000Z").getTime(),
-    scope: "https://www.googleapis.com/auth/yt-analytics.readonly",
+    scope: [
+      "https://www.googleapis.com/auth/youtube.readonly",
+      "https://www.googleapis.com/auth/yt-analytics.readonly",
+    ].join(" "),
     tokenType: "Bearer",
   });
 
-  await assert.rejects(
-    service.googleApi("reports", { ids: "channel==MINE" }, { root: "https://youtubeanalytics.googleapis.com/v2" }),
-    (error) => error.code === "YOUTUBE_ANALYTICS_API_DISABLED"
-      && error.message === "У Google Cloud потрібно ввімкнути YouTube Analytics API для цього OAuth-проєкту.",
-  );
-  assert.equal(service.snapshot().quota.used, 0);
+  const snapshot = await service.refreshAnalyticsNow();
+  assert.equal(snapshot.analytics.available, false);
+  assert.equal(snapshot.analytics.reconnectRequired, false);
+  assert.equal(snapshot.analytics.errorCode, "YOUTUBE_ANALYTICS_API_DISABLED");
+  assert.equal(snapshot.analytics.errorMessage, "У Google Cloud потрібно ввімкнути YouTube Analytics API для цього OAuth-проєкту.");
+  assert.equal(snapshot.analyticsAccess.ready, true);
+  assert.equal(snapshot.analyticsAccess.errorCode, "YOUTUBE_ANALYTICS_API_DISABLED");
+  assert.equal(snapshot.lastError, "У Google Cloud потрібно ввімкнути YouTube Analytics API для цього OAuth-проєкту.");
+  assert.equal(snapshot.quota.used, 0);
 });
 
 test("collects all required Analytics metrics and exports statistics", async (t) => {
   const rootDir = await mkdtemp(path.join(tmpdir(), "streamlab-youtube-analytics-test-"));
   t.after(() => rm(rootDir, { recursive: true, force: true }));
+  let analyticsReportCalls = 0;
   const store = new EncryptedYouTubeStore({
     rootDir,
     secret: "streamlab-youtube-analytics-secret-32-characters",
@@ -396,6 +409,7 @@ test("collects all required Analytics metrics and exports statistics", async (t)
       }
       if (url.pathname.endsWith("/subscriptions")) return Response.json({ items: [] });
       if (url.hostname === "youtubeanalytics.googleapis.com") {
+        analyticsReportCalls += 1;
         const metrics = url.searchParams.get("metrics");
         if (metrics === "averageConcurrentViewers,peakConcurrentViewers") {
           assert.equal(url.searchParams.get("filters"), "video==broadcast-a");
@@ -403,15 +417,6 @@ test("collects all required Analytics metrics and exports statistics", async (t)
             columnHeaders: [{ name: "averageConcurrentViewers" }, { name: "peakConcurrentViewers" }],
             rows: [[18, 37]],
           });
-        }
-        if (metrics === "estimatedRevenue") {
-          if (url.searchParams.get("dimensions") === "day") {
-            return Response.json({
-              columnHeaders: [{ name: "day" }, { name: "estimatedRevenue" }],
-              rows: [["2026-07-19", 4.56], ["2026-07-20", 7.78]],
-            });
-          }
-          return Response.json({ columnHeaders: [{ name: "estimatedRevenue" }], rows: [[12.34]] });
         }
         const headers = [
           "views", "estimatedMinutesWatched", "averageViewDuration", "likes", "subscribersGained", "subscribersLost",
@@ -441,12 +446,14 @@ test("collects all required Analytics metrics and exports statistics", async (t)
     scope: [
       "https://www.googleapis.com/auth/youtube.readonly",
       "https://www.googleapis.com/auth/yt-analytics.readonly",
-      "https://www.googleapis.com/auth/yt-analytics-monetary.readonly",
     ].join(" "),
     tokenType: "Bearer",
   });
 
   const snapshot = await service.refreshAll();
+  assert.equal(snapshot.analyticsAccess.ready, true);
+  assert.equal(snapshot.analytics.errorCode, null);
+  assert.equal(snapshot.analytics.stale, false);
   assert.equal(snapshot.analytics.views, 200);
   assert.equal(snapshot.analytics.estimatedMinutesWatched, 1_500);
   assert.equal(snapshot.analytics.averageViewDurationSeconds, 225);
@@ -455,11 +462,28 @@ test("collects all required Analytics metrics and exports statistics", async (t)
   assert.equal(snapshot.analytics.netSubscribers, 7);
   assert.equal(snapshot.analytics.averageConcurrentViewers, 18);
   assert.equal(snapshot.analytics.peakConcurrentViewers, 37);
-  assert.equal(snapshot.analytics.estimatedRevenue, 12.34);
+  assert.equal(snapshot.analytics.estimatedRevenue, null);
+  assert.equal(snapshot.analytics.revenueAvailable, false);
+  assert.match(snapshot.analytics.revenueError, /не підтримує estimated revenue/);
   assert.equal(snapshot.analyticsHistory.length, 2);
-  assert.equal(snapshot.analyticsHistory[0].estimatedRevenue, 4.56);
-  assert.equal(snapshot.analyticsHistory[1].estimatedRevenue, 7.78);
+  assert.equal(snapshot.analyticsHistory[0].estimatedRevenue, null);
+  assert.equal(snapshot.analyticsHistory[1].estimatedRevenue, null);
   assert.equal(snapshot.videoStats[0].officialYouTubeMetric, false);
+
+  const analyticsCallsBeforeManualRefresh = analyticsReportCalls;
+  let releaseBackgroundRefresh;
+  service.refreshPromise = new Promise((resolve) => {
+    releaseBackgroundRefresh = resolve;
+  }).finally(() => {
+    service.refreshPromise = null;
+  });
+  const manualRefresh = service.refreshAnalyticsNow();
+  await Promise.resolve();
+  assert.equal(analyticsReportCalls, analyticsCallsBeforeManualRefresh);
+  releaseBackgroundRefresh(service.snapshot());
+  const manuallyRefreshed = await manualRefresh;
+  assert.equal(manuallyRefreshed.analytics.available, true);
+  assert.equal(analyticsReportCalls, analyticsCallsBeforeManualRefresh + 3);
 
   const jsonExport = service.exportStatistics({ format: "json", all: true });
   const exported = JSON.parse(jsonExport.body);

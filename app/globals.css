@@ -693,6 +693,16 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .youtube-chart-section-empty span { max-width: 620px; font-size: 9px; line-height: 1.55; }
 .youtube-chart-section-empty--error { border-color: rgba(255,93,99,.22); background: rgba(255,93,99,.035); }
 .youtube-chart-section-empty--error strong { color: #ff898d; }
+.youtube-chart-section-empty button, .youtube-analytics-status button { min-height: 34px; justify-self: center; margin-top: 5px; padding: 0 13px; border: 1px solid rgba(114,170,255,.28); border-radius: 8px; background: rgba(77,151,255,.08); color: #9dc2ff; font-size: 9px; font-weight: 750; cursor: pointer; }
+.youtube-chart-section-empty button:not(:disabled):hover, .youtube-analytics-status button:not(:disabled):hover { border-color: rgba(114,170,255,.5); background: rgba(77,151,255,.13); color: #c1d8ff; }
+.youtube-analytics-status { display: grid; justify-items: start; gap: 5px; margin-top: 14px; padding: 13px 14px; border: 1px solid rgba(114,170,255,.18); border-radius: 11px; background: rgba(77,151,255,.04); }
+.youtube-analytics-status strong { color: #bdd4f8; font-size: 10px; }
+.youtube-analytics-status span { color: var(--muted); font-size: 9px; line-height: 1.5; }
+.youtube-analytics-status button { justify-self: start; }
+.youtube-analytics-status--warning { border-color: rgba(244,201,93,.22); background: rgba(244,201,93,.04); }
+.youtube-analytics-status--warning strong { color: var(--yellow); }
+.youtube-analytics-status--error { border-color: rgba(255,93,99,.22); background: rgba(255,93,99,.04); }
+.youtube-analytics-status--error strong { color: #ff898d; }
 .youtube-analytics-panel, .youtube-subscribers-panel, .youtube-video-stats { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 14px; background: rgba(0,0,0,.13); }
 .youtube-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .youtube-section-heading span, .youtube-section-heading h3 { display: block; }
