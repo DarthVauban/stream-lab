@@ -108,8 +108,12 @@ jobs:
             git pull --ff-only
             sh scripts/cleanup-server-storage.sh audit
             docker compose stop backup-scheduler || true
-            docker compose --profile maintenance run --rm backup prune-media
-            sh scripts/cleanup-server-storage.sh cleanup
+            if ! docker compose --profile maintenance run --rm backup prune-media; then
+              echo "Backup cleanup reported an error; deployment will continue."
+            fi
+            if ! sh scripts/cleanup-server-storage.sh cleanup; then
+              echo "Docker/media cleanup reported an error; deployment will continue."
+            fi
             previous_tag=latest
             if [ -f .deploy-tag ]; then previous_tag=$(cat .deploy-tag); fi
             new_tag="sha-$GITHUB_SHA"
@@ -126,5 +130,5 @@ jobs:
             fi
             printf '%s\n' "$new_tag" > .deploy-tag
             docker image prune -af
-            docker builder prune -af
+            docker builder prune -af || true
             sh scripts/cleanup-server-storage.sh audit

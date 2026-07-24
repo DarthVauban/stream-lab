@@ -14,7 +14,8 @@ test("production storage maintenance keeps one prepared video copy and bounds lo
 
   assert.match(backup, /--exclude='\.\/uploads\/\*\.source\.\*'/);
   assert.match(backup, /--exclude='\.\/uploads\/\*\.stream\.mp4'/);
-  assert.ok(backup.indexOf("prune_media_backups") < backup.indexOf('if /bin/sh "$0" create'));
+  assert.match(backup, /grep -q '"media"' "\$manifest"/);
+  assert.match(backup, /if ! \/bin\/sh "\$0" prune-media/);
   assert.match(backup, /! -name '\*\.stream\.mp4' -exec rm -rf -- \{\} \+/);
   assert.match(cleanup, /if \[ ! -s "\$prepared_path" \]/);
   assert.match(cleanup, /rm -f -- "\$source_path"/);

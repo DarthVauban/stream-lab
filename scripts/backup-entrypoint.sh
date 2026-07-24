@@ -148,11 +148,20 @@ prune_media_backups() {
     \( -name 'streamlab-*' -o -name 'pre-restore-*' \) -print |
   while IFS= read -r target; do
     archive="$target/data.tar.gz"
+    manifest="$target/manifest.json"
     if [ ! -f "$archive" ]; then
       continue
     fi
-    if tar -tzf "$archive" 2>/dev/null |
+    contains_media=false
+    if [ -f "$manifest" ] && grep -q '"media"' "$manifest"; then
+      contains_media=true
+    elif [ -f "$manifest" ] && grep -q '"video binaries"' "$manifest"; then
+      continue
+    elif tar -tzf "$archive" 2>/dev/null |
       grep -Eq '^\./uploads/[^/]+\.(source\.[^/]+|stream\.mp4)$'; then
+      contains_media=true
+    fi
+    if [ "$contains_media" = true ]; then
       echo "Removing legacy backup with duplicated video binaries: $(basename "$target")"
       rm -rf -- "$target"
     fi
@@ -219,9 +228,11 @@ schedule_backups() {
   while :; do
     # Cleanup runs before creation so a full disk cannot permanently block
     # retention and incomplete-backup recovery.
-    prune_incomplete_backups
-    prune_media_backups
-    prune_backups
+    if ! /bin/sh "$0" prune-media; then
+      echo "Backup cleanup failed; skipping creation until the next interval." >&2
+      sleep "$interval_seconds"
+      continue
+    fi
     # Run each cycle in a fresh shell so `set -e` remains effective even
     # though the command is used as an `if` condition here.
     if /bin/sh "$0" create; then

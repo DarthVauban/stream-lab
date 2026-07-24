@@ -58,7 +58,7 @@ case "$command" in
     print_storage "before cleanup"
     prune_ready_sources
     docker image prune -af
-    docker builder prune -af
+    docker builder prune -af || echo "Docker build cache cleanup was skipped." >&2
     print_storage "after cleanup"
     ;;
   *)
