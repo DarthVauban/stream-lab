@@ -89,6 +89,8 @@ create_backup() {
 
   tar -czf "$temporary/data.tar.gz" \
     --exclude='./uploads/*.part' \
+    --exclude='./uploads/*.source.*' \
+    --exclude='./uploads/*.stream.mp4' \
     --exclude='./uploads/*.processing.tmp.mp4' \
     --exclude='./uploads/*.thumbnail.tmp.*' \
     --exclude='./uploads/.trash' \
@@ -107,7 +109,8 @@ create_backup() {
   "name": "$backup_name",
   "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "database": "$database_name",
-  "includes": ["postgresql", "media", "encrypted integrations", "stream state"]
+  "includes": ["postgresql", "media metadata and thumbnails", "encrypted integrations", "stream state"],
+  "excludes": ["video binaries"]
 }
 EOF
   (
@@ -132,6 +135,28 @@ prune_backups() {
   find "$backup_root" -mindepth 1 -maxdepth 1 -type d \
     \( -name 'streamlab-*' -o -name 'pre-restore-*' \) \
     -mtime "+$retention_days" -exec rm -rf -- {} +
+}
+
+prune_incomplete_backups() {
+  find "$backup_root" -mindepth 1 -maxdepth 1 -type d \
+    -name '.creating-*' -exec rm -rf -- {} +
+}
+
+prune_media_backups() {
+  mkdir -p "$backup_root"
+  find "$backup_root" -mindepth 1 -maxdepth 1 -type d \
+    \( -name 'streamlab-*' -o -name 'pre-restore-*' \) -print |
+  while IFS= read -r target; do
+    archive="$target/data.tar.gz"
+    if [ ! -f "$archive" ]; then
+      continue
+    fi
+    if tar -tzf "$archive" 2>/dev/null |
+      grep -Eq '^\./uploads/[^/]+\.(source\.[^/]+|stream\.mp4)$'; then
+      echo "Removing legacy backup with duplicated video binaries: $(basename "$target")"
+      rm -rf -- "$target"
+    fi
+  done
 }
 
 restore_backup() {
@@ -167,7 +192,12 @@ restore_backup() {
     --exit-on-error \
     "$backup_root/$backup_name/database.dump"
 
-  find "$data_root" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  # Compact backups intentionally do not duplicate prepared videos. Preserve
+  # the live stream copies while replacing every other data subtree.
+  find "$data_root" -mindepth 1 -maxdepth 1 ! -name 'uploads' -exec rm -rf -- {} +
+  mkdir -p "$data_root/uploads"
+  find "$data_root/uploads" -mindepth 1 -maxdepth 1 \
+    ! -name '*.stream.mp4' -exec rm -rf -- {} +
   tar -xzf "$backup_root/$backup_name/data.tar.gz" -C "$data_root"
   echo "Backup restored: $backup_name"
   echo "Automatic pre-restore safety copy: $safety_name"
@@ -187,10 +217,15 @@ schedule_backups() {
     exit 2
   fi
   while :; do
+    # Cleanup runs before creation so a full disk cannot permanently block
+    # retention and incomplete-backup recovery.
+    prune_incomplete_backups
+    prune_media_backups
+    prune_backups
     # Run each cycle in a fresh shell so `set -e` remains effective even
     # though the command is used as an `if` condition here.
     if /bin/sh "$0" create; then
-      /bin/sh "$0" prune || echo "Backup retention cleanup failed." >&2
+      echo "Scheduled compact backup completed."
     else
       echo "Scheduled backup failed; retrying after the configured interval." >&2
     fi
@@ -208,8 +243,13 @@ case "$command" in
   restore) restore_backup "${2:-}" ;;
   list) list_backups ;;
   prune) prune_backups ;;
+  prune-media)
+    prune_incomplete_backups
+    prune_media_backups
+    prune_backups
+    ;;
   schedule) schedule_backups ;;
   *)
-    echo "Usage: backup-entrypoint.sh create [name] | verify <name> | restore <name> | list | prune | schedule"
+    echo "Usage: backup-entrypoint.sh create [name] | verify <name> | restore <name> | list | prune | prune-media | schedule"
     ;;
 esac

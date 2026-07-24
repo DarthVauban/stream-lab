@@ -106,6 +106,10 @@ jobs:
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
             cd stream-lab
             git pull --ff-only
+            sh scripts/cleanup-server-storage.sh audit
+            docker compose stop backup-scheduler || true
+            docker compose --profile maintenance run --rm backup prune-media
+            sh scripts/cleanup-server-storage.sh cleanup
             previous_tag=latest
             if [ -f .deploy-tag ]; then previous_tag=$(cat .deploy-tag); fi
             new_tag="sha-$GITHUB_SHA"
@@ -122,3 +126,5 @@ jobs:
             fi
             printf '%s\n' "$new_tag" > .deploy-tag
             docker image prune -af
+            docker builder prune -af
+            sh scripts/cleanup-server-storage.sh audit

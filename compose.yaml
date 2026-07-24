@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+    max-file: "${DOCKER_LOG_MAX_FILES:-3}"
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -5,6 +11,7 @@ services:
     init: true
     security_opt:
       - no-new-privileges:true
+    logging: *default-logging
     environment:
       POSTGRES_DB: streamlab
       POSTGRES_USER: streamlab
@@ -24,6 +31,7 @@ services:
     init: true
     security_opt:
       - no-new-privileges:true
+    logging: *default-logging
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -42,6 +50,7 @@ services:
     init: true
     security_opt:
       - no-new-privileges:true
+    logging: *default-logging
     environment:
       STREAMLAB_DOMAIN: ${STREAMLAB_DOMAIN:-stream.mt-panel.sbs}
     ports:
@@ -73,6 +82,7 @@ services:
       - "8788"
     security_opt:
       - no-new-privileges:true
+    logging: *default-logging
     environment:
       MEDIA_API_HOST: 0.0.0.0
       MEDIA_API_PORT: 8788
@@ -137,6 +147,7 @@ services:
     init: true
     security_opt:
       - no-new-privileges:true
+    logging: *default-logging
     environment:
       MEDIA_INTERNAL_API_URL: http://media-server:8788
     ports:
@@ -159,6 +170,7 @@ services:
     init: true
     security_opt:
       - no-new-privileges:true
+    logging: *default-logging
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_DB: streamlab
@@ -184,6 +196,7 @@ services:
     init: true
     security_opt:
       - no-new-privileges:true
+    logging: *default-logging
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_DB: streamlab
